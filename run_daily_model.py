@@ -102,7 +102,8 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
                 risk_m = float(confidence * 2.0)
                 sl_dist = float(current_atr * risk_m)
                 if sl_dist > 0:
-                    entry_price = float(next_open)
+                    slippage_bps = 0.0003
+                    entry_price = float(next_open) * (1 + slippage_bps) if direction == 'LONG' else float(next_open) * (1 - slippage_bps)
                     risk_dollar = equity * risk_pct
                     size = risk_dollar / (sl_dist + 1e-9)
                     
@@ -176,7 +177,10 @@ def main():
     merged['rel_strength_w'] = (merged['close'] - merged['w_close']) / (merged['w_close'] + 1e-9)
 
     # Target: next daily bar direction
-    merged['target'] = (merged['close'].shift(-1) - merged['close'] > 0).astype(int)
+    _ret_rdm = (merged['close'].shift(-1) - merged['close']) / (merged['close'] + 1e-9)
+    merged['target'] = np.where(_ret_rdm > 0.001, 1, np.where(_ret_rdm < -0.001, 0, np.nan))
+    merged = merged.dropna(subset=['target'])
+    merged['target'] = merged['target'].astype(int)
     merged = merged.dropna(subset=['target'])
 
     exclude_cols = {'time', 'open', 'high', 'low', 'close', 'volume', 'target',

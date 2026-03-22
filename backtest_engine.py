@@ -15,80 +15,23 @@ warnings.filterwarnings('ignore')
 
 from universal_ml_engine import (
     parse_tv_log, add_features_single, add_calendar_features,
-    merge_higher_tf, add_target
+    merge_higher_tf, BARRIER_ATR_MULT, BARRIER_HORIZON_BARS,
+    LIVE_CONFIDENCE_THRESHOLD, VOL_GATE_LOOKBACK,
+    EXEC_FEE_PCT, simulate_trade_path_from_arrays
 )
 
 def format_currency(val):
     return f"${val:,.2f}"
 
-def _eval_pos(position, next_open, next_high, next_low, next_close, next_time, fee_pct=0.0005):
-    trade_closed = False
-    p_type = position['type']
-    p_sl = position['sl']
-    p_tp1 = position['tp1']
-    
-    if p_type == 'LONG':
-        if next_low <= p_sl:
-            exit_price = min(next_open, p_sl)
-            # BE-1 FIX: after TP1, only half-size remains — fee must reflect that
-            remaining_size = position['size'] * 0.5 if position['tp1_hit'] else position['size']
-            fee_exit = exit_price * remaining_size * fee_pct
-            pnl = (exit_price - position['entry_price']) * remaining_size
-            position['pnl'] += (pnl - fee_exit)
-            trade_closed = True
-            position['exit_price'] = exit_price
-            position['exit_time'] = next_time
-            position['exit_reason'] = 'SL Hit'
-            
-        elif not position['tp1_hit'] and next_high >= p_tp1:
-            position['tp1_hit'] = True
-            exit_price = max(next_open, p_tp1)
-            fee_exit = exit_price * (position['size'] * 0.5) * fee_pct
-            pnl = (exit_price - position['entry_price']) * (position['size'] * 0.5)
-            position['pnl'] += (pnl - fee_exit)
-            position['sl'] = position['entry_price']
-            
-        if position['tp1_hit'] and not trade_closed:
-            new_sl = next_close - position['trail_dist']
-            if new_sl > position['sl']:
-                position['sl'] = new_sl
-                
-    elif p_type == 'SHORT':
-        if next_high >= p_sl:
-            exit_price = max(next_open, p_sl)
-            # BE-1 FIX: after TP1, only half-size remains — fee must reflect that
-            remaining_size = position['size'] * 0.5 if position['tp1_hit'] else position['size']
-            fee_exit = exit_price * remaining_size * fee_pct
-            pnl = (position['entry_price'] - exit_price) * remaining_size
-            position['pnl'] += (pnl - fee_exit)
-            trade_closed = True
-            position['exit_price'] = exit_price
-            position['exit_time'] = next_time
-            position['exit_reason'] = 'SL Hit'
-            
-        elif not position['tp1_hit'] and next_low <= p_tp1:
-            position['tp1_hit'] = True
-            exit_price = min(next_open, p_tp1)
-            fee_exit = exit_price * (position['size'] * 0.5) * fee_pct
-            pnl = (position['entry_price'] - exit_price) * (position['size'] * 0.5)
-            position['pnl'] += (pnl - fee_exit)
-            position['sl'] = position['entry_price']
-            
-        if position['tp1_hit'] and not trade_closed:
-            new_sl = next_close + position['trail_dist']
-            if new_sl < position['sl']:
-                position['sl'] = new_sl
-                
-    return trade_closed
-
-def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pct=0.02, conf_threshold=0.60):
+def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pct=0.02,
+                 conf_threshold=LIVE_CONFIDENCE_THRESHOLD, fixed_risk=True,
+                 slippage_bps=0.0003, max_hold_bars=BARRIER_HORIZON_BARS):
     equity = initial_capital
     peak_equity = equity
     max_drawdown = 0.0
     conflict_blocks = 0
-    fee_pct = 0.0005 # 0.05% execution fee
-
-    position = None 
+    volatility_blocks = 0
+    no_prediction_bars = 0
     trades = []
     equity_curve = []
     time_curve = []
@@ -99,98 +42,92 @@ def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pc
     low_arr = df['low'].values
     time_arr = df['time'].values
     atr_arr = df['atr14'].values
+    atr_ma50_arr = pd.Series(atr_arr).rolling(VOL_GATE_LOOKBACK).mean().to_numpy()
 
-    for i in range(len(df) - 1):
+    i = 0
+    while i < len(df) - 1:
         current_time = pd.to_datetime(time_arr[i])
         current_atr = atr_arr[i]
-        
-        proba_up = prob_array[i]
-        proba_down = 1.0 - proba_up
-        proba_up_1d = prob_array_1d[i]
-        proba_down_1d = 1.0 - proba_up_1d
-        
-        next_open = open_arr[i+1]
-        next_high = high_arr[i+1]
-        next_low = low_arr[i+1]
-        next_close = close_arr[i+1]
-        next_time = time_arr[i+1]
-
-        # 1. Manage Existing
-        if position is not None:
-            if _eval_pos(position, next_open, next_high, next_low, next_close, next_time, fee_pct):
-                equity += position['pnl']
-                trades.append(position)
-                position = None
-
-        # 2. Open New
-        if position is None:
-            confidence = max(proba_up, proba_down)
-            if confidence >= conf_threshold:
-                direction = 'LONG' if proba_up > 0.5 else 'SHORT'
-                direction_1d = 'LONG' if proba_up_1d > 0.5 else 'SHORT'
-                
-                if direction != direction_1d:
-                    conflict_blocks += 1
-                    continue
-                
-                risk_m = float(confidence * 2.0)
-                sl_dist = float(current_atr * risk_m)
-                
-                if sl_dist <= 0: continue
-                
-                entry_price = float(next_open)
-                risk_dollar = equity * risk_pct
-                size = risk_dollar / (sl_dist + 1e-9)
-                fee_entry = entry_price * size * fee_pct
-                
-                position = {
-                    'type': direction,
-                    'entry_price': entry_price,
-                    'size': size,
-                    'sl': entry_price - sl_dist if direction == 'LONG' else entry_price + sl_dist,
-                    'tp1': entry_price + sl_dist if direction == 'LONG' else entry_price - sl_dist,
-                    'tp1_hit': False,
-                    'trail_dist': sl_dist,
-                    'entry_time': next_time,
-                    'initial_risk': risk_dollar,
-                    'pnl': -fee_entry,
-                    'confidence': confidence,
-                    'status': 'OPEN'
-                }
-                # BE-2 FIX: do NOT evaluate the position on the bar it was just entered.
-                # The first evaluation happens on the NEXT bar (next loop iteration).
-                # Immediate self-evaluation creates intra-bar lookahead bias.
-
-        # M2M equity tracking
-        m2m_equity = equity
-        if position is not None:
-            if position['type'] == 'LONG':
-                unrealized = (next_close - position['entry_price']) * position['size']
-                if position['tp1_hit']:
-                    unrealized = (next_close - position['entry_price']) * (position['size'] * 0.5)
-            else:
-                unrealized = (position['entry_price'] - next_close) * position['size']
-                if position['tp1_hit']:
-                    unrealized = (position['entry_price'] - next_close) * (position['size'] * 0.5)
-            m2m_equity += (position['pnl'] + unrealized)
-        
-        peak_equity = max(peak_equity, m2m_equity)
-        max_drawdown = max(max_drawdown, (peak_equity - m2m_equity) / peak_equity)
-        equity_curve.append(m2m_equity)
+        equity_curve.append(equity)
         time_curve.append(current_time)
 
-    # Clean up open trades at end
-    if position is not None:
-        last_close = close_arr[-1]
-        fee_exit = last_close * position['size'] * 0.5 * fee_pct if position['tp1_hit'] else last_close * position['size'] * fee_pct
-        if position['type'] == 'LONG':
-            pnl = (last_close - position['entry_price']) * (position['size'] * 0.5 if position['tp1_hit'] else position['size'])
-        else:
-            pnl = (position['entry_price'] - last_close) * (position['size'] * 0.5 if position['tp1_hit'] else position['size'])
-        
-        position['pnl'] += (pnl - fee_exit)
-        equity += position['pnl']
-        trades.append(position)
+        proba_up = prob_array[i]
+        proba_up_1d = prob_array_1d[i]
+        if not np.isfinite(proba_up):
+            no_prediction_bars += 1
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
+
+        confidence = max(proba_up, 1.0 - proba_up)
+        atr_ma50 = atr_ma50_arr[i]
+        if confidence < conf_threshold:
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
+        if not np.isfinite(current_atr) or current_atr <= 0:
+            i += 1
+            continue
+        if not np.isfinite(atr_ma50) or current_atr <= atr_ma50:
+            volatility_blocks += 1
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
+
+        direction = 'LONG' if proba_up > 0.5 else 'SHORT'
+        if np.isfinite(proba_up_1d):
+            direction_1d = 'LONG' if proba_up_1d > 0.5 else 'SHORT'
+            if direction != direction_1d:
+                conflict_blocks += 1
+                peak_equity = max(peak_equity, equity)
+                max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+                i += 1
+                continue
+
+        risk_dollar = (initial_capital if fixed_risk else equity) * risk_pct
+        trade_path = simulate_trade_path_from_arrays(
+            open_arr,
+            high_arr,
+            low_arr,
+            close_arr,
+            time_arr,
+            i + 1,
+            direction,
+            float(current_atr * BARRIER_ATR_MULT),
+            horizon=max_hold_bars,
+            fee_pct=EXEC_FEE_PCT,
+            slippage_bps=slippage_bps
+        )
+        if not np.isfinite(trade_path['total_r']):
+            i += 1
+            continue
+
+        pnl = trade_path['total_r'] * risk_dollar
+        equity += pnl
+        peak_equity = max(peak_equity, equity)
+        max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+        trades.append({
+            'type': direction,
+            'entry_price': trade_path['entry_price'],
+            'exit_price': trade_path['exit_price'],
+            'entry_time': time_arr[i + 1],
+            'exit_time': trade_path['exit_time'],
+            'exit_reason': trade_path['exit_reason'],
+            'initial_risk': risk_dollar,
+            'confidence': confidence,
+            'pnl': pnl,
+            'status': 'CLOSED',
+            'tp1_hit': trade_path['tp1_hit'],
+            'tp2_hit': trade_path['tp2_hit'],
+        })
+
+        for k in range(i + 1, min(trade_path['exit_idx'], len(df) - 1) + 1):
+            time_curve.append(pd.to_datetime(time_arr[k]))
+            equity_curve.append(equity)
+        i = max(i + 1, trade_path['exit_idx'] + 1)
 
     results = {
         'final_equity': equity,
@@ -198,7 +135,10 @@ def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pc
         'trades': trades,
         'equity_curve': equity_curve,
         'time_curve': time_curve,
-        'conflict_blocks': conflict_blocks
+        'conflict_blocks': conflict_blocks,
+        'volatility_blocks': volatility_blocks,
+        'no_prediction_bars': no_prediction_bars,
+        'prediction_bars': int(np.isfinite(prob_array).sum())
     }
     return results
 
@@ -218,7 +158,23 @@ def calculate_metrics(trades):
     avg_loss = np.mean([t['pnl'] for t in losses]) if losses else 0
     
     expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
-    
+
+    # E6: Risk-adjusted metrics
+    r_multiples = [t['pnl'] / (t.get('initial_risk', 1) + 1e-9) for t in trades]
+    sharpe = (np.mean(r_multiples) / (np.std(r_multiples) + 1e-9)) * np.sqrt(252) if len(r_multiples) > 1 else 0.0
+    downside_returns = [r for r in r_multiples if r < 0]
+    sortino = (np.mean(r_multiples) / (np.std(downside_returns) + 1e-9)) * np.sqrt(252) if downside_returns else float('inf')
+
+    # Max consecutive losses
+    max_consec_loss = 0
+    current_streak = 0
+    for t in trades:
+        if t['pnl'] <= 0:
+            current_streak += 1
+            max_consec_loss = max(max_consec_loss, current_streak)
+        else:
+            current_streak = 0
+
     return {
         'total_trades': len(trades),
         'win_rate': win_rate,
@@ -227,7 +183,10 @@ def calculate_metrics(trades):
         'avg_win': avg_win,
         'avg_loss': avg_loss,
         'gross_profit': gross_profit,
-        'gross_loss': gross_loss
+        'gross_loss': gross_loss,
+        'sharpe': sharpe,
+        'sortino': sortino,
+        'max_consec_loss': max_consec_loss
     }
 
 def generate_report(results, metrics, symbol, save_path):
@@ -269,6 +228,9 @@ def generate_report(results, metrics, symbol, save_path):
         f"  Total Trades   : {m.get('total_trades', 0)}\n"
         f"  Win Rate       : {m.get('win_rate', 0)*100:.1f}%\n"
         f"  Profit Factor  : {m.get('profit_factor', 0):.3f}\n"
+        f"  Sharpe Ratio   : {m.get('sharpe', 0):.3f}\n"
+        f"  Sortino Ratio  : {m.get('sortino', 0):.3f}\n"
+        f"  Max Consec Loss: {m.get('max_consec_loss', 0)}\n"
         f"  Expectancy     : {format_currency(m.get('expectancy', 0))} per trade\n"
         f"  Conflict Gated : {results.get('conflict_blocks', 0)} blocks bypassed\n"
         f"  Gross Profit   : {format_currency(m.get('gross_profit', 0))}\n"
@@ -365,68 +327,81 @@ def main():
     df_full = add_calendar_features(df_full)
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
     
-    # Need target for walk-forward comparison context, though backtest technically only needs features and OHLC
-    df_full = add_target(df_full, ahead=1)
-
     extra_cols = ['time', 'open', 'high', 'low', 'close', 'volume']
     if 'atr14' not in feature_cols:
         extra_cols.append('atr14')
 
-    # Clean data identical to training
-    all_needed_cols = list(set(feature_cols + extra_cols + feature_cols_1d))
+    # Rebuild the full feature timeline. Keep every bar so open positions are
+    # evaluated on actual consecutive market bars, not only on predicted rows.
+    all_needed_cols = list(set(feature_cols + extra_cols))
     df_model_ready = df_full[all_needed_cols].copy()
-    for col in set(feature_cols + feature_cols_1d):
+    for col in feature_cols:
         df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+    df_model_ready = df_model_ready.reset_index(drop=True)
     
-    df_model_ready = df_model_ready.dropna(subset=list(set(feature_cols + feature_cols_1d))).reset_index(drop=True)
-    
-    print(f"  [=] Total Valid Bars for Simulation: {len(df_model_ready)}")
+    print(f"  [=] Total Bars for Simulation: {len(df_model_ready)}")
 
     # ── UME-2 FIX: Load OOS probability map for honest backtesting ──
-    # When available, only bars with genuine OOS predictions are backtested.
-    # Falls back to in-sample batch prediction with a loud warning if map is absent.
+    # Align OOS probabilities onto the full historical bar timeline.
     oos_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba.pkl')
+    df_backtest = df_model_ready
     if os.path.exists(oos_path):
         oos_proba_map = joblib.load(oos_path)
-        oos_mask = df_model_ready['time'].apply(
-            lambda t: pd.Timestamp(t) in oos_proba_map
-        )
-        df_backtest = df_model_ready[oos_mask].reset_index(drop=True)
         prob_array = np.array([
-            oos_proba_map[pd.Timestamp(t)] for t in df_backtest['time']
+            float(oos_proba_map[pd.Timestamp(t)]) if pd.Timestamp(t) in oos_proba_map else np.nan
+            for t in df_backtest['time']
         ])
-        print(f"  [=] OOS proba map loaded. Backtest restricted to {len(df_backtest)} honest OOS bars.")
+        print(f"  [=] OOS proba map loaded. {np.isfinite(prob_array).sum()} honest OOS prediction bars aligned to the full timeline.")
     else:
         print("  [!] WARNING: No OOS proba map found. Backtest uses in-sample predictions.")
         print("      Re-run universal_ml_engine.py to generate a clean OOS map.")
-        df_backtest = df_model_ready
         X = df_backtest[feature_cols]
         prob_array = model.predict_proba(X)[:, 1]
 
-    # ── BE-3 FIX: Compute 1D probabilities on ACTUAL daily bars, not on duplicated 1H rows ──
-    # The 1D model was trained on daily-bar sequences; applying it to merged 1H rows
-    # introduces distribution mismatch (same feature values for 23 consecutive hours).
-    # Fix: run predict on the actual 1D dataframe, then map back by calendar date.
-    df_1d_for_filter = add_features_single(df_1d.copy(), prefix='d_')  # compute_vwap=False (correct default)
-    for col in feature_cols_1d:
-        if col in df_1d_for_filter.columns:
-            df_1d_for_filter[col] = df_1d_for_filter[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-    valid_1d_mask = df_1d_for_filter[feature_cols_1d].notna().all(axis=1)
-    df_1d_valid = df_1d_for_filter[valid_1d_mask].reset_index(drop=True)
-    daily_proba = model_1d.predict_proba(df_1d_valid[feature_cols_1d])[:, 1]
-    date_to_prob_1d = {
-        pd.Timestamp(row['time']).date(): float(prob)
-        for row, prob in zip(df_1d_valid.to_dict('records'), daily_proba)
-    }
-    # Map each 1H bar to its calendar date's 1D probability (neutral 0.5 if date missing)
-    prob_array_1d = np.array([
-        date_to_prob_1d.get(pd.Timestamp(t).date(), 0.5)
-        for t in df_backtest['time']
-    ])
-    print(f"  [=] 1D filter computed on {len(df_1d_valid)} actual daily bars.")
+    # ── E3 FIX: Use genuine OOS 1D probabilities for conflict gating ──
+    # Load the saved 1D OOS proba map. Only bars with OOS 1D predictions use
+    # the genuine probability. Bars without OOS data remain NaN and do not gate.
+    oos_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba_1d.pkl')
+    if os.path.exists(oos_1d_path):
+        oos_proba_map_1d = joblib.load(oos_1d_path)
+        date_to_prob_1d = {}
+        for ts, prob in oos_proba_map_1d.items():
+            date_to_prob_1d[pd.Timestamp(ts).date()] = float(prob)
+        prob_array_1d = np.array([
+            date_to_prob_1d.get(pd.Timestamp(t).date(), np.nan)
+            for t in df_backtest['time']
+        ])
+        print(f"  [=] 1D OOS proba map loaded. {len(date_to_prob_1d)} honest OOS days available for gating.")
+    else:
+        # Fallback: compute on actual daily bars (in-sample — warn loudly)
+        print("  [!] WARNING: No 1D OOS proba map found. Using in-sample 1D predictions.")
+        print("      Re-run universal_ml_engine.py to generate clean 1D OOS map.")
+        df_1d_for_filter = add_features_single(df_1d.copy(), prefix='d_')
+        for col in feature_cols_1d:
+            if col in df_1d_for_filter.columns:
+                df_1d_for_filter[col] = df_1d_for_filter[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+        valid_1d_mask = df_1d_for_filter[feature_cols_1d].notna().all(axis=1)
+        df_1d_valid = df_1d_for_filter[valid_1d_mask].reset_index(drop=True)
+        daily_proba = model_1d.predict_proba(df_1d_valid[feature_cols_1d])[:, 1]
+        date_to_prob_1d = {
+            pd.Timestamp(row['time']).date(): float(prob)
+            for row, prob in zip(df_1d_valid.to_dict('records'), daily_proba)
+        }
+        prob_array_1d = np.array([
+            date_to_prob_1d.get(pd.Timestamp(t).date(), np.nan)
+            for t in df_backtest['time']
+        ])
+        print(f"  [=] 1D filter computed on {len(df_1d_valid)} actual daily bars (IN-SAMPLE FALLBACK).")
 
     print("  [=] Executing Bar-by-Bar Portfolio Walkthrough...")
-    results = run_backtest(df_backtest, prob_array, prob_array_1d, initial_capital=10000.0, risk_pct=0.02, conf_threshold=0.60)
+    results = run_backtest(
+        df_backtest,
+        prob_array,
+        prob_array_1d,
+        initial_capital=10000.0,
+        risk_pct=0.02,
+        conf_threshold=LIVE_CONFIDENCE_THRESHOLD
+    )
     
     if results is None: 
         return
@@ -437,10 +412,15 @@ def main():
     print("  PORTFOLIO SIMULATION RESULTS")
     print("=" * 60)
     print(f"  Final Equity   : {format_currency(results['final_equity'])}")
+    print(f"  Prediction Bars: {results.get('prediction_bars', 0)}")
     print(f"  Total Trades   : {metrics.get('total_trades', 0)}")
     print(f"  Win Rate       : {metrics.get('win_rate', 0)*100:.1f}%")
     print(f"  Profit Factor  : {metrics.get('profit_factor', 0):.3f}")
+    print(f"  Sharpe Ratio   : {metrics.get('sharpe', 0):.3f}")
+    print(f"  Sortino Ratio  : {metrics.get('sortino', 0):.3f}")
+    print(f"  Max Consec Loss: {metrics.get('max_consec_loss', 0)}")
     print(f"  Conflict Gated : {results.get('conflict_blocks', 0)} blocks bypassed")
+    print(f"  Volatility Gate: {results.get('volatility_blocks', 0)} bars bypassed")
     print(f"  Max Drawdown   : {results['max_drawdown']*100:.2f}%")
     print("=" * 60)
 

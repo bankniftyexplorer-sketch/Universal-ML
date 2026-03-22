@@ -15,46 +15,163 @@ from sklearn.model_selection import TimeSeriesSplit
 import matplotlib
 import argparse
 import os
+import subprocess
+import sys
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 warnings.filterwarnings('ignore')
 
+# Execution/training alignment constants
+BARRIER_ATR_MULT = 1.25
+BARRIER_HORIZON_BARS = 24
+LIVE_CONFIDENCE_THRESHOLD = 0.70
+VOL_GATE_LOOKBACK = 50
+TP1_R_MULT = 1.0
+TP2_R_MULT = 2.0
+TP1_FRACTION = 0.50
+TP2_FRACTION = 0.25
+RUNNER_FRACTION = 0.25
+TRAIL_R_MULT = 1.0
+MIN_LABEL_EDGE_R = 0.25
+MIN_LABEL_BEST_R = 0.15
+EXEC_FEE_PCT = 0.0005
+EXEC_SLIPPAGE_BPS = 0.0003
+TIME_COL_CANDIDATES = ('Date', 'date', 'Datetime', 'datetime', 'Timestamp', 'timestamp', 'Time', 'time')
+MESSAGE_COL_CANDIDATES = ('Message', 'message')
+MODEL_N_JOBS = 4
+
 # ─────────────────────────────────────────────
 # 1. PARSER  (handles Indian comma-formatted numbers)
 # ─────────────────────────────────────────────
+
+def _find_first_column(raw: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    for name in candidates:
+        if name in raw.columns:
+            return name
+    lowered = {str(col).strip().lower(): col for col in raw.columns}
+    for name in candidates:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return None
+
+
+def _infer_symbol_timeframe_from_filename(path: str) -> tuple[str, str]:
+    stem = os.path.splitext(os.path.basename(path))[0]
+    upper_stem = stem.upper()
+    tf_patterns = [('1M', r'(^|[_\- ])1M($|[_\- ])'),
+                   ('1W', r'(^|[_\- ])1W($|[_\- ])'),
+                   ('1D', r'(^|[_\- ])1D($|[_\- ])'),
+                   ('60', r'(^|[_\- ])1H($|[_\- ])|(^|[_\- ])60($|[_\- ])')]
+    tf_guess = ''
+    for tf_val, pattern in tf_patterns:
+        if re.search(pattern, upper_stem):
+            tf_guess = tf_val
+            upper_stem = re.sub(pattern, '_', upper_stem)
+            break
+    symbol_guess = re.sub(r'[_\- ]+', '_', upper_stem).strip('_')
+    return symbol_guess, tf_guess
+
+
+def _timeframe_to_timedelta(tf_str: str) -> pd.Timedelta | pd.DateOffset:
+    tf_key = str(tf_str).strip().upper()
+    if tf_key in {'60', '1H', 'H'}:
+        return pd.Timedelta(hours=1)
+    if tf_key in {'1D', 'D'}:
+        return pd.Timedelta(days=1)
+    if tf_key in {'1W', 'W'}:
+        return pd.Timedelta(weeks=1)
+    if tf_key in {'1M', 'M'}:
+        return pd.DateOffset(months=1)
+    return pd.Timedelta(0)
+
+
+def _drop_timezone_preserve_wall_clock(parsed: pd.Series) -> pd.Series:
+    try:
+        return parsed.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        return parsed
+
+
+def _parse_datetime_series(series: pd.Series) -> pd.Series:
+    text = series.astype(str).str.strip()
+    parsed = pd.to_datetime(text, errors='coerce', utc=False)
+    parsed = _drop_timezone_preserve_wall_clock(parsed)
+    if parsed.notna().mean() >= 0.7:
+        return parsed
+
+    numeric = pd.to_numeric(text.str.replace(',', '', regex=False), errors='coerce')
+    if numeric.notna().mean() < 0.7:
+        return parsed
+
+    median_abs = numeric.dropna().abs().median()
+    if median_abs >= 1e17:
+        unit = 'ns'
+    elif median_abs >= 1e14:
+        unit = 'us'
+    elif median_abs >= 1e11:
+        unit = 'ms'
+    else:
+        unit = 's'
+    return pd.to_datetime(numeric, unit=unit, errors='coerce')
+
+
+def _extract_symbol_and_timeframe(message_series: pd.Series, path: str) -> tuple[str, str]:
+    symbol_guess, tf_guess = _infer_symbol_timeframe_from_filename(path)
+    symbol_str = symbol_guess
+    tf_str = tf_guess
+    try:
+        symbol_extracted = message_series.str.extract(r'SYMBOL:\s*([^,]+)', expand=False).dropna()
+        if not symbol_extracted.empty:
+            symbol_str = str(symbol_extracted.iloc[-1]).strip()
+
+        tf_extracted = message_series.str.extract(r'TIME FRAME:\s*([A-Za-z0-9_]+)', expand=False).dropna()
+        if not tf_extracted.empty:
+            tf_str = str(tf_extracted.iloc[-1]).strip()
+    except Exception:
+        pass
+    return symbol_str, tf_str
+
+
+def _detect_time_column(raw: pd.DataFrame, message_series: pd.Series, tf_str: str) -> pd.Series:
+    for col in TIME_COL_CANDIDATES:
+        if col in raw.columns:
+            parsed = _parse_datetime_series(raw[col])
+            if parsed.notna().any():
+                return parsed
+
+    close_time = message_series.str.extract(r'CLOSE TIME:\s*([\d,]+)', expand=False)
+    close_numeric = pd.to_numeric(close_time.str.replace(',', '', regex=False), errors='coerce')
+    if close_numeric.notna().any():
+        close_dt = pd.to_datetime(close_numeric, unit='ms', errors='coerce')
+        return close_dt - _timeframe_to_timedelta(tf_str)
+
+    return pd.Series(pd.NaT, index=raw.index, dtype='datetime64[ns]')
 
 def parse_tv_log(path: str) -> tuple:
     """Parse TradingView log CSV and automatically detect Symbol and Timeframe."""
     # Use robust separator, handle bad lines
     raw = pd.read_csv(path, on_bad_lines='skip')
     
-    if raw.empty or 'Message' not in raw.columns:
+    if raw.empty:
         return pd.DataFrame(), None, None
 
+    message_col = _find_first_column(raw, MESSAGE_COL_CANDIDATES)
+    if message_col is None:
+        return pd.DataFrame(), None, None
+
+    message_series = raw[message_col].astype(str)
+    symbol_str, tf_str = _extract_symbol_and_timeframe(message_series, path)
+
     df = pd.DataFrame()
-    df['time'] = pd.to_datetime(raw['Date'], utc=False).dt.tz_localize(None)
+    df['time'] = _detect_time_column(raw, message_series, tf_str)
 
     # Vectorized regex extraction directly from the message string.
     # Handles numbers with commas by replacing them post-extraction.
     for col, key in [('open', 'OPEN'), ('high', 'HIGH'), ('low', 'LOW'), ('close', 'CLOSE'), ('volume', 'VOLUME')]:
-        extracted = raw['Message'].str.extract(rf'{key}:([\d,\.]+)', expand=False)
+        extracted = message_series.str.extract(rf'{key}:\s*([\d,\.]+)', expand=False)
         df[col] = pd.to_numeric(extracted.str.replace(',', ''), errors='coerce')
-
-    # Automatically extract SYMBOL and TIME FRAME from the last message
-    symbol_str = ""
-    tf_str = ""
-    try:
-        symbol_extracted = raw['Message'].str.extract(r'SYMBOL:([A-Za-z0-9_!]+)', expand=False).dropna()
-        if not symbol_extracted.empty:
-            symbol_str = str(symbol_extracted.iloc[-1])
-            
-        tf_extracted = raw['Message'].str.extract(r'TIME FRAME:([A-Za-z0-9_]+)', expand=False).dropna()
-        if not tf_extracted.empty:
-            tf_str = str(tf_extracted.iloc[-1])
-    except Exception as e:
-        pass
 
     df = df.dropna().sort_values('time').reset_index(drop=True)
     return df, symbol_str, tf_str
@@ -79,6 +196,7 @@ def add_features_single(df: pd.DataFrame, prefix: str = '', compute_vwap: bool =
     l = df['low']
     o = df['open']
     v = df['volume']
+    v_clean = v.fillna(0.0)
 
     # 1. Momentum Returns (Immediate, Short, Macro)
     for w in [1, 5, 21]: 
@@ -109,6 +227,11 @@ def add_features_single(df: pd.DataFrame, prefix: str = '', compute_vwap: bool =
     lower = mb - 2 * std
     df[f'{p}bb_width'] = ((upper - lower) / (mb + 1e-9)).fillna(0).values
     df[f'{p}bb_per'] = ((c - lower) / (upper - lower + 1e-9)).fillna(0).values
+    kc_mid = c.ewm(span=20, adjust=False).mean()
+    kc_upper = kc_mid + (1.5 * atr14)
+    kc_lower = kc_mid - (1.5 * atr14)
+    df[f'{p}kc_width'] = ((kc_upper - kc_lower) / (kc_mid + 1e-9)).fillna(0).values
+    df[f'{p}is_squeeze'] = (df[f'{p}bb_width'] < df[f'{p}kc_width']).astype(int).values
 
     # 6. Sharp vs Smooth Momentum (RSI)
     delta = c.diff()
@@ -119,8 +242,38 @@ def add_features_single(df: pd.DataFrame, prefix: str = '', compute_vwap: bool =
         df[f'{p}rsi{period}'] = (100 - 100 / (1 + rs)).fillna(50).values
 
     # 7. Volume Spike Detection
-    vol_ma_short = v.rolling(10).mean()
-    df[f'{p}vol_ratio_s'] = (v / (vol_ma_short + 1e-9)).fillna(1).values
+    vol_ma_short = v_clean.rolling(10).mean()
+    df[f'{p}vol_ratio_s'] = (v_clean / (vol_ma_short + 1e-9)).fillna(1).values
+
+    # 7b. Volume Split Delta Proxy
+    # Split candle volume into buy/sell pressure using wick/body geometry.
+    tw = np.maximum(h, pc) - np.maximum(o, c)
+    bw = np.minimum(o, c) - np.minimum(l, pc)
+    body = np.abs(o - c)
+    tw_sq = tw * tw
+    bw_sq = bw * bw
+    body_sq = body * body
+    total_sq = tw_sq + bw_sq + body_sq
+    special_move = bw + (c - o) - tw
+    cond = special_move >= 0
+    buy_share = bw_sq + np.where(cond, body_sq, 0.0)
+    sell_share = tw_sq + np.where(~cond, body_sq, 0.0)
+    buy_ratio = np.where(total_sq > 0, buy_share / total_sq, 0.5)
+    sell_ratio = np.where(total_sq > 0, sell_share / total_sq, 0.5)
+    split_buy_vol = v_clean * buy_ratio
+    split_sell_vol = v_clean * sell_ratio
+    split_delta = split_buy_vol - split_sell_vol
+    split_delta_ema5 = split_delta.ewm(span=5, adjust=False).mean()
+    split_delta_ema20 = split_delta.ewm(span=20, adjust=False).mean()
+    split_delta_std20 = split_delta.rolling(20).std()
+    split_vol_sum5 = v_clean.rolling(5).sum()
+    df[f'{p}split_buy_vol'] = split_buy_vol.fillna(0).values
+    df[f'{p}split_sell_vol'] = split_sell_vol.fillna(0).values
+    df[f'{p}split_delta'] = split_delta.fillna(0).values
+    df[f'{p}split_delta_ratio'] = (split_delta / (v_clean + 1e-9)).fillna(0).values
+    df[f'{p}split_delta_ema_gap'] = ((split_delta_ema5 - split_delta_ema20) / (vol_ma_short + 1e-9)).fillna(0).values
+    df[f'{p}split_delta_z20'] = ((split_delta - split_delta.rolling(20).mean()) / (split_delta_std20 + 1e-9)).fillna(0).values
+    df[f'{p}split_pressure5'] = (split_delta.rolling(5).sum() / (split_vol_sum5 + 1e-9)).fillna(0).values
 
     # 8. Intraday VWAP — controlled by compute_vwap param (never via prefix heuristic)
     if compute_vwap and 'time' in df.columns:
@@ -174,6 +327,9 @@ def add_features_single(df: pd.DataFrame, prefix: str = '', compute_vwap: bool =
     # 12. ATR Regime Slope — is volatility expanding (+) or contracting (−)?
     atr14_5ago = atr14.shift(5).fillna(atr14)
     df[f'{p}atr_trend'] = ((atr14 - atr14_5ago) / (atr14_5ago + 1e-9)).fillna(0).values
+    atr14_ma50 = atr14.rolling(VOL_GATE_LOOKBACK).mean()
+    df[f'{p}atr_regime50'] = ((atr14 / (atr14_ma50 + 1e-9)) - 1.0).fillna(0).values
+    df[f'{p}atr_expanding'] = (atr14 > atr14_ma50).astype(int).values
 
     # 13. RSI Acceleration — 3-bar delta of RSI-14 (momentum of momentum)
     gain14 = delta.clip(lower=0).rolling(14).mean()
@@ -196,12 +352,21 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df['day_of_month'] = t.dt.day
     df['week_of_year'] = t.dt.isocalendar().week.astype(int)
 
-    # More granular session representation
-    # Covers full 24-hour clock: -1=pre-market (<9), 0-6=market hours (9-16), 7=after-hours (>=16)
-    bins   = [0, 9, 10, 11, 12, 13, 14, 15, 16, 24]
-    labels = [-1, 0, 1, 2, 3, 4, 5, 6, 7]
-    df['session'] = pd.cut(t.dt.hour, bins=bins, labels=labels,
-                           right=False, include_lowest=True).astype(float).fillna(-1)
+    # NSE session buckets from the CSV's IST bar-open timestamps.
+    # Regular 1H bars are stamped 09:00, 10:00, ..., 15:00; special sessions
+    # such as Muhurat Trading remain outside the regular buckets as -1.
+    mins = (t.dt.hour * 60) + t.dt.minute
+    df['session'] = np.select(
+        [
+            (mins >= 9 * 60) & (mins < 9 * 60 + 30),
+            (mins >= 9 * 60 + 30) & (mins < 11 * 60),
+            (mins >= 11 * 60) & (mins < 13 * 60),
+            (mins >= 13 * 60) & (mins < 14 * 60 + 30),
+            (mins >= 14 * 60 + 30) & (mins < 15 * 60 + 30),
+        ],
+        [0, 1, 2, 3, 4],
+        default=-1
+    ).astype(float)
 
     # Day of week and month as cyclical features
     df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
@@ -251,15 +416,27 @@ def merge_higher_tf(df_1h: pd.DataFrame,
     df_1m_feat['m_open']  = df_1m['open'].values # Added open
     df_1m_feat['m_volume'] = df_1m['volume'].values # Added volume
 
+    # ── LOOK-AHEAD FIX: Shift higher-TF timestamps forward by one full period ──
+    # CSV bars are timestamped at bar-OPEN (start of period).
+    # Without this shift, merge_asof matches TODAY's incomplete daily bar to
+    # intraday bars, leaking the full day's H/L/C as features mid-day.
+    # Shifting by +1 period means only COMPLETED (closed) bars are available.
+    df_1d_feat['time'] = df_1d_feat['time'] + pd.Timedelta(days=1)
+    df_1w_feat['time'] = df_1w_feat['time'] + pd.Timedelta(weeks=1)
+    m_times = df_1m_feat['time']
+    m_next_times = m_times.shift(-1)
+    m_gap_fallback = m_times.diff().dropna().median() if len(m_times) > 1 else pd.DateOffset(months=1)
+    df_1m_feat['time'] = m_next_times.where(m_next_times.notna(), m_times + m_gap_fallback)
+
     # Sort for merge_asof
     df_1h = df_1h.sort_values('time')
     df_1d_feat = df_1d_feat.sort_values('time')
     df_1w_feat = df_1w_feat.sort_values('time')
     df_1m_feat = df_1m_feat.sort_values('time')
 
-    merged = pd.merge_asof(df_1h, df_1d_feat, on='time', direction='backward', tolerance=pd.Timedelta('1 day')) # Added tolerance for daily
-    merged = pd.merge_asof(merged, df_1w_feat, on='time', direction='backward', tolerance=pd.Timedelta('7 days')) # Added tolerance for weekly
-    merged = pd.merge_asof(merged, df_1m_feat, on='time', direction='backward', tolerance=pd.Timedelta('31 days')) # Added tolerance for monthly
+    merged = pd.merge_asof(df_1h, df_1d_feat, on='time', direction='backward', tolerance=pd.Timedelta('2 days'))
+    merged = pd.merge_asof(merged, df_1w_feat, on='time', direction='backward', tolerance=pd.Timedelta('14 days'))
+    merged = pd.merge_asof(merged, df_1m_feat, on='time', direction='backward', tolerance=pd.Timedelta('62 days'))
 
     # Position within daily/weekly/monthly range - handle potential NaNs from tolerance
     dr = (merged['d_high'] - merged['d_low']).replace(0, np.nan)
@@ -281,20 +458,285 @@ def merge_higher_tf(df_1h: pd.DataFrame,
 # 3. TARGET
 # ─────────────────────────────────────────────
 
-def add_target(df: pd.DataFrame, ahead: int = 1) -> pd.DataFrame:
-    """
-    Target: next 1H bar direction defined by price movement.
+def _lift_stop(stop: float, candidate: float, is_long: bool) -> float:
+    return max(stop, candidate) if is_long else min(stop, candidate)
 
-    We use binary (1=up, 0=down) for the main model — cleanest signal.
-    'ahead' parameter allows for predicting further into the future.
+
+def _favorable_touch(price: float, level: float, is_long: bool) -> bool:
+    return price >= level if is_long else price <= level
+
+
+def _adverse_touch(price: float, level: float, is_long: bool) -> bool:
+    return price <= level if is_long else price >= level
+
+
+def _realized_r(entry_price: float, exit_price: float, risk_dist: float, fraction: float, is_long: bool) -> float:
+    gross = (exit_price - entry_price) if is_long else (entry_price - exit_price)
+    return (gross / (risk_dist + 1e-9)) * fraction
+
+
+def _fee_r(price: float, risk_dist: float, fraction: float, fee_pct: float) -> float:
+    return (price * fee_pct / (risk_dist + 1e-9)) * fraction
+
+
+def simulate_trade_path_from_arrays(opens: np.ndarray,
+                                    highs: np.ndarray,
+                                    lows: np.ndarray,
+                                    closes: np.ndarray,
+                                    times: np.ndarray | None,
+                                    entry_idx: int,
+                                    direction: str,
+                                    risk_dist: float,
+                                    horizon: int = BARRIER_HORIZON_BARS,
+                                    fee_pct: float = EXEC_FEE_PCT,
+                                    slippage_bps: float = EXEC_SLIPPAGE_BPS) -> dict:
+    """Simulate the exact trade plan used by both training labels and backtest.
+
+    Execution model:
+    - Entry on next bar open with slippage.
+    - 50% off at TP1 = 1R.
+    - Move stop to breakeven after TP1.
+    - 25% off at TP2 = 2R.
+    - Raise stop to TP1 after TP2.
+    - Trail the final 25% using a 1R stop behind close.
+    - Force-close any remainder at horizon expiry.
+    - Same-bar ambiguities are resolved conservatively against the trade.
     """
-    # Shift target calculation by 'ahead' bars to predict 'ahead' steps into the future
-    next_close = df['close'].shift(-ahead)
-    df['target'] = (next_close - df['close'] > 0).astype(int)
-    df['next_ret_pct'] = (next_close - df['close']) / df['close'] * 100
-    
-    # Drop rows where target couldn't be calculated
-    df = df.dropna(subset=['target'])
+    n = len(opens)
+    if entry_idx >= n or risk_dist <= 0 or not np.isfinite(risk_dist):
+        return {'total_r': np.nan, 'exit_idx': entry_idx, 'exit_time': None, 'exit_reason': 'INVALID'}
+
+    is_long = direction.upper() == 'LONG'
+    raw_entry = float(opens[entry_idx])
+    if not np.isfinite(raw_entry):
+        return {'total_r': np.nan, 'exit_idx': entry_idx, 'exit_time': None, 'exit_reason': 'INVALID_ENTRY'}
+
+    entry_price = raw_entry * (1 + slippage_bps) if is_long else raw_entry * (1 - slippage_bps)
+    stop = entry_price - risk_dist if is_long else entry_price + risk_dist
+    tp1 = entry_price + (risk_dist * TP1_R_MULT) if is_long else entry_price - (risk_dist * TP1_R_MULT)
+    tp2 = entry_price + (risk_dist * TP2_R_MULT) if is_long else entry_price - (risk_dist * TP2_R_MULT)
+    remaining = {'tp1': TP1_FRACTION, 'tp2': TP2_FRACTION, 'runner': RUNNER_FRACTION}
+    total_r = -_fee_r(entry_price, risk_dist, 1.0, fee_pct)
+    tp1_hit = False
+    tp2_hit = False
+    exit_reason = 'TIME_EXIT'
+    exit_idx = min(n - 1, entry_idx + max(horizon - 1, 0))
+    last_fill_price = entry_price
+
+    def remaining_total() -> float:
+        return float(remaining['tp1'] + remaining['tp2'] + remaining['runner'])
+
+    def fill_fraction(key: str, fill_price: float) -> None:
+        nonlocal total_r, last_fill_price
+        fraction = remaining[key]
+        if fraction <= 0:
+            return
+        total_r += _realized_r(entry_price, fill_price, risk_dist, fraction, is_long)
+        total_r -= _fee_r(fill_price, risk_dist, fraction, fee_pct)
+        remaining[key] = 0.0
+        last_fill_price = fill_price
+
+    def fill_all_remaining(fill_price: float) -> None:
+        nonlocal total_r, last_fill_price
+        leftover = remaining_total()
+        if leftover <= 0:
+            return
+        total_r += _realized_r(entry_price, fill_price, risk_dist, leftover, is_long)
+        total_r -= _fee_r(fill_price, risk_dist, leftover, fee_pct)
+        remaining['tp1'] = 0.0
+        remaining['tp2'] = 0.0
+        remaining['runner'] = 0.0
+        last_fill_price = fill_price
+
+    last_idx = min(n - 1, entry_idx + max(horizon - 1, 0))
+    for j in range(entry_idx, last_idx + 1):
+        bar_open = float(opens[j])
+        bar_high = float(highs[j])
+        bar_low = float(lows[j])
+        bar_close = float(closes[j])
+        if not np.isfinite(bar_open) or not np.isfinite(bar_high) or not np.isfinite(bar_low) or not np.isfinite(bar_close):
+            exit_reason = 'BAD_BAR'
+            exit_idx = j
+            break
+
+        if _adverse_touch(bar_open, stop, is_long):
+            fill_all_remaining(bar_open)
+            exit_reason = 'SL_GAP'
+            exit_idx = j
+            break
+
+        if remaining['tp1'] > 0 and _favorable_touch(bar_open, tp1, is_long):
+            fill_fraction('tp1', tp1)
+            tp1_hit = True
+            stop = _lift_stop(stop, entry_price, is_long)
+
+        if remaining['tp2'] > 0 and _favorable_touch(bar_open, tp2, is_long):
+            fill_fraction('tp2', tp2)
+            tp2_hit = True
+            stop = _lift_stop(stop, tp1, is_long)
+
+        if remaining_total() <= 0:
+            exit_reason = 'TARGETS_GAP_FILLED'
+            exit_idx = j
+            break
+
+        bar_best = bar_high if is_long else bar_low
+        bar_worst = bar_low if is_long else bar_high
+        favorable_same_bar = (
+            (remaining['tp1'] > 0 and _favorable_touch(bar_best, tp1, is_long)) or
+            (remaining['tp2'] > 0 and _favorable_touch(bar_best, tp2, is_long))
+        )
+        adverse_same_bar = _adverse_touch(bar_worst, stop, is_long)
+
+        if adverse_same_bar and favorable_same_bar:
+            fill_all_remaining(stop)
+            exit_reason = 'AMBIGUOUS_BAR_SL'
+            exit_idx = j
+            break
+        if adverse_same_bar:
+            fill_all_remaining(stop)
+            exit_reason = 'SL_HIT'
+            exit_idx = j
+            break
+
+        if remaining['tp1'] > 0 and _favorable_touch(bar_best, tp1, is_long):
+            fill_fraction('tp1', tp1)
+            tp1_hit = True
+            stop = _lift_stop(stop, entry_price, is_long)
+            if remaining_total() <= 0:
+                exit_reason = 'TP1_FILLED'
+                exit_idx = j
+                break
+            if _adverse_touch(bar_worst, stop, is_long):
+                fill_all_remaining(stop)
+                exit_reason = 'POST_TP1_STOP'
+                exit_idx = j
+                break
+
+        if remaining['tp2'] > 0 and _favorable_touch(bar_best, tp2, is_long):
+            fill_fraction('tp2', tp2)
+            tp2_hit = True
+            stop = _lift_stop(stop, tp1, is_long)
+            if remaining_total() <= 0:
+                exit_reason = 'TP2_FILLED'
+                exit_idx = j
+                break
+            if _adverse_touch(bar_worst, stop, is_long):
+                fill_all_remaining(stop)
+                exit_reason = 'POST_TP2_STOP'
+                exit_idx = j
+                break
+
+        if remaining['runner'] > 0 and tp1_hit:
+            trail_base = tp1 if tp2_hit else entry_price
+            trail_candidate = bar_close - (risk_dist * TRAIL_R_MULT) if is_long else bar_close + (risk_dist * TRAIL_R_MULT)
+            stop = _lift_stop(stop, trail_base, is_long)
+            stop = _lift_stop(stop, trail_candidate, is_long)
+
+    else:
+        fill_all_remaining(float(closes[last_idx]))
+        exit_reason = 'TIME_EXIT'
+        exit_idx = last_idx
+
+    if remaining_total() > 0 and exit_reason in {'BAD_BAR'}:
+        fill_all_remaining(float(closes[min(exit_idx, n - 1)]))
+
+    exit_time = None if times is None else times[min(exit_idx, n - 1)]
+    return {
+        'entry_idx': entry_idx,
+        'entry_price': entry_price,
+        'exit_price': float(last_fill_price),
+        'exit_idx': min(exit_idx, n - 1),
+        'exit_time': exit_time,
+        'exit_reason': exit_reason,
+        'total_r': float(total_r),
+        'tp1_hit': tp1_hit,
+        'tp2_hit': tp2_hit,
+        'final_stop': float(stop)
+    }
+
+
+def add_target(df: pd.DataFrame,
+               atr_mult: float = BARRIER_ATR_MULT,
+               horizon: int = BARRIER_HORIZON_BARS,
+               atr_col: str = 'atr14',
+               drop_unresolved: bool = True) -> pd.DataFrame:
+    """
+    Target: whichever direction would have produced the better executed trade.
+
+    The long and short paths are both simulated using the exact trading plan
+    (TP1, TP2, breakeven move, trailing stop, fees/slippage, and max-hold).
+    Training keeps only decisive bars where one side has a meaningful edge.
+    """
+    df = df.copy()
+    n = len(df)
+    opens = df['open'].to_numpy(dtype=float)
+    highs = df['high'].to_numpy(dtype=float)
+    lows = df['low'].to_numpy(dtype=float)
+    closes = df['close'].to_numpy(dtype=float)
+    times = df['time'].to_numpy() if 'time' in df.columns else None
+    atrs = df[atr_col].to_numpy(dtype=float)
+
+    target = np.full(n, np.nan, dtype=float)
+    next_ret_pct = np.full(n, np.nan, dtype=float)
+    bars_to_target = np.full(n, np.nan, dtype=float)
+    entry_prices = np.full(n, np.nan, dtype=float)
+    target_distances = np.full(n, np.nan, dtype=float)
+    long_path_r = np.full(n, np.nan, dtype=float)
+    short_path_r = np.full(n, np.nan, dtype=float)
+    target_edge_r = np.full(n, np.nan, dtype=float)
+    best_path_r = np.full(n, np.nan, dtype=float)
+
+    last_start_idx = max(-1, n - horizon - 1)
+    for i in range(last_start_idx + 1):
+        entry_idx = i + 1
+        dist = atrs[i] * atr_mult
+        if not np.isfinite(dist) or dist <= 0:
+            continue
+
+        long_trade = simulate_trade_path_from_arrays(
+            opens, highs, lows, closes, times, entry_idx, 'LONG', dist, horizon=horizon
+        )
+        short_trade = simulate_trade_path_from_arrays(
+            opens, highs, lows, closes, times, entry_idx, 'SHORT', dist, horizon=horizon
+        )
+
+        long_r = long_trade['total_r']
+        short_r = short_trade['total_r']
+        if not np.isfinite(long_r) or not np.isfinite(short_r):
+            continue
+
+        long_path_r[i] = long_r
+        short_path_r[i] = short_r
+        best_path_r[i] = max(long_r, short_r)
+        target_edge_r[i] = abs(long_r - short_r)
+        entry_prices[i] = long_trade['entry_price']
+        target_distances[i] = dist
+
+        if long_r >= short_r + MIN_LABEL_EDGE_R and long_r >= MIN_LABEL_BEST_R:
+            target[i] = 1.0
+            next_ret_pct[i] = (long_r * dist / (entry_prices[i] + 1e-9)) * 100.0
+            bars_to_target[i] = long_trade['exit_idx'] - i
+        elif short_r >= long_r + MIN_LABEL_EDGE_R and short_r >= MIN_LABEL_BEST_R:
+            target[i] = 0.0
+            next_ret_pct[i] = -(short_r * dist / (entry_prices[i] + 1e-9)) * 100.0
+            bars_to_target[i] = short_trade['exit_idx'] - i
+
+    df['target'] = target
+    df['next_ret_pct'] = next_ret_pct
+    df['bars_to_target'] = bars_to_target
+    df['entry_price_next_bar'] = entry_prices
+    df['target_distance'] = target_distances
+    df['long_path_r'] = long_path_r
+    df['short_path_r'] = short_path_r
+    df['target_edge_r'] = target_edge_r
+    df['best_path_r'] = best_path_r
+
+    if drop_unresolved:
+        df = df.dropna(subset=['target'])
+        df['target'] = df['target'].astype(int)
+    else:
+        df['target'] = df['target'].astype('Int64')
     return df
 
 
@@ -302,11 +744,57 @@ def add_target(df: pd.DataFrame, ahead: int = 1) -> pd.DataFrame:
 # 4. WALK-FORWARD VALIDATION (Optimized for CPU)
 # ─────────────────────────────────────────────
 
+def _build_lgbm_classifier() -> lgb.LGBMClassifier:
+    return lgb.LGBMClassifier(
+        n_estimators=800,
+        learning_rate=0.02,
+        num_leaves=31,
+        max_depth=5,
+        min_child_samples=40,
+        subsample=0.75,
+        subsample_freq=1,
+        colsample_bytree=0.75,
+        reg_alpha=0.15,
+        reg_lambda=0.15,
+        random_state=42,
+        n_jobs=MODEL_N_JOBS,
+        verbose=-1,
+        objective='binary',
+        metric='logloss'
+    )
+
+
+def _fit_lgbm_with_inner_validation(X_train_full: pd.DataFrame,
+                                    y_train_full: pd.Series) -> tuple[lgb.LGBMClassifier, pd.DataFrame, pd.Series]:
+    inner_val_size = max(100, int(len(X_train_full) * 0.15))
+    inner_val_size = min(inner_val_size, len(X_train_full) - 1)
+    if inner_val_size <= 0:
+        raise ValueError("Not enough training rows for inner validation.")
+
+    X_train_inner = X_train_full.iloc[:-inner_val_size]
+    y_train_inner = y_train_full.iloc[:-inner_val_size]
+    X_val_inner   = X_train_full.iloc[-inner_val_size:]
+    y_val_inner   = y_train_full.iloc[-inner_val_size:]
+
+    model = _build_lgbm_classifier()
+    model.fit(
+        X_train_inner, y_train_inner,
+        eval_set=[(X_val_inner, y_val_inner)],
+        eval_metric='logloss',
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=60, verbose=False),
+            lgb.log_evaluation(period=10000)
+        ]
+    )
+    return model, X_val_inner, y_val_inner
+
+
 def walk_forward(df: pd.DataFrame,
                  feature_cols: list,
                  n_splits: int = 10,
                  min_train_bars: int = 2000,
-                 test_size_ratio: float = 0.15
+                 test_size_ratio: float = 0.15,
+                 purge_gap: int = 24
                  ) -> dict:
     """
     Pure walk-forward: train on past, test on strictly future window.
@@ -326,16 +814,20 @@ def walk_forward(df: pd.DataFrame,
     split_points = []
     current_train_end = min_train_bars
     while current_train_end < n:
-        test_window_size = max(int(n * test_size_ratio), 100) # Ensure a minimum test window size, e.g., 100 bars
+        test_window_size = max(int(n * test_size_ratio), 100)
         test_end = min(current_train_end + test_window_size, n)
         
-        if test_end <= current_train_end: # Should not happen if test_size_ratio is reasonable
+        if test_end <= current_train_end:
+            break
+        
+        # DEGENERATE SPLIT GUARD: skip splits with fewer than 50 test bars
+        if (test_end - current_train_end) < 50:
             break
         
         split_points.append((current_train_end, test_end))
         current_train_end = test_end
         
-        if len(split_points) >= n_splits: # Cap number of splits if data is very long
+        if len(split_points) >= n_splits:
             break
 
     if not split_points:
@@ -346,6 +838,8 @@ def walk_forward(df: pd.DataFrame,
           f"min_train_bars={min_train_bars}, test_ratio={test_size_ratio:.2f}")
     print(f"  Total bars: {n}")
 
+    feature_cols = list(feature_cols)
+
     results = []
     feature_importance_sum = np.zeros(len(feature_cols))
     all_test_preds = []
@@ -355,8 +849,10 @@ def walk_forward(df: pd.DataFrame,
     oos_proba_map: dict = {}
 
     for i, (train_end, test_end) in enumerate(split_points):
-        X_train_full = df[feature_cols].iloc[:train_end]
-        y_train_full = df['target'].iloc[:train_end]
+        # PURGE GAP: skip `purge_gap` bars between train and test to break autocorrelation
+        purged_train_end = max(0, train_end - purge_gap)
+        X_train_full = df[feature_cols].iloc[:purged_train_end]
+        y_train_full = df['target'].iloc[:purged_train_end]
         X_test       = df[feature_cols].iloc[train_end:test_end]
         y_test       = df['target'].iloc[train_end:test_end]
         
@@ -365,43 +861,16 @@ def walk_forward(df: pd.DataFrame,
 
         # ── UME-1 FIX: Inner validation from TRAINING window only ──
         # Test fold is never seen by eval_set — no lookahead pollution.
-        inner_val_size = max(100, int(len(X_train_full) * 0.15))
-        X_train_inner = X_train_full.iloc[:-inner_val_size]
-        y_train_inner = y_train_full.iloc[:-inner_val_size]
-        X_val_inner   = X_train_full.iloc[-inner_val_size:]
-        y_val_inner   = y_train_full.iloc[-inner_val_size:]
+        model, X_val_inner, y_val_inner = _fit_lgbm_with_inner_validation(X_train_full, y_train_full)
 
-        # ── UME-5 FIX: Fixed random_state=42 — fully reproducible across runs ──
-        model = lgb.LGBMClassifier(
-            n_estimators=800,
-            learning_rate=0.02,
-            num_leaves=31,
-            max_depth=5,
-            min_child_samples=40,
-            subsample=0.75,
-            subsample_freq=1,
-            colsample_bytree=0.75,
-            reg_alpha=0.15,
-            reg_lambda=0.15,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1,
-            objective='binary',
-            metric='logloss'
-        )
-        
-        model.fit(
-            X_train_inner, y_train_inner,
-            eval_set=[(X_val_inner, y_val_inner)],  # UME-1 FIX: inner-train val only
-            eval_metric='logloss',
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=60, verbose=False),
-                lgb.log_evaluation(period=10000)
-            ]
-        )
+        # M4 FIX: Isotonic calibration on inner validation set
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.frozen import FrozenEstimator
+        calibrated_model = CalibratedClassifierCV(FrozenEstimator(model), method='isotonic')
+        calibrated_model.fit(X_val_inner, y_val_inner)
 
-        preds = model.predict(X_test)
-        proba = model.predict_proba(X_test)[:, 1] # Probability of class 1 (UP)
+        preds = calibrated_model.predict(X_test)
+        proba = calibrated_model.predict_proba(X_test)[:, 1]
         acc   = accuracy_score(y_test, preds)
 
         # ── UME-2 FIX: Record every OOS prediction by its bar's timestamp ──
@@ -411,12 +880,7 @@ def walk_forward(df: pd.DataFrame,
                 oos_proba_map[pd.Timestamp(ts)] = float(prob)
 
         # High-confidence subset analysis
-        confidence_threshold_high = 0.60
-        confidence_threshold_low  = 0.40
-
-        conf_mask_up   = proba > confidence_threshold_high
-        conf_mask_down = proba < confidence_threshold_low
-        conf_mask = conf_mask_up | conf_mask_down
+        conf_mask = np.maximum(proba, 1.0 - proba) >= LIVE_CONFIDENCE_THRESHOLD
         
         acc_conf  = np.nan
         high_conf_bars_count = conf_mask.sum()
@@ -443,29 +907,13 @@ def walk_forward(df: pd.DataFrame,
         
         conf_str = f"{acc_conf:.3f}" if not np.isnan(acc_conf) else " n/a"
         print(f"  Split {i+1:2d} | Train:{train_end:>6} | Test:{len(X_test):>5} | "
-              f"Acc:{acc:.3f} | ConfAcc({confidence_threshold_high}%):{conf_str} | "
+              f"Acc:{acc:.3f} | ConfAcc(>={LIVE_CONFIDENCE_THRESHOLD:.2f}):{conf_str} | "
               f"ConfBars:{conf_mask.mean()*100:5.1f}% | Baseline(UP):{y_test.mean():.3f}")
 
     # ── UME-2 FIX: Final model for LIVE INFERENCE ONLY ──
     # Trained on all history so live predictions use the fullest possible signal.
     # Any backtest MUST use oos_proba_map — never batch-predict from this model on historical data.
-    final_model = lgb.LGBMClassifier(
-        n_estimators=800,
-        learning_rate=0.02,
-        num_leaves=31,
-        max_depth=5,
-        min_child_samples=40,
-        subsample=0.75,
-        subsample_freq=1,
-        colsample_bytree=0.75,
-        reg_alpha=0.15,
-        reg_lambda=0.15,
-        n_jobs=-1,
-        verbose=-1,
-        objective='binary',
-        metric='logloss',
-        random_state=42
-    )
+    final_model = _build_lgbm_classifier()
     final_model.fit(df[feature_cols], df['target']) # Train on all available history
 
     # Overall accuracy calculation
@@ -488,7 +936,7 @@ def walk_forward(df: pd.DataFrame,
 # 5. REPORT CHART (Visual Enhancements)
 # ─────────────────────────────────────────────
 
-def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
+def save_report(wf_results: dict, save_path: str, pred_info: dict = None, symbol: str = 'UNKNOWN'):
     if not wf_results or 'splits' not in wf_results or not wf_results['splits']:
         print("  No walk-forward results to plot.")
         return
@@ -538,7 +986,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
         
         report_text = (
             f"======================================================================\n"
-            f"  {symbol_display} ULTIMATE FORECAST (NEXT BAR WITH EXACT TARGETS)\n"
+            f"  {symbol_display} ULTIMATE FORECAST (EXECUTION-ALIGNED)\n"
             f"======================================================================\n"
             f"  Bar time    : {pred_info['time']}\n"
             f"  Direction   : {pred_info['dir']}\n"
@@ -549,6 +997,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
             f"  Stop Loss   : {pred_info['sl']}\n"
             f"  Target 1    : {pred_info['tp1']}\n"
             f"  Target 2    : {pred_info['tp2']}\n"
+            f"  Trail Stop  : {pred_info['trail']}\n"
             f"======================================================================"
         )
         ax1.text(0.5, 0.5, report_text, color=bg_color, fontsize=16, 
@@ -558,7 +1007,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
     # — 2. CODER ACCURACY PLOT —
     x = splits['split']
     ax2.plot(x, splits['accuracy'],     'o-', color=accent_color_1, lw=2, label='Split Accuracy')
-    ax2.plot(x, splits['acc_high_conf'],'s--',color=accent_color_2, lw=2, label='High-Confidence Accuracy (>60%)')
+    ax2.plot(x, splits['acc_high_conf'],'s--',color=accent_color_2, lw=2, label=f'High-Confidence Accuracy (>={LIVE_CONFIDENCE_THRESHOLD:.2f})')
     ax2.axhline(splits_summary['baseline_up'], color=accent_color_3, ls=':', lw=1.5, label=f"Always-UP baseline ({splits_summary['baseline_up']:.2f})")
     ax2.axhline(0.5, color='#777777', ls=':', lw=1)
     
@@ -589,7 +1038,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
     else:
         ax3.text(0.5, 0.5, "No significant features", color=light_text_color, ha='center', va='center')
 
-    fig.suptitle('BANKNIFTY Futures — ML Performance Report', color='white', fontsize=18, fontweight='bold', y=0.98)
+    fig.suptitle(f'{(pred_info or {}).get("symbol", symbol).upper()} — ML Performance Report', color='white', fontsize=18, fontweight='bold', y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(save_path, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
     plt.close()
@@ -600,7 +1049,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
 # 6. PREDICTION FUNCTION (live use)
 # ─────────────────────────────────────────────
 
-def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidence_threshold: float = 0.60) -> dict:
+def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidence_threshold: float = LIVE_CONFIDENCE_THRESHOLD) -> dict:
     """
     Pass in the latest fully-formed 1H row (with all features computed).
     Returns direction prediction + confidence.
@@ -641,7 +1090,11 @@ def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidenc
     prob_down = round(1 - proba, 4)
     confidence = max(prob_up, prob_down)
     
-    signal = 'STRONG' if confidence >= confidence_threshold else ('MODERATE' if confidence > 0.55 else 'WEAK')
+    volatility_ok = bool(latest_row.get('atr_expanding', 1))
+    if confidence < confidence_threshold or not volatility_ok:
+        signal = 'NO_TRADE'
+    else:
+        signal = 'STRONG'
     
     return {
         'direction': direction,
@@ -715,8 +1168,13 @@ if __name__ == '__main__':
     print("\n  [+] Constructing Secondary 1D Target Model...")
     df_1d_model = add_features_single(df_1d.copy(), prefix='d_')
     
-    # Predict next 1D bar close > current 1D close
-    df_1d_model['target'] = (df_1d_model['close'].shift(-1) - df_1d_model['close'] > 0).astype(int)
+    df_1d_model = add_target(
+        df_1d_model,
+        atr_mult=BARRIER_ATR_MULT,
+        horizon=10,
+        atr_col='d_atr14',
+        drop_unresolved=True
+    )
     
     exclude_cols_1d = {'time', 'open', 'high', 'low', 'close', 'volume', 'target'}
     feature_cols_1d = [c for c in df_1d_model.columns if c.startswith('d_') and c not in exclude_cols_1d]
@@ -742,6 +1200,11 @@ if __name__ == '__main__':
                 f.write(f"{col}\n")
         print(f"  Final 1D model saved to '{mod_1d_path}'")
 
+        # E3 FIX: Save 1D OOS proba map for honest backtest gating
+        oos_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba_1d.pkl')
+        joblib.dump(wf_results_1d['oos_proba_map'], oos_1d_path)
+        print(f"  1D OOS proba map saved to '{oos_1d_path}' ({len(wf_results_1d['oos_proba_map'])} bars)")
+
     print("\n  Engineering features...")
     
     # 1H features — VWAP computed here only (1H primary timeframe)
@@ -751,12 +1214,19 @@ if __name__ == '__main__':
     # Merge higher TF
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
     
-    # Target - Predicting for the *next* bar (ahead=1)
-    df_full = add_target(df_full, ahead=1)
+    # Target - simulate the full executed trade path and keep only decisive edges
+    df_full = add_target(
+        df_full,
+        atr_mult=BARRIER_ATR_MULT,
+        horizon=BARRIER_HORIZON_BARS,
+        atr_col='atr14',
+        drop_unresolved=True
+    )
     
     # Define feature columns: exclude raw price/time data and target column
     exclude_cols = {'time', 'open', 'high', 'low', 'close', 'volume',
-                    'target', 'next_ret_pct',
+                    'target', 'next_ret_pct', 'bars_to_target', 'entry_price_next_bar', 'target_distance',
+                    'long_path_r', 'short_path_r', 'target_edge_r', 'best_path_r',
                     'd_open', 'd_high', 'd_low', 'd_close', 'd_volume', # Exclude raw higher TF data
                     'w_open', 'w_high', 'w_low', 'w_close', 'w_volume',
                     'm_open', 'm_high', 'm_low', 'm_close', 'm_volume'}
@@ -797,7 +1267,7 @@ if __name__ == '__main__':
         print("  SUMMARY OF WALK-FORWARD VALIDATION")
         print("=" * 70)
         print(f"  Overall Accuracy (All Signals)      : {wf_results['overall_accuracy']:.3f}")
-        print(f"  Overall High-Conf Accuracy (>60%) : {splits_df['acc_high_conf'].mean():.3f}")
+        print(f"  Overall High-Conf Accuracy (>={LIVE_CONFIDENCE_THRESHOLD:.2f}) : {splits_df['acc_high_conf'].mean():.3f}")
         print(f"  Average High-Confidence Bar %       : {splits_df['high_conf_pct'].mean():.1%}")
         print(f"  Average Always-UP Baseline          : {wf_results['overall_baseline_up']:.3f}")
         print(f"  Edge over Baseline                  : {wf_results['overall_accuracy'] - wf_results['overall_baseline_up']:+.3f}")
@@ -822,12 +1292,13 @@ if __name__ == '__main__':
         model = wf_results['final_model']
         feature_cols_to_use = wf_results['feature_cols']
         last_completable_row = df_model_ready.iloc[-1] 
-        pred = predict_next_bar(model, feature_cols_to_use, last_completable_row, confidence_threshold=0.60)
+        pred = predict_next_bar(model, feature_cols_to_use, last_completable_row, confidence_threshold=LIVE_CONFIDENCE_THRESHOLD)
         close_price = float(last_completable_row['close'])
         atr = float(last_completable_row.get('atr14', 150.0))
+        volatility_ok = bool(last_completable_row.get('atr_expanding', 1))
         
         print("\n" + "=" * 70)
-        print(f"  {SYMBOL.upper()} ULTIMATE FORECAST (NEXT BAR WITH EXACT TARGETS)")
+        print(f"  {SYMBOL.upper()} ULTIMATE FORECAST (EXECUTION-ALIGNED)")
         print("=" * 70)
         if 'time' in last_completable_row:
             print(f"  Bar time    : {last_completable_row['time']}")
@@ -837,40 +1308,43 @@ if __name__ == '__main__':
         print("----------------------------------------------------------------------")
         print(f"  Entry Price : {close_price:,.2f} (Current Close)")
 
-        # ─────────────────────────────────────────────
-        # DYNAMIC ML-CONFIDENCE RISK SCALING
-        # Relies on probability confidence to expand or choke trade limits.
-        # e.g., 85% Confidence = 1.7x ATR (Wide breathing room for massive breakout)
-        # e.g., 55% Confidence = 1.1x ATR (Tight stop for low-edge trades)
-        # ─────────────────────────────────────────────
-        risk_m = pred['confidence'] * 2.0 
+        risk_m = BARRIER_ATR_MULT
+        trail_str = f"{TRAIL_R_MULT:.2f}R trailing stop after TP1"
 
-        if pred['direction'] == "UP":
+        if pred['signal_strength'] == 'NO_TRADE':
+            sl_str, tp1_str, tp2_str, trail_str = "N/A", "N/A", "N/A", "N/A"
+            if not volatility_ok:
+                print("  [Filtered out: ATR is below its 50-bar average]")
+            else:
+                print(f"  [Filtered out: confidence below {LIVE_CONFIDENCE_THRESHOLD:.2f}]")
+        elif pred['direction'] == "UP":
             sl_val = close_price - (atr * risk_m)
             tp1_val = close_price + (atr * risk_m)
-            tp2_val = close_price + (atr * risk_m * 2.5) # Massive uncapped runner
-            
+            tp2_val = close_price + (atr * risk_m * TP2_R_MULT)
+
             sl_str = f"{sl_val:,.2f}  (Entry - {risk_m:.2f}x ATR14)"
-            tp1_str = f"{tp1_val:,.2f}  (Entry + {risk_m:.2f}x ATR14)"
-            tp2_str = f"{tp2_val:,.2f}  (Entry + {risk_m*2.5:.2f}x ATR14 [Trailing])"
-            
+            tp1_str = f"{tp1_val:,.2f}  (50% off at +{TP1_R_MULT:.2f}R)"
+            tp2_str = f"{tp2_val:,.2f}  (25% off at +{TP2_R_MULT:.2f}R)"
+
             print(f"  Stop Loss   : {sl_str}")
             print(f"  Target 1    : {tp1_str}")
             print(f"  Target 2    : {tp2_str}")
+            print(f"  Trail Stop  : {trail_str}")
         elif pred['direction'] == "DOWN":
             sl_val = close_price + (atr * risk_m)
             tp1_val = close_price - (atr * risk_m)
-            tp2_val = close_price - (atr * risk_m * 2.5)
-            
+            tp2_val = close_price - (atr * risk_m * TP2_R_MULT)
+
             sl_str = f"{sl_val:,.2f}  (Entry + {risk_m:.2f}x ATR14)"
-            tp1_str = f"{tp1_val:,.2f}  (Entry - {risk_m:.2f}x ATR14)"
-            tp2_str = f"{tp2_val:,.2f}  (Entry - {risk_m*2.5:.2f}x ATR14 [Trailing])"
-            
+            tp1_str = f"{tp1_val:,.2f}  (50% off at +{TP1_R_MULT:.2f}R)"
+            tp2_str = f"{tp2_val:,.2f}  (25% off at +{TP2_R_MULT:.2f}R)"
+
             print(f"  Stop Loss   : {sl_str}")
             print(f"  Target 1    : {tp1_str}")
             print(f"  Target 2    : {tp2_str}")
+            print(f"  Trail Stop  : {trail_str}")
         else:
-            sl_str, tp1_str, tp2_str = "0.0", "0.0", "0.0"
+            sl_str, tp1_str, tp2_str, trail_str = "N/A", "N/A", "N/A", "N/A"
             print("  [No clear directional edge, targets N/A]")
             
         print("======================================================================")
@@ -885,7 +1359,8 @@ if __name__ == '__main__':
             'entry': f"{close_price:,.2f} (Current Close)",
             'sl': sl_str,
             'tp1': tp1_str,
-            'tp2': tp2_str
+            'tp2': tp2_str,
+            'trail': trail_str
         }
 
         # Save the performance chart AND text report in one PNG
@@ -897,6 +1372,18 @@ if __name__ == '__main__':
         print("\n  Top 15 most predictive features:")
         for i, (fname, fval) in enumerate(fi_sorted[:15]):
             print(f"    {i+1}. {fname:<30} {fval:.2f}")
+
+        backtest_script = os.path.join(os.path.dirname(__file__), 'backtest_engine.py')
+        if os.path.exists(backtest_script):
+            print("\n  Launching aligned backtest report generation...")
+            completed = subprocess.run(
+                [sys.executable, backtest_script, '--outdir', DATA_DIR],
+                check=False
+            )
+            if completed.returncode != 0:
+                print(f"  [!] backtest_engine.py exited with code {completed.returncode}")
+        else:
+            print(f"  [!] Missing backtest engine at {backtest_script}")
 
     else:
         print("\nWalk-forward validation did not produce results. Please check errors above.")
