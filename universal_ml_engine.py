@@ -1,7 +1,8 @@
 """
-BANKNIFTY FUTURES — LightGBM Direction Predictor (Optimized)
-Multi-timeframe: 1H primary | 1D + 1W context features
-Walk-forward validated | Runs on i7 4770 / 16GB RAM / no GPU
+Universal ML Direction Predictor — TOON v4.0 (Pure Holographic Engine)
+Geometry-only features: scale-invariant candle shape coordinates.
+No classical indicators. 4 extraction layers. Multi-timeframe pyramid.
+Walk-forward validated | i7-4770 / 16 GB RAM / CPU only
 """
 
 import re
@@ -20,6 +21,13 @@ import sys
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+
+from holographic_engine import (
+    holographic_feature_engine,
+    feature_selection_pipeline,
+    HOLO_WINDOWS_1H, HOLO_WINDOWS_1D, HOLO_WINDOWS_1W, HOLO_WINDOWS_1M,
+    FINAL_FEAT_BUDGET,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -182,278 +190,71 @@ def parse_tv_log(path: str) -> tuple:
 
 
 # ─────────────────────────────────────────────
-# 2. FEATURE ENGINEERING
+# 2. ATR14 — labelling scaffold only
+#    Used by add_target() to set barrier distances.
+#    NEVER passed as a model input feature.
 # ─────────────────────────────────────────────
 
-def add_features_single(df: pd.DataFrame, prefix: str = '', compute_vwap: bool = False) -> pd.DataFrame:
-    """Ultimate Core features on OHLCV dataframe.
-
-    Args:
-        df           : OHLCV DataFrame with time/open/high/low/close/volume.
-        prefix       : Column prefix for higher-TF merged features (e.g. 'd_').
-        compute_vwap : If True, compute intraday VWAP distance.
-                       Must be True ONLY for the 1H primary timeframe.
+def _compute_atr14(df: pd.DataFrame) -> pd.DataFrame:
     """
-    p = prefix
+    Compute atr14 on a dataframe that has 'high', 'low', 'close' columns.
+    Adds a single column 'atr14'. Used exclusively by add_target().
+    The model never sees this column as an input feature.
+    """
     c = df['close']
     h = df['high']
     l = df['low']
-    o = df['open']
-    v = df['volume']
-    v_clean = v.fillna(0.0)
-
-    # 1. Momentum Returns (Immediate, Short, Macro)
-    for w in [1, 5, 21]: 
-        df[f'{p}ret{w}'] = c.pct_change(w).fillna(0).values
-
-    # 2. Candle Structure (Micro-Rejection Dynamics)
-    rng = h - l + 1e-9
-    df[f'{p}body_ratio'] = (np.abs(c - o) / rng).values
-    df[f'{p}upper_wick'] = ((h - np.maximum(c, o)) / rng).values
-    df[f'{p}lower_wick'] = ((np.minimum(c, o) - l) / rng).values
-
-    # 3. Normalized Volatility Regime
     pc = c.shift(1).fillna(c)
-    tr = np.maximum((h - l), np.maximum(np.abs(h - pc), np.abs(l - pc)))
-    atr14 = tr.rolling(14).mean()
-    df[f'{p}atr_norm14'] = (tr / (atr14 + 1e-9)).fillna(0).values 
-    df[f'{p}atr14'] = atr14.fillna(0).values # Keep raw atr14 for stop-loss usage
-
-    # 4. Trend Proximity (Short-term vs Mid-term)
-    for w in [20, 50]:
-        ema = c.ewm(span=w, adjust=False).mean()
-        df[f'{p}ema_pos{w}'] = ((c - ema) / (ema + 1e-9)).fillna(0).values
-
-    # 5. Volatility Squeeze & Standard Deviation Boundaries
-    mb = c.rolling(20).mean()
-    std = c.rolling(20).std()
-    upper = mb + 2 * std
-    lower = mb - 2 * std
-    df[f'{p}bb_width'] = ((upper - lower) / (mb + 1e-9)).fillna(0).values
-    df[f'{p}bb_per'] = ((c - lower) / (upper - lower + 1e-9)).fillna(0).values
-    kc_mid = c.ewm(span=20, adjust=False).mean()
-    kc_upper = kc_mid + (1.5 * atr14)
-    kc_lower = kc_mid - (1.5 * atr14)
-    df[f'{p}kc_width'] = ((kc_upper - kc_lower) / (kc_mid + 1e-9)).fillna(0).values
-    df[f'{p}is_squeeze'] = (df[f'{p}bb_width'] < df[f'{p}kc_width']).astype(int).values
-
-    # 6. Sharp vs Smooth Momentum (RSI)
-    delta = c.diff()
-    for period in [5, 14]:
-        gain = delta.clip(lower=0).rolling(period).mean()
-        loss = (-delta.clip(upper=0)).rolling(period).mean()
-        rs = gain / (loss + 1e-9)
-        df[f'{p}rsi{period}'] = (100 - 100 / (1 + rs)).fillna(50).values
-
-    # 7. Volume Spike Detection
-    vol_ma_short = v_clean.rolling(10).mean()
-    df[f'{p}vol_ratio_s'] = (v_clean / (vol_ma_short + 1e-9)).fillna(1).values
-
-    # 7b. Volume Split Delta Proxy
-    # Split candle volume into buy/sell pressure using wick/body geometry.
-    tw = np.maximum(h, pc) - np.maximum(o, c)
-    bw = np.minimum(o, c) - np.minimum(l, pc)
-    body = np.abs(o - c)
-    tw_sq = tw * tw
-    bw_sq = bw * bw
-    body_sq = body * body
-    total_sq = tw_sq + bw_sq + body_sq
-    special_move = bw + (c - o) - tw
-    cond = special_move >= 0
-    buy_share = bw_sq + np.where(cond, body_sq, 0.0)
-    sell_share = tw_sq + np.where(~cond, body_sq, 0.0)
-    buy_ratio = np.where(total_sq > 0, buy_share / total_sq, 0.5)
-    sell_ratio = np.where(total_sq > 0, sell_share / total_sq, 0.5)
-    split_buy_vol = v_clean * buy_ratio
-    split_sell_vol = v_clean * sell_ratio
-    split_delta = split_buy_vol - split_sell_vol
-    split_delta_ema5 = split_delta.ewm(span=5, adjust=False).mean()
-    split_delta_ema20 = split_delta.ewm(span=20, adjust=False).mean()
-    split_delta_std20 = split_delta.rolling(20).std()
-    split_vol_sum5 = v_clean.rolling(5).sum()
-    df[f'{p}split_buy_vol'] = split_buy_vol.fillna(0).values
-    df[f'{p}split_sell_vol'] = split_sell_vol.fillna(0).values
-    df[f'{p}split_delta'] = split_delta.fillna(0).values
-    df[f'{p}split_delta_ratio'] = (split_delta / (v_clean + 1e-9)).fillna(0).values
-    df[f'{p}split_delta_ema_gap'] = ((split_delta_ema5 - split_delta_ema20) / (vol_ma_short + 1e-9)).fillna(0).values
-    df[f'{p}split_delta_z20'] = ((split_delta - split_delta.rolling(20).mean()) / (split_delta_std20 + 1e-9)).fillna(0).values
-    df[f'{p}split_pressure5'] = (split_delta.rolling(5).sum() / (split_vol_sum5 + 1e-9)).fillna(0).values
-
-    # 8. Intraday VWAP — controlled by compute_vwap param (never via prefix heuristic)
-    if compute_vwap and 'time' in df.columns:
-        df['pv'] = c * v
-        df['date_only'] = df['time'].dt.date
-        group_pv = df.groupby('date_only')['pv'].cumsum()
-        group_v = df.groupby('date_only')['volume'].cumsum()
-        df['vwap'] = group_pv / (group_v + 1e-9)
-        df[f'{p}vwap_dist'] = ((c - df['vwap']) / df['vwap']).fillna(0).values
-        df.drop(['pv', 'date_only', 'vwap'], axis=1, inplace=True)
-
-    # ---------------------------------------------------------
-    # 9. PURE KINEMATICS (Derivative Physics & Structural Bias)
-    # ---------------------------------------------------------
-    c1, c2 = c.shift(1).fillna(c), c.shift(2).fillna(c)
-    
-    # Feature 1: Close Acceleration (2nd Derivative normalized by ATR)
-    df[f'{p}close_accel'] = ((c - 2*c1 + c2) / (atr14 + 1e-9)).fillna(0).values
-    
-    # Feature 2: Wick Imbalance Velocity
-    uw1 = h.shift(1) - np.maximum(c1, o.shift(1))
-    lw1 = np.minimum(c1, o.shift(1)) - l.shift(1)
-    df[f'{p}wick_imb_vel'] = (((df[f'{p}upper_wick'] - df[f'{p}lower_wick']) - (uw1 - lw1)) / (atr14 + 1e-9)).fillna(0).values
-    
-    # Feature 3: Body Convexity (Inflection Point Locator)
-    df[f'{p}body_convex'] = ((2*c - c1 - c2) / (atr14 + 1e-9)).fillna(0).values
-    
-    # Feature 4: Net Thrust Velocity
-    nt = (c - l) / ((h - c) + 1e-9)
-    nt1 = (c1 - l.shift(1)) / ((h.shift(1) - c1) + 1e-9)
-    df[f'{p}net_thrust_vel'] = (nt - nt1).fillna(0).values
-    
-    # Feature 5: Structural Bull Energy (Anti-Sabotage Trap Detection)
-    # 1 if (Green AND Expanding) OR (Red AND Shrinking)
-    is_green = c >= o
-    candle_size = np.sqrt((h - l) * np.abs(c - o))
-    is_expanding = candle_size >= candle_size.shift(1).fillna(0)
-    df[f'{p}struct_bull_energy'] = ((is_green & is_expanding) | (~is_green & ~is_expanding)).astype(int).values
-
-    # 10. Market Regime detection (Choppy vs Trending)
-    # ER near 1 = Strong Trend, ER near 0 = Mean Reverting / Choppy
-    abs_diff = c.diff().abs()
-    net_change = (c - c.shift(20)).abs()
-    volatility = abs_diff.rolling(20).sum()
-    df[f'{p}efficiency_ratio20'] = (net_change / (volatility + 1e-9)).fillna(0.5).values
-
-    # 11. Gap Analysis — open vs prior close (overnight information signal)
-    prev_close = c.shift(1).fillna(c)
-    df[f'{p}gap_ratio'] = ((o - prev_close) / (atr14 + 1e-9)).fillna(0).values
-
-    # 12. ATR Regime Slope — is volatility expanding (+) or contracting (−)?
-    atr14_5ago = atr14.shift(5).fillna(atr14)
-    df[f'{p}atr_trend'] = ((atr14 - atr14_5ago) / (atr14_5ago + 1e-9)).fillna(0).values
-    atr14_ma50 = atr14.rolling(VOL_GATE_LOOKBACK).mean()
-    df[f'{p}atr_regime50'] = ((atr14 / (atr14_ma50 + 1e-9)) - 1.0).fillna(0).values
-    df[f'{p}atr_expanding'] = (atr14 > atr14_ma50).astype(int).values
-
-    # 13. RSI Acceleration — 3-bar delta of RSI-14 (momentum of momentum)
-    gain14 = delta.clip(lower=0).rolling(14).mean()
-    loss14 = (-delta.clip(upper=0)).rolling(14).mean()
-    rsi14_raw = 100 - 100 / (1 + gain14 / (loss14 + 1e-9))
-    df[f'{p}rsi14_accel'] = rsi14_raw.diff(3).fillna(0).values
-
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    df['atr14'] = tr.rolling(14).mean().fillna(tr)
     return df
 
 
-def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Time-based features for 1H data."""
-    t = df['time']
-    df['hour']         = t.dt.hour
-    df['dow']          = t.dt.dayofweek          # 0=Mon
-    df['wom']          = (t.dt.day - 1) // 7     # week of month 0-4
-    df['month']        = t.dt.month
-    df['is_monday']    = (t.dt.dayofweek == 0).astype(int)
-    df['is_friday']    = (t.dt.dayofweek == 4).astype(int)
-    df['day_of_month'] = t.dt.day
-    df['week_of_year'] = t.dt.isocalendar().week.astype(int)
-
-    # NSE session buckets from the CSV's IST bar-open timestamps.
-    # Regular 1H bars are stamped 09:00, 10:00, ..., 15:00; special sessions
-    # such as Muhurat Trading remain outside the regular buckets as -1.
-    mins = (t.dt.hour * 60) + t.dt.minute
-    df['session'] = np.select(
-        [
-            (mins >= 9 * 60) & (mins < 9 * 60 + 30),
-            (mins >= 9 * 60 + 30) & (mins < 11 * 60),
-            (mins >= 11 * 60) & (mins < 13 * 60),
-            (mins >= 13 * 60) & (mins < 14 * 60 + 30),
-            (mins >= 14 * 60 + 30) & (mins < 15 * 60 + 30),
-        ],
-        [0, 1, 2, 3, 4],
-        default=-1
-    ).astype(float)
-
-    # Day of week and month as cyclical features
-    df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
-    df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7)
-    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-
-    return df
 
 
 def merge_higher_tf(df_1h: pd.DataFrame,
                     df_1d: pd.DataFrame,
                     df_1w: pd.DataFrame,
                     df_1m: pd.DataFrame) -> pd.DataFrame:
-    """Merge daily, weekly, and monthly features into 1H dataframe via asof merge."""
-    
-    # Add features to higher TFs
-    df_1d = add_features_single(df_1d.copy(), prefix='d_')
-    df_1w = add_features_single(df_1w.copy(), prefix='w_')
-    df_1m = add_features_single(df_1m.copy(), prefix='m_')
-
-    # Use only the feature columns from higher TFs
-    d_cols = [c for c in df_1d.columns if c.startswith('d_')] + ['time']
-    w_cols = [c for c in df_1w.columns if c.startswith('w_')] + ['time']
-    m_cols = [c for c in df_1m.columns if c.startswith('m_')] + ['time']
-
-    df_1d_feat = df_1d[d_cols].copy()
-    df_1w_feat = df_1w[w_cols].copy()
-    df_1m_feat = df_1m[m_cols].copy()
-
-    # For ASOF merge, higher TF data needs to contain the CLOSE price for "current" value
-    df_1d_feat['d_close'] = df_1d['close'].values
-    df_1d_feat['d_high']  = df_1d['high'].values
-    df_1d_feat['d_low']   = df_1d['low'].values
-    df_1d_feat['d_open']  = df_1d['open'].values # Added open for potential features
-    df_1d_feat['d_volume'] = df_1d['volume'].values # Added volume for potential features
-
-    df_1w_feat['w_close'] = df_1w['close'].values
-    df_1w_feat['w_high']  = df_1w['high'].values
-    df_1w_feat['w_low']   = df_1w['low'].values
-    df_1w_feat['w_open']  = df_1w['open'].values # Added open
-    df_1w_feat['w_volume'] = df_1w['volume'].values # Added volume
-
-    df_1m_feat['m_close'] = df_1m['close'].values
-    df_1m_feat['m_high']  = df_1m['high'].values
-    df_1m_feat['m_low']   = df_1m['low'].values
-    df_1m_feat['m_open']  = df_1m['open'].values # Added open
-    df_1m_feat['m_volume'] = df_1m['volume'].values # Added volume
-
+    """
+    Merge raw OHLCV from daily, weekly, and monthly bars into 1H dataframe.
+    No classical indicators are computed here — the holographic engine handles
+    all feature extraction separately.
+    The look-ahead shift (+1 period) is preserved verbatim.
+    """
     # ── LOOK-AHEAD FIX: Shift higher-TF timestamps forward by one full period ──
-    # CSV bars are timestamped at bar-OPEN (start of period).
-    # Without this shift, merge_asof matches TODAY's incomplete daily bar to
-    # intraday bars, leaking the full day's H/L/C as features mid-day.
-    # Shifting by +1 period means only COMPLETED (closed) bars are available.
+    # Only COMPLETED (closed) bars are available at any given 1H bar.
+    df_1d_feat = df_1d[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
+    df_1w_feat = df_1w[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
+    df_1m_feat = df_1m[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
+
+    df_1d_feat.columns = ['time', 'd_open', 'd_high', 'd_low', 'd_close', 'd_volume']
+    df_1w_feat.columns = ['time', 'w_open', 'w_high', 'w_low', 'w_close', 'w_volume']
+    df_1m_feat.columns = ['time', 'm_open', 'm_high', 'm_low', 'm_close', 'm_volume']
+
     df_1d_feat['time'] = df_1d_feat['time'] + pd.Timedelta(days=1)
     df_1w_feat['time'] = df_1w_feat['time'] + pd.Timedelta(weeks=1)
     m_times = df_1m_feat['time']
-    m_next_times = m_times.shift(-1)
-    m_gap_fallback = m_times.diff().dropna().median() if len(m_times) > 1 else pd.DateOffset(months=1)
-    df_1m_feat['time'] = m_next_times.where(m_next_times.notna(), m_times + m_gap_fallback)
+    m_next  = m_times.shift(-1)
+    m_gap   = m_times.diff().dropna().median() if len(m_times) > 1 else pd.DateOffset(months=1)
+    df_1m_feat['time'] = m_next.where(m_next.notna(), m_times + m_gap)
 
     # Sort for merge_asof
-    df_1h = df_1h.sort_values('time')
+    df_1h     = df_1h.sort_values('time').reset_index(drop=True)
     df_1d_feat = df_1d_feat.sort_values('time')
     df_1w_feat = df_1w_feat.sort_values('time')
     df_1m_feat = df_1m_feat.sort_values('time')
 
-    merged = pd.merge_asof(df_1h, df_1d_feat, on='time', direction='backward', tolerance=pd.Timedelta('2 days'))
-    merged = pd.merge_asof(merged, df_1w_feat, on='time', direction='backward', tolerance=pd.Timedelta('14 days'))
-    merged = pd.merge_asof(merged, df_1m_feat, on='time', direction='backward', tolerance=pd.Timedelta('62 days'))
+    merged = pd.merge_asof(df_1h, df_1d_feat, on='time', direction='backward',
+                           tolerance=pd.Timedelta('2 days'))
+    merged = pd.merge_asof(merged, df_1w_feat, on='time', direction='backward',
+                           tolerance=pd.Timedelta('14 days'))
+    merged = pd.merge_asof(merged, df_1m_feat, on='time', direction='backward',
+                           tolerance=pd.Timedelta('62 days'))
 
-    # Position within daily/weekly/monthly range - handle potential NaNs from tolerance
-    dr = (merged['d_high'] - merged['d_low']).replace(0, np.nan)
-    wr = (merged['w_high'] - merged['w_low']).replace(0, np.nan)
-    mr = (merged['m_high'] - merged['m_low']).replace(0, np.nan)
-    merged['pos_in_daily_range']  = (merged['close'] - merged['d_low']) / dr
-    merged['pos_in_weekly_range'] = (merged['close'] - merged['w_low']) / wr
-    merged['pos_in_monthly_range'] = (merged['close'] - merged['m_low']) / mr
-    
-    # Add relative strength to daily/weekly/monthly close
-    merged['rel_strength_d'] = (merged['close'] - merged['d_close']) / (merged['d_close'] + 1e-9)
-    merged['rel_strength_w'] = (merged['close'] - merged['w_close']) / (merged['w_close'] + 1e-9)
-    merged['rel_strength_m'] = (merged['close'] - merged['m_close']) / (merged['m_close'] + 1e-9)
+    return merged
+
+
 
     return merged
 
@@ -1239,7 +1040,8 @@ def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidenc
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Universal ML Direction Predictor")
-    parser.add_argument('--outdir', type=str, default='/home/km/BankniftyML/', help="Output directory for models and reports")
+    parser.add_argument('--outdir', type=str, default='/home/km/Universal-ML/', help="Output directory for models and reports")
+
     args = parser.parse_args()
 
     DATA_DIR = args.outdir
@@ -1292,107 +1094,105 @@ if __name__ == '__main__':
     print(f"  1W bars : {len(df_1w):>7}  ({df_1w['time'].min().date()} → {df_1w['time'].max().date()})")
     print(f"  1M bars : {len(df_1m):>7}  ({df_1m['time'].min().date()} → {df_1m['time'].max().date()})")
     
-    print("\n  [+] Constructing Secondary 1D Target Model...")
-    df_1d_model = add_features_single(df_1d.copy(), prefix='d_')
-    
-    df_1d_model = add_target(
-        df_1d_model,
-        atr_mult=BARRIER_ATR_MULT,
-        horizon=10,
-        atr_col='d_atr14',
-        drop_unresolved=True
+    print("\n  [TOON v4.0] Building Holographic Feature Engine...")
+    print("  Philosophy: Pure geometry. No classical indicators.")
+
+    # ── Step 1: Compute atr14 on 1H ONLY for labelling scaffold ──────────
+    # atr14 is needed by add_target() to set barrier distances.
+    # It is NEVER passed as a model input feature.
+    df_1h_labelled = _compute_atr14(df_1h.copy())
+
+    # ── Step 2: Run holographic engine on all 4 timeframes ────────────────
+    # Each timeframe processed independently. Look-ahead rule enforced inside.
+    df_full = holographic_feature_engine(
+        df_1h_labelled,
+        df_1d=df_1d,
+        df_1w=df_1w,
+        df_1m=df_1m,
     )
-    
-    exclude_cols_1d = {'time', 'open', 'high', 'low', 'close', 'volume', 'target'}
-    feature_cols_1d = [c for c in df_1d_model.columns if c.startswith('d_') and c not in exclude_cols_1d]
-    
-    df_model_ready_1d = df_1d_model[feature_cols_1d + ['target', 'time', 'close']].copy()
-    for col in feature_cols_1d:
-        df_model_ready_1d[col] = df_model_ready_1d[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-    df_model_ready_1d = df_model_ready_1d.dropna(subset=['target'] + feature_cols_1d).reset_index(drop=True)
-    
-    MIN_TRAIN_BARS_1D = max(200, int(len(df_model_ready_1d) * 0.4))
-    print("\n" + "=" * 70)
-    print("  Walk-Forward Validation for 1D Model")
-    print("=" * 70)
-    wf_results_1d = walk_forward(df_model_ready_1d, feature_cols_1d, n_splits=5, min_train_bars=MIN_TRAIN_BARS_1D, test_size_ratio=0.15)
-    
-    if wf_results_1d:
-        mod_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model_1d.pkl')
-        feat_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features_1d.txt')
-        import joblib
-        joblib.dump(wf_results_1d['final_model'], mod_1d_path)
-        with open(feat_1d_path, 'w') as f:
-            for col in wf_results_1d['feature_cols']:
-                f.write(f"{col}\n")
-        print(f"  Final 1D model saved to '{mod_1d_path}'")
 
-        # E3 FIX: Save 1D OOS proba map for honest backtest gating
-        oos_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba_1d.pkl')
-        joblib.dump(wf_results_1d['oos_proba_map'], oos_1d_path)
-        print(f"  1D OOS proba map saved to '{oos_1d_path}' ({len(wf_results_1d['oos_proba_map'])} bars)")
-
-    print("\n  Engineering features...")
-    
-    # 1H features — VWAP computed here only (1H primary timeframe)
-    df_full = add_features_single(df_1h.copy(), prefix='', compute_vwap=True)  # UME-3 FIX
-    df_full = add_calendar_features(df_full)
-    
-    # Merge higher TF
+    # ── Step 3: ASOF-merge higher-TF timestamps for temporal alignment ────
+    # merge_higher_tf now only brings in raw OHLCV columns with the look-ahead
+    # shift. The holographic engine has already extracted all shape features.
+    print("  [TOON v4.0] Merging higher-TF timestamp anchors...")
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
-    
-    # Target - simulate the full executed trade path and keep only decisive edges
+
+    # ── Step 4: Add target using atr14 (labelling scaffold) ───────────────
+    print("  [TOON v4.0] Labelling targets via trade simulation...")
     df_full = add_target(
         df_full,
         atr_mult=BARRIER_ATR_MULT,
         horizon=BARRIER_HORIZON_BARS,
         atr_col='atr14',
-        drop_unresolved=True
+        drop_unresolved=True,
     )
-    
-    # Define feature columns: exclude raw price/time data and target column
-    exclude_cols = {'time', 'open', 'high', 'low', 'close', 'volume',
-                    'target', 'next_ret_pct', 'bars_to_target', 'entry_price_next_bar', 'target_distance',
-                    'long_path_r', 'short_path_r', 'target_edge_r', 'best_path_r',
-                    'long_mfe_atr', 'long_mae_atr', 'short_mfe_atr', 'short_mae_atr',
-                    'd_open', 'd_high', 'd_low', 'd_close', 'd_volume', # Exclude raw higher TF data
-                    'w_open', 'w_high', 'w_low', 'w_close', 'w_volume',
-                    'm_open', 'm_high', 'm_low', 'm_close', 'm_volume'}
-    feature_cols = [c for c in df_full.columns if c not in exclude_cols]
-    
-    # Ensure all feature columns are numerical and handle potential infinities/NaNs from feature engineering
-    df_model_ready = df_full[feature_cols + ['target', 'time', 'close'] + list(TRADE_PLAN_LABEL_COLS)].copy()
-    for col in feature_cols:
+
+    # ── Step 5: Identify holographic feature columns ───────────────────────
+    # Exclude: raw OHLCV, time, labelling scaffold, target and trade-plan cols.
+    # atr14 is excluded here — it was labelling scaffolding only.
+    NON_FEATURE_COLS = {
+        'time', 'open', 'high', 'low', 'close', 'volume',
+        'atr14',                                           # labelling only
+        'target', 'next_ret_pct', 'bars_to_target',
+        'entry_price_next_bar', 'target_distance',
+        'long_path_r', 'short_path_r', 'target_edge_r', 'best_path_r',
+        'long_mfe_atr', 'long_mae_atr', 'short_mfe_atr', 'short_mae_atr',
+        # raw higher-TF OHLCV from merge (not holographic)
+        'd_open', 'd_high', 'd_low', 'd_close', 'd_volume',
+        'w_open', 'w_high', 'w_low', 'w_close', 'w_volume',
+        'm_open', 'm_high', 'm_low', 'm_close', 'm_volume',
+    }
+    all_holo_cols = [c for c in df_full.columns if c not in NON_FEATURE_COLS]
+
+    # Sanitize: replace inf/nan
+    df_model_ready = df_full[all_holo_cols + ['target', 'time', 'close']
+                             + [c for c in TRADE_PLAN_LABEL_COLS if c in df_full.columns]].copy()
+    for col in all_holo_cols:
         df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-    
-    df_model_ready = df_model_ready.dropna(subset=['target'] + feature_cols).reset_index(drop=True)
-    
-    print(f"  Total bars after feature engineering and cleaning: {len(df_model_ready)}")
-    print(f"  Features used ({len(feature_cols)}): {', '.join(feature_cols[:5])}... {', '.join(feature_cols[-5:])}")
-    print(f"  Target (UP=1) distribution: {df_model_ready['target'].mean():.1%}")
-    
-    MIN_TRAIN_BARS = 2500 
-    TEST_SIZE_RATIO = 0.15 
+    df_model_ready = df_model_ready.dropna(subset=['target'] + all_holo_cols).reset_index(drop=True)
+
+    print(f"  [TOON v4.0] Bars after labelling & cleaning : {len(df_model_ready)}")
+    print(f"  [TOON v4.0] Holographic features before selection : {len(all_holo_cols)}")
+    print(f"  [TOON v4.0] Target (UP=1) distribution : {df_model_ready['target'].mean():.1%}")
+
+    # ── Step 6: Feature selection pipeline (1800 → 40) ────────────────────
+    MIN_TRAIN_BARS  = 2500
+    TEST_SIZE_RATIO = 0.15
 
     n_available = len(df_model_ready)
-    if n_available < MIN_TRAIN_BARS + 100: 
+    if n_available < MIN_TRAIN_BARS + 100:
         print(f"\n  Error: Not enough {SYMBOL} data for walk-forward validation.")
         exit()
 
+    feature_cols, sel_meta = feature_selection_pipeline(
+        df_model_ready,
+        all_holo_cols,
+        walk_forward_fn=walk_forward,
+        target_col='target',
+        min_train_bars=MIN_TRAIN_BARS,
+        test_size_ratio=TEST_SIZE_RATIO,
+        n_splits=10,
+    )
+
+    print(f"\n  [TOON v4.0] Final feature count into walk_forward : {len(feature_cols)}")
+
+    # ── Step 7: Final walk-forward validation ─────────────────────────────
     print("\n" + "=" * 70)
-    print("  Walk-Forward Validation for Model Robustness")
+    print("  Walk-Forward Validation — TOON v4.0 Holographic Model")
     print("=" * 70)
-    
-    wf_results = walk_forward(df_model_ready,
-                              feature_cols,
-                              n_splits=10, 
-                              min_train_bars=MIN_TRAIN_BARS,
-                              test_size_ratio=TEST_SIZE_RATIO)
-    
+
+    wf_results = walk_forward(
+        df_model_ready,
+        feature_cols,
+        n_splits=10,
+        min_train_bars=MIN_TRAIN_BARS,
+        test_size_ratio=TEST_SIZE_RATIO,
+    )
+
     if wf_results:
         splits_df = pd.DataFrame(wf_results['splits'])
         print("\n" + "=" * 70)
-        print("  SUMMARY OF WALK-FORWARD VALIDATION")
+        print("  SUMMARY — TOON v4.0 HOLOGRAPHIC WALK-FORWARD")
         print("=" * 70)
         print(f"  Overall Accuracy (All Signals)      : {wf_results['overall_accuracy']:.3f}")
         print(f"  Overall High-Conf Accuracy (>={LIVE_CONFIDENCE_THRESHOLD:.2f}) : {splits_df['acc_high_conf'].mean():.3f}")
@@ -1401,10 +1201,24 @@ if __name__ == '__main__':
         print(f"  Edge over Baseline                  : {wf_results['overall_accuracy'] - wf_results['overall_baseline_up']:+.3f}")
         print(f"  Number of splits performed          : {len(splits_df)}")
         print(f"  Total bars used for validation      : {splits_df['test_bars'].sum()}")
-        
-        # Save final model and feature list for later use
+
+        # Layer breakdown of final features
+        final_feats = wf_results['feature_cols']
+        dna_n   = sum(1 for c in final_feats if '_bar' in c)
+        gram_n  = sum(1 for c in final_feats if '_gram_' in c)
+        fft_n   = sum(1 for c in final_feats if '_fft_' in c)
+        skel_n  = sum(1 for c in final_feats if '_skel_' in c)
+        conf_n  = sum(1 for c in final_feats if c.startswith('mtf_conf'))
+        print(f"\n  Feature layer breakdown in final model:")
+        print(f"    DNA:  {dna_n:3d}  |  Grammar: {gram_n:3d}  |  Spectral: {fft_n:3d}"
+              f"  |  Skeleton: {skel_n:3d}  |  Confluence: {conf_n:3d}")
+        if fft_n == 0:
+            print("  NOTE: Zero FFT features in final model. Spectral layer is "
+                  "provisional — not removed. Re-evaluate after first live run.")
+
+        # Save final model and feature list
         import joblib
-        mod_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model.pkl')
+        mod_path  = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model.pkl')
         feat_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features.txt')
         joblib.dump(wf_results['final_model'], mod_path)
         with open(feat_path, 'w') as f:
@@ -1412,87 +1226,86 @@ if __name__ == '__main__':
                 f.write(f"{col}\n")
         print(f"\n  Final model saved to '{mod_path}'")
 
-        # UME-2 FIX: Save OOS probability map for honest backtesting.
-        # backtest_engine.py loads this file and restricts simulation to only these bars.
         oos_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba.pkl')
         joblib.dump(wf_results['oos_proba_map'], oos_path)
         print(f"  OOS proba map saved to '{oos_path}' ({len(wf_results['oos_proba_map'])} bars)")
-        model = wf_results['final_model']
+
+        model             = wf_results['final_model']
         feature_cols_to_use = wf_results['feature_cols']
-        trade_plan_models = train_trade_plan_models(df_model_ready, feature_cols_to_use)
-        trade_plan_path = os.path.join(DATA_DIR, f'{file_prefix}_trade_plan_models.pkl')
+        # Train trade plan models ONLY on pre-OOS data (same window as final fold).
+        # Training on the full dataset leaks future excursion outcomes into SL/TP sizing.
+        _tp_train_end = len(df_model_ready) - int(len(df_model_ready) * TEST_SIZE_RATIO)
+        trade_plan_models = train_trade_plan_models(
+            df_model_ready.iloc[:_tp_train_end], feature_cols_to_use
+        )
+        trade_plan_path   = os.path.join(DATA_DIR, f'{file_prefix}_trade_plan_models.pkl')
         joblib.dump(trade_plan_models, trade_plan_path)
         print(f"  Trade-plan models saved to '{trade_plan_path}' ({len(trade_plan_models)} models)")
-        last_completable_row = df_model_ready.iloc[-1] 
-        pred = predict_next_bar(model, feature_cols_to_use, last_completable_row, confidence_threshold=LIVE_CONFIDENCE_THRESHOLD)
-        close_price = float(last_completable_row['close'])
-        atr = float(last_completable_row.get('atr14', 150.0))
-        volatility_ok = bool(last_completable_row.get('atr_expanding', 1))
-        trade_plan = predict_trade_plan(trade_plan_models, feature_cols_to_use, last_completable_row.copy(), pred['direction'], atr)
-        
+
+        last_row   = df_model_ready.iloc[-1]
+        pred       = predict_next_bar(model, feature_cols_to_use, last_row,
+                                      confidence_threshold=LIVE_CONFIDENCE_THRESHOLD)
+        close_price = float(last_row['close'])
+        # atr14 excluded from model features; use last known value for trade plan display
+        atr = float(df_full['atr14'].iloc[-1]) if 'atr14' in df_full.columns else 150.0
+        trade_plan  = predict_trade_plan(trade_plan_models, feature_cols_to_use,
+                                         last_row.copy(), pred['direction'], atr)
+
         print("\n" + "=" * 70)
-        print(f"  {SYMBOL.upper()} ULTIMATE FORECAST (EXECUTION-ALIGNED)")
+        print(f"  {SYMBOL.upper()} FORECAST (TOON v4.0 — PURE GEOMETRY)")
         print("=" * 70)
-        if 'time' in last_completable_row:
-            print(f"  Bar time    : {last_completable_row['time']}")
+        if 'time' in last_row:
+            print(f"  Bar time    : {last_row['time']}")
         print(f"  Direction   : {pred['direction']}")
         print(f"  Confidence  : {pred['confidence']*100:.1f}%")
         print(f"  Signal      : {pred['signal_strength']}")
         print("----------------------------------------------------------------------")
         print(f"  Entry Price : {close_price:,.2f} (Current Close)")
 
-        trail_str = "N/A"
+        trail_str   = "N/A"
         filter_note = trade_plan['note']
         if pred['direction'] in {"UP", "DOWN"} and np.isfinite(trade_plan['sl']):
-            sl_str = f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
-            tp1_str = f"{trade_plan['tp1']:,.2f}  (ML TP1 {trade_plan['tp1_atr']:.2f}x ATR14)"
-            tp2_str = f"{trade_plan['tp2']:,.2f}  (ML TP2 {trade_plan['tp2_atr']:.2f}x ATR14)"
+            sl_str    = f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
+            tp1_str   = f"{trade_plan['tp1']:,.2f}  (ML TP1 {trade_plan['tp1_atr']:.2f}x ATR14)"
+            tp2_str   = f"{trade_plan['tp2']:,.2f}  (ML TP2 {trade_plan['tp2_atr']:.2f}x ATR14)"
             trail_str = f"{trade_plan['trail_r']:.2f}R trailing stop after TP1"
         else:
             sl_str, tp1_str, tp2_str = "N/A", "N/A", "N/A"
 
         if pred['signal_strength'] == 'NO_TRADE':
-            if not volatility_ok:
-                filter_note = f"{filter_note} Filtered out: ATR is below its 50-bar average".strip()
-            else:
-                filter_note = f"{filter_note} Filtered out: confidence below {LIVE_CONFIDENCE_THRESHOLD:.2f}".strip()
+            filter_note = (f"{filter_note} Filtered: confidence below "
+                           f"{LIVE_CONFIDENCE_THRESHOLD:.2f}").strip()
         if pred['direction'] in {"UP", "DOWN"}:
             print(f"  Stop Loss   : {sl_str}")
             print(f"  Target 1    : {tp1_str}")
             print(f"  Target 2    : {tp2_str}")
             print(f"  Trail Stop  : {trail_str}")
             if filter_note:
-                print(f"  [Filtered out: {filter_note}]")
+                print(f"  [{filter_note}]")
         else:
-            sl_str, tp1_str, tp2_str, trail_str = "N/A", "N/A", "N/A", "N/A"
+            sl_str = tp1_str = tp2_str = trail_str = "N/A"
             print("  [No clear directional edge, targets N/A]")
-            
+
         print("======================================================================")
-        
-        # Build Pred Info dictionary for Trader Image Output
+
         pred_info = {
             'symbol': SYMBOL,
-            'time': str(last_completable_row.get('time', 'N/A')),
-            'dir': pred['direction'],
-            'conf': f"{pred['confidence']*100:.1f}%",
+            'time':   str(last_row.get('time', 'N/A')),
+            'dir':    pred['direction'],
+            'conf':   f"{pred['confidence']*100:.1f}%",
             'signal': pred['signal_strength'],
-            'entry': f"{close_price:,.2f} (Current Close)",
-            'sl': sl_str,
-            'tp1': tp1_str,
-            'tp2': tp2_str,
-            'trail': trail_str,
-            'note': filter_note
+            'entry':  f"{close_price:,.2f} (Current Close)",
+            'sl': sl_str, 'tp1': tp1_str, 'tp2': tp2_str,
+            'trail': trail_str, 'note': filter_note,
         }
 
-        # Save the performance chart AND text report in one PNG
         report_file = os.path.join(DATA_DIR, f'{file_prefix}_ml_report_ultimate.png')
         save_report(wf_results, report_file, pred_info=pred_info)
-        
-        # Display top features concisely
+
         fi_sorted = sorted(wf_results['feature_importance'].items(), key=lambda x: x[1], reverse=True)
-        print("\n  Top 15 most predictive features:")
+        print("\n  Top 15 most predictive holographic features:")
         for i, (fname, fval) in enumerate(fi_sorted[:15]):
-            print(f"    {i+1}. {fname:<30} {fval:.2f}")
+            print(f"    {i+1}. {fname:<42} {fval:.2f}")
 
         backtest_script = os.path.join(os.path.dirname(__file__), 'backtest_engine.py')
         if os.path.exists(backtest_script):
@@ -1510,3 +1323,5 @@ if __name__ == '__main__':
         print("\nWalk-forward validation did not produce results. Please check errors above.")
 
     print("\nScript finished.")
+
+

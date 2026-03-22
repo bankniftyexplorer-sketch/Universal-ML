@@ -14,11 +14,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from universal_ml_engine import (
-    parse_tv_log, add_features_single, add_calendar_features,
-    merge_higher_tf, BARRIER_ATR_MULT, BARRIER_HORIZON_BARS,
+    parse_tv_log, merge_higher_tf, _compute_atr14,
+    BARRIER_ATR_MULT, BARRIER_HORIZON_BARS,
     LIVE_CONFIDENCE_THRESHOLD, VOL_GATE_LOOKBACK,
     EXEC_FEE_PCT, simulate_trade_path_from_arrays, predict_trade_plan
 )
+from holographic_engine import holographic_feature_engine
+
 
 def format_currency(val):
     return f"${val:,.2f}"
@@ -53,7 +55,8 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
         time_curve.append(current_time)
 
         proba_up = prob_array[i]
-        proba_up_1d = prob_array_1d[i]
+        proba_up_1d = float('nan')   # no separate 1D model in TOON v4.0
+
         if not np.isfinite(proba_up):
             no_prediction_bars += 1
             peak_equity = max(peak_equity, equity)
@@ -78,19 +81,14 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
             i += 1
             continue
 
+        # No cross-TF conflict gate in TOON v4.0 — confluence is learned inside
+        # the holographic features (mtf_conf_* layer). Skip the hard gate.
         direction = 'LONG' if proba_up > 0.5 else 'SHORT'
-        if np.isfinite(proba_up_1d):
-            direction_1d = 'LONG' if proba_up_1d > 0.5 else 'SHORT'
-            if direction != direction_1d:
-                conflict_blocks += 1
-                peak_equity = max(peak_equity, equity)
-                max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
-                i += 1
-                continue
+
 
         risk_dollar = (initial_capital if fixed_risk else equity) * risk_pct
         trade_plan = predict_trade_plan(
-            trade_plan_models or {},
+            trade_plan_models or {}, 
             feature_cols,
             df.iloc[i].copy(),
             'UP' if direction == 'LONG' else 'DOWN',
@@ -271,7 +269,8 @@ def generate_report(results, metrics, symbol, save_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--outdir', type=str, default='/home/km/BankniftyML/', help='Directory with models and csv')
+    parser.add_argument('--outdir', type=str, default='/home/km/Universal-ML/', help='Directory with models and csv')
+
     args = parser.parse_args()
     
     DATA_DIR = args.outdir
@@ -330,45 +329,47 @@ def main():
         print(f"[!] Could not find {model_path} or {feat_path}.")
         return
 
-    if not os.path.exists(model_1d_path) or not os.path.exists(feat_1d_path):
-        print(f"[!] Could not find 1D models in {model_1d_path}")
-        return
 
     print(f"\n  [=] Loading Model: {file_prefix}_ultimate_model.pkl")
     model = joblib.load(model_path)
-    
-    print(f"  [=] Loading Secondary 1D Model: {file_prefix}_ultimate_model_1d.pkl")
-    model_1d = joblib.load(model_1d_path)
-    
+
     with open(feat_path, 'r') as f:
         feature_cols = [line.strip() for line in f.readlines() if line.strip()]
-        
-    with open(feat_1d_path, 'r') as f:
-        feature_cols_1d = [line.strip() for line in f.readlines() if line.strip()]
+
     trade_plan_models = joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
     if trade_plan_models:
         print(f"  [=] Trade-plan models loaded. {len(trade_plan_models)} ML exit models available.")
     else:
         print("  [!] WARNING: No ML trade-plan models found. Falling back to static ATR exits.")
 
-    print("  [=] Reconstructing feature space over historical data...")
-    df_full = add_features_single(df_1h.copy(), prefix='', compute_vwap=True)  # UME-3 FIX
-    df_full = add_calendar_features(df_full)
-    df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
-    
-    extra_cols = ['time', 'open', 'high', 'low', 'close', 'volume']
-    if 'atr14' not in feature_cols:
-        extra_cols.append('atr14')
+    print("  [=] Reconstructing holographic feature space over historical data...")
+    # Step 1: compute atr14 labelling scaffold (used for volatility gate only,
+    #         not as a model input)
+    df_1h_labelled = _compute_atr14(df_1h.copy())
 
-    # Rebuild the full feature timeline. Keep every bar so open positions are
-    # evaluated on actual consecutive market bars, not only on predicted rows.
-    all_needed_cols = list(set(feature_cols + extra_cols))
-    df_model_ready = df_full[all_needed_cols].copy()
+    # Step 2: run holographic engine — same call as in main()
+    df_full = holographic_feature_engine(
+        df_1h_labelled,
+        df_1d=df_1d,
+        df_1w=df_1w,
+        df_1m=df_1m,
+    )
+
+    # Step 3: ASOF-merge for temporal alignment
+    df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
+
+    # Build model-ready frame; keep atr14 as side-channel for vol-gate
+    all_needed_cols = list(set(feature_cols + ['time', 'open', 'high', 'low', 'close', 'volume', 'atr14']))
+    available = [c for c in all_needed_cols if c in df_full.columns]
+    df_model_ready = df_full[available].copy()
     for col in feature_cols:
-        df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+        if col in df_model_ready.columns:
+            df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
     df_model_ready = df_model_ready.reset_index(drop=True)
+
     
     print(f"  [=] Total Bars for Simulation: {len(df_model_ready)}")
+
 
     # ── UME-2 FIX: Load OOS probability map for honest backtesting ──
     # Align OOS probabilities onto the full historical bar timeline.
@@ -402,25 +403,9 @@ def main():
         ])
         print(f"  [=] 1D OOS proba map loaded. {len(date_to_prob_1d)} honest OOS days available for gating.")
     else:
-        # Fallback: compute on actual daily bars (in-sample — warn loudly)
-        print("  [!] WARNING: No 1D OOS proba map found. Using in-sample 1D predictions.")
-        print("      Re-run universal_ml_engine.py to generate clean 1D OOS map.")
-        df_1d_for_filter = add_features_single(df_1d.copy(), prefix='d_')
-        for col in feature_cols_1d:
-            if col in df_1d_for_filter.columns:
-                df_1d_for_filter[col] = df_1d_for_filter[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-        valid_1d_mask = df_1d_for_filter[feature_cols_1d].notna().all(axis=1)
-        df_1d_valid = df_1d_for_filter[valid_1d_mask].reset_index(drop=True)
-        daily_proba = model_1d.predict_proba(df_1d_valid[feature_cols_1d])[:, 1]
-        date_to_prob_1d = {
-            pd.Timestamp(row['time']).date(): float(prob)
-            for row, prob in zip(df_1d_valid.to_dict('records'), daily_proba)
-        }
-        prob_array_1d = np.array([
-            date_to_prob_1d.get(pd.Timestamp(t).date(), np.nan)
-            for t in df_backtest['time']
-        ])
-        print(f"  [=] 1D filter computed on {len(df_1d_valid)} actual daily bars (IN-SAMPLE FALLBACK).")
+        print(f"  [!] WARNING: No 1D OOS proba map found. 1D filtering disabled.")
+        prob_array_1d = np.full(len(df_backtest), np.nan)
+
 
     print("  [=] Executing Bar-by-Bar Portfolio Walkthrough...")
     results = run_backtest(
