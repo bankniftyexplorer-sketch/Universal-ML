@@ -1,0 +1,904 @@
+"""
+BANKNIFTY FUTURES — LightGBM Direction Predictor (Optimized)
+Multi-timeframe: 1H primary | 1D + 1W context features
+Walk-forward validated | Runs on i7 4770 / 16GB RAM / no GPU
+"""
+
+import re
+import warnings
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import TimeSeriesSplit
+import matplotlib
+import argparse
+import os
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────
+# 1. PARSER  (handles Indian comma-formatted numbers)
+# ─────────────────────────────────────────────
+
+def parse_tv_log(path: str) -> tuple:
+    """Parse TradingView log CSV and automatically detect Symbol and Timeframe."""
+    # Use robust separator, handle bad lines
+    raw = pd.read_csv(path, on_bad_lines='skip')
+    
+    if raw.empty or 'Message' not in raw.columns:
+        return pd.DataFrame(), None, None
+
+    df = pd.DataFrame()
+    df['time'] = pd.to_datetime(raw['Date'], utc=False).dt.tz_localize(None)
+
+    # Vectorized regex extraction directly from the message string.
+    # Handles numbers with commas by replacing them post-extraction.
+    for col, key in [('open', 'OPEN'), ('high', 'HIGH'), ('low', 'LOW'), ('close', 'CLOSE'), ('volume', 'VOLUME')]:
+        extracted = raw['Message'].str.extract(rf'{key}:([\d,\.]+)', expand=False)
+        df[col] = pd.to_numeric(extracted.str.replace(',', ''), errors='coerce')
+
+    # Automatically extract SYMBOL and TIME FRAME from the last message
+    symbol_str = ""
+    tf_str = ""
+    try:
+        symbol_extracted = raw['Message'].str.extract(r'SYMBOL:([A-Za-z0-9_!]+)', expand=False).dropna()
+        if not symbol_extracted.empty:
+            symbol_str = str(symbol_extracted.iloc[-1])
+            
+        tf_extracted = raw['Message'].str.extract(r'TIME FRAME:([A-Za-z0-9_]+)', expand=False).dropna()
+        if not tf_extracted.empty:
+            tf_str = str(tf_extracted.iloc[-1])
+    except Exception as e:
+        pass
+
+    df = df.dropna().sort_values('time').reset_index(drop=True)
+    return df, symbol_str, tf_str
+
+
+# ─────────────────────────────────────────────
+# 2. FEATURE ENGINEERING
+# ─────────────────────────────────────────────
+
+def add_features_single(df: pd.DataFrame, prefix: str = '', compute_vwap: bool = False) -> pd.DataFrame:
+    """Ultimate Core features on OHLCV dataframe.
+
+    Args:
+        df           : OHLCV DataFrame with time/open/high/low/close/volume.
+        prefix       : Column prefix for higher-TF merged features (e.g. 'd_').
+        compute_vwap : If True, compute intraday VWAP distance.
+                       Must be True ONLY for the 1H primary timeframe.
+    """
+    p = prefix
+    c = df['close']
+    h = df['high']
+    l = df['low']
+    o = df['open']
+    v = df['volume']
+
+    # 1. Momentum Returns (Immediate, Short, Macro)
+    for w in [1, 5, 21]: 
+        df[f'{p}ret{w}'] = c.pct_change(w).fillna(0).values
+
+    # 2. Candle Structure (Micro-Rejection Dynamics)
+    rng = h - l + 1e-9
+    df[f'{p}body_ratio'] = (np.abs(c - o) / rng).values
+    df[f'{p}upper_wick'] = ((h - np.maximum(c, o)) / rng).values
+    df[f'{p}lower_wick'] = ((np.minimum(c, o) - l) / rng).values
+
+    # 3. Normalized Volatility Regime
+    pc = c.shift(1).fillna(c)
+    tr = np.maximum((h - l), np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    atr14 = tr.rolling(14).mean()
+    df[f'{p}atr_norm14'] = (tr / (atr14 + 1e-9)).fillna(0).values 
+    df[f'{p}atr14'] = atr14.fillna(0).values # Keep raw atr14 for stop-loss usage
+
+    # 4. Trend Proximity (Short-term vs Mid-term)
+    for w in [20, 50]:
+        ema = c.ewm(span=w, adjust=False).mean()
+        df[f'{p}ema_pos{w}'] = ((c - ema) / (ema + 1e-9)).fillna(0).values
+
+    # 5. Volatility Squeeze & Standard Deviation Boundaries
+    mb = c.rolling(20).mean()
+    std = c.rolling(20).std()
+    upper = mb + 2 * std
+    lower = mb - 2 * std
+    df[f'{p}bb_width'] = ((upper - lower) / (mb + 1e-9)).fillna(0).values
+    df[f'{p}bb_per'] = ((c - lower) / (upper - lower + 1e-9)).fillna(0).values
+
+    # 6. Sharp vs Smooth Momentum (RSI)
+    delta = c.diff()
+    for period in [5, 14]:
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        rs = gain / (loss + 1e-9)
+        df[f'{p}rsi{period}'] = (100 - 100 / (1 + rs)).fillna(50).values
+
+    # 7. Volume Spike Detection
+    vol_ma_short = v.rolling(10).mean()
+    df[f'{p}vol_ratio_s'] = (v / (vol_ma_short + 1e-9)).fillna(1).values
+
+    # 8. Intraday VWAP — controlled by compute_vwap param (never via prefix heuristic)
+    if compute_vwap and 'time' in df.columns:
+        df['pv'] = c * v
+        df['date_only'] = df['time'].dt.date
+        group_pv = df.groupby('date_only')['pv'].cumsum()
+        group_v = df.groupby('date_only')['volume'].cumsum()
+        df['vwap'] = group_pv / (group_v + 1e-9)
+        df[f'{p}vwap_dist'] = ((c - df['vwap']) / df['vwap']).fillna(0).values
+        df.drop(['pv', 'date_only', 'vwap'], axis=1, inplace=True)
+
+    # ---------------------------------------------------------
+    # 9. PURE KINEMATICS (Derivative Physics & Structural Bias)
+    # ---------------------------------------------------------
+    c1, c2 = c.shift(1).fillna(c), c.shift(2).fillna(c)
+    
+    # Feature 1: Close Acceleration (2nd Derivative normalized by ATR)
+    df[f'{p}close_accel'] = ((c - 2*c1 + c2) / (atr14 + 1e-9)).fillna(0).values
+    
+    # Feature 2: Wick Imbalance Velocity
+    uw1 = h.shift(1) - np.maximum(c1, o.shift(1))
+    lw1 = np.minimum(c1, o.shift(1)) - l.shift(1)
+    df[f'{p}wick_imb_vel'] = (((df[f'{p}upper_wick'] - df[f'{p}lower_wick']) - (uw1 - lw1)) / (atr14 + 1e-9)).fillna(0).values
+    
+    # Feature 3: Body Convexity (Inflection Point Locator)
+    df[f'{p}body_convex'] = ((2*c - c1 - c2) / (atr14 + 1e-9)).fillna(0).values
+    
+    # Feature 4: Net Thrust Velocity
+    nt = (c - l) / ((h - c) + 1e-9)
+    nt1 = (c1 - l.shift(1)) / ((h.shift(1) - c1) + 1e-9)
+    df[f'{p}net_thrust_vel'] = (nt - nt1).fillna(0).values
+    
+    # Feature 5: Structural Bull Energy (Anti-Sabotage Trap Detection)
+    # 1 if (Green AND Expanding) OR (Red AND Shrinking)
+    is_green = c >= o
+    candle_size = np.sqrt((h - l) * np.abs(c - o))
+    is_expanding = candle_size >= candle_size.shift(1).fillna(0)
+    df[f'{p}struct_bull_energy'] = ((is_green & is_expanding) | (~is_green & ~is_expanding)).astype(int).values
+
+    # 10. Market Regime detection (Choppy vs Trending)
+    # ER near 1 = Strong Trend, ER near 0 = Mean Reverting / Choppy
+    abs_diff = c.diff().abs()
+    net_change = (c - c.shift(20)).abs()
+    volatility = abs_diff.rolling(20).sum()
+    df[f'{p}efficiency_ratio20'] = (net_change / (volatility + 1e-9)).fillna(0.5).values
+
+    # 11. Gap Analysis — open vs prior close (overnight information signal)
+    prev_close = c.shift(1).fillna(c)
+    df[f'{p}gap_ratio'] = ((o - prev_close) / (atr14 + 1e-9)).fillna(0).values
+
+    # 12. ATR Regime Slope — is volatility expanding (+) or contracting (−)?
+    atr14_5ago = atr14.shift(5).fillna(atr14)
+    df[f'{p}atr_trend'] = ((atr14 - atr14_5ago) / (atr14_5ago + 1e-9)).fillna(0).values
+
+    # 13. RSI Acceleration — 3-bar delta of RSI-14 (momentum of momentum)
+    gain14 = delta.clip(lower=0).rolling(14).mean()
+    loss14 = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi14_raw = 100 - 100 / (1 + gain14 / (loss14 + 1e-9))
+    df[f'{p}rsi14_accel'] = rsi14_raw.diff(3).fillna(0).values
+
+    return df
+
+
+def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Time-based features for 1H data."""
+    t = df['time']
+    df['hour']         = t.dt.hour
+    df['dow']          = t.dt.dayofweek          # 0=Mon
+    df['wom']          = (t.dt.day - 1) // 7     # week of month 0-4
+    df['month']        = t.dt.month
+    df['is_monday']    = (t.dt.dayofweek == 0).astype(int)
+    df['is_friday']    = (t.dt.dayofweek == 4).astype(int)
+    df['day_of_month'] = t.dt.day
+    df['week_of_year'] = t.dt.isocalendar().week.astype(int)
+
+    # More granular session representation
+    # Covers full 24-hour clock: -1=pre-market (<9), 0-6=market hours (9-16), 7=after-hours (>=16)
+    bins   = [0, 9, 10, 11, 12, 13, 14, 15, 16, 24]
+    labels = [-1, 0, 1, 2, 3, 4, 5, 6, 7]
+    df['session'] = pd.cut(t.dt.hour, bins=bins, labels=labels,
+                           right=False, include_lowest=True).astype(float).fillna(-1)
+
+    # Day of week and month as cyclical features
+    df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
+    df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+
+    return df
+
+
+def merge_higher_tf(df_1h: pd.DataFrame,
+                    df_1d: pd.DataFrame,
+                    df_1w: pd.DataFrame,
+                    df_1m: pd.DataFrame) -> pd.DataFrame:
+    """Merge daily, weekly, and monthly features into 1H dataframe via asof merge."""
+    
+    # Add features to higher TFs
+    df_1d = add_features_single(df_1d.copy(), prefix='d_')
+    df_1w = add_features_single(df_1w.copy(), prefix='w_')
+    df_1m = add_features_single(df_1m.copy(), prefix='m_')
+
+    # Use only the feature columns from higher TFs
+    d_cols = [c for c in df_1d.columns if c.startswith('d_')] + ['time']
+    w_cols = [c for c in df_1w.columns if c.startswith('w_')] + ['time']
+    m_cols = [c for c in df_1m.columns if c.startswith('m_')] + ['time']
+
+    df_1d_feat = df_1d[d_cols].copy()
+    df_1w_feat = df_1w[w_cols].copy()
+    df_1m_feat = df_1m[m_cols].copy()
+
+    # For ASOF merge, higher TF data needs to contain the CLOSE price for "current" value
+    df_1d_feat['d_close'] = df_1d['close'].values
+    df_1d_feat['d_high']  = df_1d['high'].values
+    df_1d_feat['d_low']   = df_1d['low'].values
+    df_1d_feat['d_open']  = df_1d['open'].values # Added open for potential features
+    df_1d_feat['d_volume'] = df_1d['volume'].values # Added volume for potential features
+
+    df_1w_feat['w_close'] = df_1w['close'].values
+    df_1w_feat['w_high']  = df_1w['high'].values
+    df_1w_feat['w_low']   = df_1w['low'].values
+    df_1w_feat['w_open']  = df_1w['open'].values # Added open
+    df_1w_feat['w_volume'] = df_1w['volume'].values # Added volume
+
+    df_1m_feat['m_close'] = df_1m['close'].values
+    df_1m_feat['m_high']  = df_1m['high'].values
+    df_1m_feat['m_low']   = df_1m['low'].values
+    df_1m_feat['m_open']  = df_1m['open'].values # Added open
+    df_1m_feat['m_volume'] = df_1m['volume'].values # Added volume
+
+    # Sort for merge_asof
+    df_1h = df_1h.sort_values('time')
+    df_1d_feat = df_1d_feat.sort_values('time')
+    df_1w_feat = df_1w_feat.sort_values('time')
+    df_1m_feat = df_1m_feat.sort_values('time')
+
+    merged = pd.merge_asof(df_1h, df_1d_feat, on='time', direction='backward', tolerance=pd.Timedelta('1 day')) # Added tolerance for daily
+    merged = pd.merge_asof(merged, df_1w_feat, on='time', direction='backward', tolerance=pd.Timedelta('7 days')) # Added tolerance for weekly
+    merged = pd.merge_asof(merged, df_1m_feat, on='time', direction='backward', tolerance=pd.Timedelta('31 days')) # Added tolerance for monthly
+
+    # Position within daily/weekly/monthly range - handle potential NaNs from tolerance
+    dr = (merged['d_high'] - merged['d_low']).replace(0, np.nan)
+    wr = (merged['w_high'] - merged['w_low']).replace(0, np.nan)
+    mr = (merged['m_high'] - merged['m_low']).replace(0, np.nan)
+    merged['pos_in_daily_range']  = (merged['close'] - merged['d_low']) / dr
+    merged['pos_in_weekly_range'] = (merged['close'] - merged['w_low']) / wr
+    merged['pos_in_monthly_range'] = (merged['close'] - merged['m_low']) / mr
+    
+    # Add relative strength to daily/weekly/monthly close
+    merged['rel_strength_d'] = (merged['close'] - merged['d_close']) / (merged['d_close'] + 1e-9)
+    merged['rel_strength_w'] = (merged['close'] - merged['w_close']) / (merged['w_close'] + 1e-9)
+    merged['rel_strength_m'] = (merged['close'] - merged['m_close']) / (merged['m_close'] + 1e-9)
+
+    return merged
+
+
+# ─────────────────────────────────────────────
+# 3. TARGET
+# ─────────────────────────────────────────────
+
+def add_target(df: pd.DataFrame, ahead: int = 1) -> pd.DataFrame:
+    """
+    Target: next 1H bar direction defined by price movement.
+
+    We use binary (1=up, 0=down) for the main model — cleanest signal.
+    'ahead' parameter allows for predicting further into the future.
+    """
+    # Shift target calculation by 'ahead' bars to predict 'ahead' steps into the future
+    next_close = df['close'].shift(-ahead)
+    df['target'] = (next_close - df['close'] > 0).astype(int)
+    df['next_ret_pct'] = (next_close - df['close']) / df['close'] * 100
+    
+    # Drop rows where target couldn't be calculated
+    df = df.dropna(subset=['target'])
+    return df
+
+
+# ─────────────────────────────────────────────
+# 4. WALK-FORWARD VALIDATION (Optimized for CPU)
+# ─────────────────────────────────────────────
+
+def walk_forward(df: pd.DataFrame,
+                 feature_cols: list,
+                 n_splits: int = 10,
+                 min_train_bars: int = 2000,
+                 test_size_ratio: float = 0.15
+                 ) -> dict:
+    """
+    Pure walk-forward: train on past, test on strictly future window.
+    Early-stopping uses an inner validation slice carved from the training
+    window only — the test fold is NEVER visible during training.
+    OOS probabilities are accumulated in oos_proba_map for honest backtesting.
+    """
+    df = df.dropna(subset=feature_cols + ['target']).reset_index(drop=True)
+    n = len(df)
+    
+    # Dynamic window size calculation based on ratio
+    if n < min_train_bars:
+        print(f"  Error: Not enough data for walk-forward. Need {min_train_bars}, got {n}.")
+        return {}
+
+    # Calculate split points
+    split_points = []
+    current_train_end = min_train_bars
+    while current_train_end < n:
+        test_window_size = max(int(n * test_size_ratio), 100) # Ensure a minimum test window size, e.g., 100 bars
+        test_end = min(current_train_end + test_window_size, n)
+        
+        if test_end <= current_train_end: # Should not happen if test_size_ratio is reasonable
+            break
+        
+        split_points.append((current_train_end, test_end))
+        current_train_end = test_end
+        
+        if len(split_points) >= n_splits: # Cap number of splits if data is very long
+            break
+
+    if not split_points:
+        print("  Error: Could not determine valid split points for walk-forward.")
+        return {}
+
+    print(f"\n  Walk-forward: {len(split_points)} splits, "
+          f"min_train_bars={min_train_bars}, test_ratio={test_size_ratio:.2f}")
+    print(f"  Total bars: {n}")
+
+    results = []
+    feature_importance_sum = np.zeros(len(feature_cols))
+    all_test_preds = []
+    all_test_trues = []
+    # UME-2 FIX: Genuine OOS probability map keyed by pd.Timestamp.
+    # The backtest engine MUST use these — never batch-predict on this model.
+    oos_proba_map: dict = {}
+
+    for i, (train_end, test_end) in enumerate(split_points):
+        X_train_full = df[feature_cols].iloc[:train_end]
+        y_train_full = df['target'].iloc[:train_end]
+        X_test       = df[feature_cols].iloc[train_end:test_end]
+        y_test       = df['target'].iloc[train_end:test_end]
+        
+        if len(X_test) == 0:
+            continue
+
+        # ── UME-1 FIX: Inner validation from TRAINING window only ──
+        # Test fold is never seen by eval_set — no lookahead pollution.
+        inner_val_size = max(100, int(len(X_train_full) * 0.15))
+        X_train_inner = X_train_full.iloc[:-inner_val_size]
+        y_train_inner = y_train_full.iloc[:-inner_val_size]
+        X_val_inner   = X_train_full.iloc[-inner_val_size:]
+        y_val_inner   = y_train_full.iloc[-inner_val_size:]
+
+        # ── UME-5 FIX: Fixed random_state=42 — fully reproducible across runs ──
+        model = lgb.LGBMClassifier(
+            n_estimators=800,
+            learning_rate=0.02,
+            num_leaves=31,
+            max_depth=5,
+            min_child_samples=40,
+            subsample=0.75,
+            subsample_freq=1,
+            colsample_bytree=0.75,
+            reg_alpha=0.15,
+            reg_lambda=0.15,
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1,
+            objective='binary',
+            metric='logloss'
+        )
+        
+        model.fit(
+            X_train_inner, y_train_inner,
+            eval_set=[(X_val_inner, y_val_inner)],  # UME-1 FIX: inner-train val only
+            eval_metric='logloss',
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=60, verbose=False),
+                lgb.log_evaluation(period=10000)
+            ]
+        )
+
+        preds = model.predict(X_test)
+        proba = model.predict_proba(X_test)[:, 1] # Probability of class 1 (UP)
+        acc   = accuracy_score(y_test, preds)
+
+        # ── UME-2 FIX: Record every OOS prediction by its bar's timestamp ──
+        if 'time' in df.columns:
+            test_times = df['time'].iloc[train_end:test_end].values
+            for ts, prob in zip(test_times, proba):
+                oos_proba_map[pd.Timestamp(ts)] = float(prob)
+
+        # High-confidence subset analysis
+        confidence_threshold_high = 0.60
+        confidence_threshold_low  = 0.40
+
+        conf_mask_up   = proba > confidence_threshold_high
+        conf_mask_down = proba < confidence_threshold_low
+        conf_mask = conf_mask_up | conf_mask_down
+        
+        acc_conf  = np.nan
+        high_conf_bars_count = conf_mask.sum()
+        if high_conf_bars_count > 10:
+            acc_conf  = accuracy_score(y_test[conf_mask], preds[conf_mask])
+        
+        results.append({
+            'split': i + 1,
+            'train_bars': train_end,
+            'test_bars': len(X_test),
+            'accuracy': acc,
+            'acc_high_conf': acc_conf,
+            'high_conf_pct': conf_mask.mean() if high_conf_bars_count > 0 else 0.0,
+            'baseline_up': y_test.mean(),
+            'baseline_down': 1 - y_test.mean(),
+            'proba_mean': proba.mean(),
+            'proba_std': proba.std(),
+            'high_conf_bars': high_conf_bars_count
+        })
+        
+        feature_importance_sum += model.feature_importances_
+        all_test_preds.extend(preds)
+        all_test_trues.extend(y_test)
+        
+        conf_str = f"{acc_conf:.3f}" if not np.isnan(acc_conf) else " n/a"
+        print(f"  Split {i+1:2d} | Train:{train_end:>6} | Test:{len(X_test):>5} | "
+              f"Acc:{acc:.3f} | ConfAcc({confidence_threshold_high}%):{conf_str} | "
+              f"ConfBars:{conf_mask.mean()*100:5.1f}% | Baseline(UP):{y_test.mean():.3f}")
+
+    # ── UME-2 FIX: Final model for LIVE INFERENCE ONLY ──
+    # Trained on all history so live predictions use the fullest possible signal.
+    # Any backtest MUST use oos_proba_map — never batch-predict from this model on historical data.
+    final_model = lgb.LGBMClassifier(
+        n_estimators=800,
+        learning_rate=0.02,
+        num_leaves=31,
+        max_depth=5,
+        min_child_samples=40,
+        subsample=0.75,
+        subsample_freq=1,
+        colsample_bytree=0.75,
+        reg_alpha=0.15,
+        reg_lambda=0.15,
+        n_jobs=-1,
+        verbose=-1,
+        objective='binary',
+        metric='logloss',
+        random_state=42
+    )
+    final_model.fit(df[feature_cols], df['target']) # Train on all available history
+
+    # Overall accuracy calculation
+    overall_acc = accuracy_score(all_test_trues, all_test_preds)
+    overall_baseline_up = np.mean(all_test_trues)
+
+    return {
+        'splits': results,
+        'feature_importance': dict(zip(feature_cols, feature_importance_sum / len(split_points))),
+        'final_model': final_model,
+        'feature_cols': feature_cols,
+        'df': df,
+        'overall_accuracy': overall_acc,
+        'overall_baseline_up': overall_baseline_up,
+        'oos_proba_map': oos_proba_map  # UME-2: ONLY valid source for honest backtesting
+    }
+
+
+# ─────────────────────────────────────────────
+# 5. REPORT CHART (Visual Enhancements)
+# ─────────────────────────────────────────────
+
+def save_report(wf_results: dict, save_path: str, pred_info: dict = None):
+    if not wf_results or 'splits' not in wf_results or not wf_results['splits']:
+        print("  No walk-forward results to plot.")
+        return
+        
+    splits = pd.DataFrame(wf_results['splits'])
+    fi     = wf_results['feature_importance']
+    
+    # Add overall metrics if available
+    if 'overall_accuracy' in wf_results:
+        splits_summary = splits.mean(numeric_only=True)
+        splits_summary['accuracy'] = wf_results['overall_accuracy']
+        splits_summary['acc_high_conf'] = splits['acc_high_conf'].mean() # Avg of high_conf acc across splits
+        splits_summary['high_conf_pct'] = splits['high_conf_pct'].mean()
+        splits_summary['baseline_up'] = wf_results['overall_baseline_up']
+    else:
+        splits_summary = splits.mean(numeric_only=True)
+
+    fig = plt.figure(figsize=(14, 16), facecolor='#0d0d0d')
+    gs  = gridspec.GridSpec(3, 1, figure=fig, hspace=0.4, height_ratios=[1, 1.5, 1.5]) 
+
+    ax1 = fig.add_subplot(gs[0, 0]) # Top row: TRADER TEXT FORECAST
+    ax2 = fig.add_subplot(gs[1, 0]) # Middle row: CODER ACCURACY
+    ax3 = fig.add_subplot(gs[2, 0]) # Bottom row: CODER FEATURES (Top 15)
+
+    # Color theme
+    dark_bg_color = '#0d0d0d'
+    light_text_color = '#e0e0e0'
+    axis_line_color = '#444444'
+    accent_color_1 = '#00d4ff' # Cyan
+    accent_color_2 = '#00ff88' # Green
+    accent_color_3 = '#ff6b6b' # Red
+    accent_color_5 = '#7c4dff' # Purple
+
+    for ax in [ax1, ax2, ax3]:
+        ax.set_facecolor(dark_bg_color)
+        ax.tick_params(colors=light_text_color, labelsize=9)
+        for spine in ['bottom', 'top', 'left', 'right']:
+            ax.spines[spine].set_color(axis_line_color)
+
+    # — 1. TRADER FORECAST (TEXT PANEL) —
+    ax1.axis('off') # Hide axes for text panel
+    if pred_info:
+        bg_color = accent_color_2 if pred_info['dir'] == 'UP' else accent_color_3
+        
+        # Get dynamic symbol from pred_info or default to BANKNIFTY
+        symbol_display = pred_info.get('symbol', 'BANKNIFTY').upper()
+        
+        report_text = (
+            f"======================================================================\n"
+            f"  {symbol_display} ULTIMATE FORECAST (NEXT BAR WITH EXACT TARGETS)\n"
+            f"======================================================================\n"
+            f"  Bar time    : {pred_info['time']}\n"
+            f"  Direction   : {pred_info['dir']}\n"
+            f"  Confidence  : {pred_info['conf']}\n"
+            f"  Signal      : {pred_info['signal']}\n"
+            f"----------------------------------------------------------------------\n"
+            f"  Entry Price : {pred_info['entry']}\n"
+            f"  Stop Loss   : {pred_info['sl']}\n"
+            f"  Target 1    : {pred_info['tp1']}\n"
+            f"  Target 2    : {pred_info['tp2']}\n"
+            f"======================================================================"
+        )
+        ax1.text(0.5, 0.5, report_text, color=bg_color, fontsize=16, 
+                 fontfamily='monospace', fontweight='bold', ha='center', va='center',
+                 bbox=dict(facecolor='#1a1a1a', edgecolor=bg_color, pad=2.0, boxstyle='round'))
+
+    # — 2. CODER ACCURACY PLOT —
+    x = splits['split']
+    ax2.plot(x, splits['accuracy'],     'o-', color=accent_color_1, lw=2, label='Split Accuracy')
+    ax2.plot(x, splits['acc_high_conf'],'s--',color=accent_color_2, lw=2, label='High-Confidence Accuracy (>60%)')
+    ax2.axhline(splits_summary['baseline_up'], color=accent_color_3, ls=':', lw=1.5, label=f"Always-UP baseline ({splits_summary['baseline_up']:.2f})")
+    ax2.axhline(0.5, color='#777777', ls=':', lw=1)
+    
+    # Overall accuracy line
+    ax2.axhline(splits_summary['accuracy'], color=accent_color_1, ls='--', lw=1, label=f'Overall Acc ({splits_summary["accuracy"]:.3f})')
+    ax2.fill_between(x, 0.5, splits['accuracy'], alpha=0.1, color=accent_color_1)
+    
+    ax2.set_title('Walk-Forward Accuracy (Out-of-Sample)', color=light_text_color, fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Split (Timeline)', color=light_text_color)
+    ax2.set_ylabel('Accuracy', color=light_text_color)
+    ax2.set_ylim(0.4, 0.85) 
+    ax2.legend(facecolor=dark_bg_color, edgecolor=axis_line_color, labelcolor=light_text_color, fontsize=10, loc='lower right')
+
+    # — 3. CODER TOP 15 FEATURES —
+    fi_filtered = {k: v for k, v in fi.items() if v > 0}
+    top15 = sorted(fi_filtered.items(), key=lambda x: x[1], reverse=True)[:15]
+    
+    if top15:
+        fnames, fvals = zip(*top15)
+        fnames = [str(n).replace('_', ' ').upper() for n in fnames]
+        
+        bars = ax3.barh(range(len(fnames)), fvals, color=accent_color_5, alpha=0.85)
+        ax3.set_yticks(range(len(fnames)))
+        ax3.set_yticklabels(fnames, color='#cccccc', fontsize=10)
+        ax3.set_title('Top 15 Most Predictive Features', color=light_text_color, fontsize=14, fontweight='bold')
+        ax3.invert_yaxis()
+        ax3.set_xlabel('Importance Score', color=light_text_color)
+    else:
+        ax3.text(0.5, 0.5, "No significant features", color=light_text_color, ha='center', va='center')
+
+    fig.suptitle('BANKNIFTY Futures — ML Performance Report', color='white', fontsize=18, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(save_path, dpi=120, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close()
+    print(f"\n  Report saved → {save_path}")
+
+
+# ─────────────────────────────────────────────
+# 6. PREDICTION FUNCTION (live use)
+# ─────────────────────────────────────────────
+
+def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidence_threshold: float = 0.60) -> dict:
+    """
+    Pass in the latest fully-formed 1H row (with all features computed).
+    Returns direction prediction + confidence.
+    """
+    if model is None or not feature_cols or latest_row.empty:
+        return {
+            'direction': 'ERROR',
+            'prob_up': np.nan,
+            'prob_down': np.nan,
+            'confidence': np.nan,
+            'signal_strength': 'ERROR',
+            'message': 'Model or data not properly loaded.'
+        }
+
+    # Ensure all feature_cols are present in latest_row, fill missing with 0 if necessary (though usually they should be computed)
+    missing_cols = [col for col in feature_cols if col not in latest_row.index]
+    if missing_cols:
+        print(f"  Warning: Missing columns in latest_row, filling with 0: {missing_cols}")
+        for col in missing_cols:
+            latest_row[col] = 0.0
+
+    X = latest_row[feature_cols].values.reshape(1, -1)
+    
+    try:
+        proba = model.predict_proba(X)[0][1] # Probability of class 1 (UP)
+    except Exception as e:
+        return {
+            'direction': 'ERROR',
+            'prob_up': np.nan,
+            'prob_down': np.nan,
+            'confidence': np.nan,
+            'signal_strength': 'ERROR',
+            'message': f'Error during prediction: {e}'
+        }
+        
+    direction = 'UP' if proba > 0.5 else 'DOWN'
+    prob_up = round(proba, 4)
+    prob_down = round(1 - proba, 4)
+    confidence = max(prob_up, prob_down)
+    
+    signal = 'STRONG' if confidence >= confidence_threshold else ('MODERATE' if confidence > 0.55 else 'WEAK')
+    
+    return {
+        'direction': direction,
+        'prob_up': prob_up,
+        'prob_down': prob_down,
+        'confidence': confidence,
+        'signal_strength': signal,
+        'message': 'Prediction successful.'
+    }
+
+
+# ─────────────────────────────────────────────
+# 7. MAIN EXECUTION (Optimized for performance)
+# ─────────────────────────────────────────────
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Universal ML Direction Predictor")
+    parser.add_argument('--outdir', type=str, default='/home/km/BankniftyML/', help="Output directory for models and reports")
+    args = parser.parse_args()
+
+    DATA_DIR = args.outdir
+    CSV_DIR = os.path.join(DATA_DIR, 'csv_data')
+    os.makedirs(CSV_DIR, exist_ok=True)
+    
+    print("=" * 70)
+    print("  AUTO-SCANNING CSV FOLDER (csv_data/) FOR SYMBOL AND TIMEFRAMES")
+    print("=" * 70)
+    
+    csv_files = [f for f in os.listdir(CSV_DIR) if f.endswith('.csv')]
+    if not csv_files:
+        print(f"  [!] No CSV files found in {CSV_DIR}")
+        print("      Please drop your 3 CSV files (1H, 1D, 1W) into this folder, no specific naming required.")
+        exit()
+
+    df_1h, df_1d, df_1w, df_1m = None, None, None, None
+    SYMBOL = "UNKNOWN"
+
+    for ffile in csv_files:
+        path = os.path.join(CSV_DIR, ffile)
+        df, sym, tf = parse_tv_log(path)
+        tf = str(tf).upper()
+        
+        if sym and sym != "UNKNOWN":
+            SYMBOL = sym.replace('!', '') # Output clean symbol without !
+
+        if tf in ['60', '1H']:
+            df_1h = df
+            print(f"  [+] Detected 1H File: {ffile}")
+        elif tf in ['1D', 'D']:
+            df_1d = df
+            print(f"  [+] Detected 1D File: {ffile}")
+        elif tf in ['1W', 'W']:
+            df_1w = df
+            print(f"  [+] Detected 1W File: {ffile}")
+        elif tf in ['1M', 'M']:
+            df_1m = df
+            print(f"  [+] Detected 1M File: {ffile}")
+
+    if df_1h is None or df_1d is None or df_1w is None or df_1m is None:
+        print(f"\n  [!] Error: Could not find all 4 timeframes (60, 1D, 1W, 1M) from inside you CSVs.")
+        print(f"      Make sure the actual text in the CSVs say 'TIME FRAME:60', 'TIME FRAME:1D', 'TIME FRAME:1W', and 'TIME FRAME:1M'")
+        exit()
+
+    file_prefix = SYMBOL.lower().replace(' ', '_')
+
+    print(f"  1H bars : {len(df_1h):>7}  ({df_1h['time'].min().date()} → {df_1h['time'].max().date()})")
+    print(f"  1D bars : {len(df_1d):>7}  ({df_1d['time'].min().date()} → {df_1d['time'].max().date()})")
+    print(f"  1W bars : {len(df_1w):>7}  ({df_1w['time'].min().date()} → {df_1w['time'].max().date()})")
+    print(f"  1M bars : {len(df_1m):>7}  ({df_1m['time'].min().date()} → {df_1m['time'].max().date()})")
+    
+    print("\n  [+] Constructing Secondary 1D Target Model...")
+    df_1d_model = add_features_single(df_1d.copy(), prefix='d_')
+    
+    # Predict next 1D bar close > current 1D close
+    df_1d_model['target'] = (df_1d_model['close'].shift(-1) - df_1d_model['close'] > 0).astype(int)
+    
+    exclude_cols_1d = {'time', 'open', 'high', 'low', 'close', 'volume', 'target'}
+    feature_cols_1d = [c for c in df_1d_model.columns if c.startswith('d_') and c not in exclude_cols_1d]
+    
+    df_model_ready_1d = df_1d_model[feature_cols_1d + ['target', 'time', 'close']].copy()
+    for col in feature_cols_1d:
+        df_model_ready_1d[col] = df_model_ready_1d[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+    df_model_ready_1d = df_model_ready_1d.dropna(subset=['target'] + feature_cols_1d).reset_index(drop=True)
+    
+    MIN_TRAIN_BARS_1D = max(200, int(len(df_model_ready_1d) * 0.4))
+    print("\n" + "=" * 70)
+    print("  Walk-Forward Validation for 1D Model")
+    print("=" * 70)
+    wf_results_1d = walk_forward(df_model_ready_1d, feature_cols_1d, n_splits=5, min_train_bars=MIN_TRAIN_BARS_1D, test_size_ratio=0.15)
+    
+    if wf_results_1d:
+        mod_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model_1d.pkl')
+        feat_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features_1d.txt')
+        import joblib
+        joblib.dump(wf_results_1d['final_model'], mod_1d_path)
+        with open(feat_1d_path, 'w') as f:
+            for col in wf_results_1d['feature_cols']:
+                f.write(f"{col}\n")
+        print(f"  Final 1D model saved to '{mod_1d_path}'")
+
+    print("\n  Engineering features...")
+    
+    # 1H features — VWAP computed here only (1H primary timeframe)
+    df_full = add_features_single(df_1h.copy(), prefix='', compute_vwap=True)  # UME-3 FIX
+    df_full = add_calendar_features(df_full)
+    
+    # Merge higher TF
+    df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
+    
+    # Target - Predicting for the *next* bar (ahead=1)
+    df_full = add_target(df_full, ahead=1)
+    
+    # Define feature columns: exclude raw price/time data and target column
+    exclude_cols = {'time', 'open', 'high', 'low', 'close', 'volume',
+                    'target', 'next_ret_pct',
+                    'd_open', 'd_high', 'd_low', 'd_close', 'd_volume', # Exclude raw higher TF data
+                    'w_open', 'w_high', 'w_low', 'w_close', 'w_volume',
+                    'm_open', 'm_high', 'm_low', 'm_close', 'm_volume'}
+    feature_cols = [c for c in df_full.columns if c not in exclude_cols]
+    
+    # Ensure all feature columns are numerical and handle potential infinities/NaNs from feature engineering
+    df_model_ready = df_full[feature_cols + ['target', 'time', 'close']].copy()
+    for col in feature_cols:
+        df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+    
+    df_model_ready = df_model_ready.dropna(subset=['target'] + feature_cols).reset_index(drop=True)
+    
+    print(f"  Total bars after feature engineering and cleaning: {len(df_model_ready)}")
+    print(f"  Features used ({len(feature_cols)}): {', '.join(feature_cols[:5])}... {', '.join(feature_cols[-5:])}")
+    print(f"  Target (UP=1) distribution: {df_model_ready['target'].mean():.1%}")
+    
+    MIN_TRAIN_BARS = 2500 
+    TEST_SIZE_RATIO = 0.15 
+
+    n_available = len(df_model_ready)
+    if n_available < MIN_TRAIN_BARS + 100: 
+        print(f"\n  Error: Not enough {SYMBOL} data for walk-forward validation.")
+        exit()
+
+    print("\n" + "=" * 70)
+    print("  Walk-Forward Validation for Model Robustness")
+    print("=" * 70)
+    
+    wf_results = walk_forward(df_model_ready,
+                              feature_cols,
+                              n_splits=10, 
+                              min_train_bars=MIN_TRAIN_BARS,
+                              test_size_ratio=TEST_SIZE_RATIO)
+    
+    if wf_results:
+        splits_df = pd.DataFrame(wf_results['splits'])
+        print("\n" + "=" * 70)
+        print("  SUMMARY OF WALK-FORWARD VALIDATION")
+        print("=" * 70)
+        print(f"  Overall Accuracy (All Signals)      : {wf_results['overall_accuracy']:.3f}")
+        print(f"  Overall High-Conf Accuracy (>60%) : {splits_df['acc_high_conf'].mean():.3f}")
+        print(f"  Average High-Confidence Bar %       : {splits_df['high_conf_pct'].mean():.1%}")
+        print(f"  Average Always-UP Baseline          : {wf_results['overall_baseline_up']:.3f}")
+        print(f"  Edge over Baseline                  : {wf_results['overall_accuracy'] - wf_results['overall_baseline_up']:+.3f}")
+        print(f"  Number of splits performed          : {len(splits_df)}")
+        print(f"  Total bars used for validation      : {splits_df['test_bars'].sum()}")
+        
+        # Save final model and feature list for later use
+        import joblib
+        mod_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model.pkl')
+        feat_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features.txt')
+        joblib.dump(wf_results['final_model'], mod_path)
+        with open(feat_path, 'w') as f:
+            for col in wf_results['feature_cols']:
+                f.write(f"{col}\n")
+        print(f"\n  Final model saved to '{mod_path}'")
+
+        # UME-2 FIX: Save OOS probability map for honest backtesting.
+        # backtest_engine.py loads this file and restricts simulation to only these bars.
+        oos_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba.pkl')
+        joblib.dump(wf_results['oos_proba_map'], oos_path)
+        print(f"  OOS proba map saved to '{oos_path}' ({len(wf_results['oos_proba_map'])} bars)")
+        model = wf_results['final_model']
+        feature_cols_to_use = wf_results['feature_cols']
+        last_completable_row = df_model_ready.iloc[-1] 
+        pred = predict_next_bar(model, feature_cols_to_use, last_completable_row, confidence_threshold=0.60)
+        close_price = float(last_completable_row['close'])
+        atr = float(last_completable_row.get('atr14', 150.0))
+        
+        print("\n" + "=" * 70)
+        print(f"  {SYMBOL.upper()} ULTIMATE FORECAST (NEXT BAR WITH EXACT TARGETS)")
+        print("=" * 70)
+        if 'time' in last_completable_row:
+            print(f"  Bar time    : {last_completable_row['time']}")
+        print(f"  Direction   : {pred['direction']}")
+        print(f"  Confidence  : {pred['confidence']*100:.1f}%")
+        print(f"  Signal      : {pred['signal_strength']}")
+        print("----------------------------------------------------------------------")
+        print(f"  Entry Price : {close_price:,.2f} (Current Close)")
+
+        # ─────────────────────────────────────────────
+        # DYNAMIC ML-CONFIDENCE RISK SCALING
+        # Relies on probability confidence to expand or choke trade limits.
+        # e.g., 85% Confidence = 1.7x ATR (Wide breathing room for massive breakout)
+        # e.g., 55% Confidence = 1.1x ATR (Tight stop for low-edge trades)
+        # ─────────────────────────────────────────────
+        risk_m = pred['confidence'] * 2.0 
+
+        if pred['direction'] == "UP":
+            sl_val = close_price - (atr * risk_m)
+            tp1_val = close_price + (atr * risk_m)
+            tp2_val = close_price + (atr * risk_m * 2.5) # Massive uncapped runner
+            
+            sl_str = f"{sl_val:,.2f}  (Entry - {risk_m:.2f}x ATR14)"
+            tp1_str = f"{tp1_val:,.2f}  (Entry + {risk_m:.2f}x ATR14)"
+            tp2_str = f"{tp2_val:,.2f}  (Entry + {risk_m*2.5:.2f}x ATR14 [Trailing])"
+            
+            print(f"  Stop Loss   : {sl_str}")
+            print(f"  Target 1    : {tp1_str}")
+            print(f"  Target 2    : {tp2_str}")
+        elif pred['direction'] == "DOWN":
+            sl_val = close_price + (atr * risk_m)
+            tp1_val = close_price - (atr * risk_m)
+            tp2_val = close_price - (atr * risk_m * 2.5)
+            
+            sl_str = f"{sl_val:,.2f}  (Entry + {risk_m:.2f}x ATR14)"
+            tp1_str = f"{tp1_val:,.2f}  (Entry - {risk_m:.2f}x ATR14)"
+            tp2_str = f"{tp2_val:,.2f}  (Entry - {risk_m*2.5:.2f}x ATR14 [Trailing])"
+            
+            print(f"  Stop Loss   : {sl_str}")
+            print(f"  Target 1    : {tp1_str}")
+            print(f"  Target 2    : {tp2_str}")
+        else:
+            sl_str, tp1_str, tp2_str = "0.0", "0.0", "0.0"
+            print("  [No clear directional edge, targets N/A]")
+            
+        print("======================================================================")
+        
+        # Build Pred Info dictionary for Trader Image Output
+        pred_info = {
+            'symbol': SYMBOL,
+            'time': str(last_completable_row.get('time', 'N/A')),
+            'dir': pred['direction'],
+            'conf': f"{pred['confidence']*100:.1f}%",
+            'signal': pred['signal_strength'],
+            'entry': f"{close_price:,.2f} (Current Close)",
+            'sl': sl_str,
+            'tp1': tp1_str,
+            'tp2': tp2_str
+        }
+
+        # Save the performance chart AND text report in one PNG
+        report_file = os.path.join(DATA_DIR, f'{file_prefix}_ml_report_ultimate.png')
+        save_report(wf_results, report_file, pred_info=pred_info)
+        
+        # Display top features concisely
+        fi_sorted = sorted(wf_results['feature_importance'].items(), key=lambda x: x[1], reverse=True)
+        print("\n  Top 15 most predictive features:")
+        for i, (fname, fval) in enumerate(fi_sorted[:15]):
+            print(f"    {i+1}. {fname:<30} {fval:.2f}")
+
+    else:
+        print("\nWalk-forward validation did not produce results. Please check errors above.")
+
+    print("\nScript finished.")
