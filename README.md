@@ -1,59 +1,62 @@
-# 🔥 Universal-ML Engine
-### High-Precision Multi-Timeframe Algorithmic Trading Core
-**77.4% High-Confidence OOS Accuracy | 6.5+ Profit Factor | Zero-Leak Engineering**
+# 🛠️ Universal-ML Engine (Manual Operating Guide)
+### Surgical-Precision Machine Learning for Price Series Prediction
 
 ---
 
-## 🚀 Overview
-**Universal-ML** is a professional-grade, production-ready machine learning engine designed for financial time-series prediction. It specifically targets high-precision directional forecasting (e.g., Nifty/Banknifty Futures) using a **Walk-Forward Validation** (WFV) architecture that ensures **zero lookahead bias** and **zero data leakage**.
+## 📂 1. THE DATA PROTOCOL (Manual Feed)
+This engine is designed as a **manual-feed system**. It does NOT have a built-in data downloader. You must manually provide the price data in CSV format from TradingView, MT5, or any other source.
 
-### Key Performance Identifiers (Post-Audit Build)
-| Metric | Value |
-|---|---|
-| **High-Confidence Accuracy (>60%)** | **77.4%** |
-| **Out-Of-Sample Win Rate** | **83.2%** |
-| **Profit Factor** | **6.516** |
-| **Max Drawdown** | **10.31%** |
-| **Risk-Reward Profile** | High-Confidence Thresholding with Intra-Bar SL/TP |
+### Setup Requirement:
+1.  Create a folder named `csv_data` in the project root.
+2.  **Naming is Critical**: The engine scans for files based on their prefix. You must name your files exactly as follows:
+    *   `1H_ANYNAME.csv` (Primary - 1 Hour timeframe)
+    *   `1D_ANYNAME.csv` (Secondary - 1 Day timeframe)
+    *   `1W_ANYNAME.csv` (Secondary - 1 Week timeframe)
+    *   `1M_ANYNAME.csv` (Secondary - 1 Month timeframe)
 
----
-
-## 🏗️ Core Architecture
-
-### 1. `universal_ml_engine.py` (The Brain)
-*   **Feature Engine**: 118+ engineered features including volatility-normalized returns, kinematic wicks, candle-body ratios, and relative strength across 1H, 1D, 1W, and 1M timeframes.
-*   **Validation Engine**: A robust, multi-split **Walk-Forward** pipeline. Each split carves a hidden validation slice *only* from the training history for early-stopping, ensuring the test set remains strictly blind.
-*   **OOS Proba Map**: Generates an honest timestamped probability map (`{symbol}_oos_proba.pkl`) containing only genuine out-of-sample predictions for backtesting.
-
-### 2. `backtest_engine.py` (The Reality Check)
-*   **Intra-Bar Evaluation**: Simulates trade entry, take-profit (TP1 with half-exit), trailing stops, and stop-losses based on raw OHLC bar dynamics.
-*   **Dual-Horizon Gating**: Implements a 1D macro-trend filter. Trades are only executed if the 1H prediction aligns with the 1D model's bias, significantly improving win rates.
-*   **Fee Accounting**: Realistic fee modeling (commissions + spread) applied at every entry and exit.
-
-### 3. `run_daily_model.py` (Operations)
-*   **Automated Backtesting**: A lightweight daily operator for running 1D model evaluations and generating visual equity curve reports.
+*Note: Replace `ANYNAME` with your symbol (e.g., `1H_BANKNIFTY.csv`).*
 
 ---
 
-## 🛠️ Setup & Execution
+## ⚡ 2. QUICK START (Install & Run)
 
-### 1. Data Structure
-The engine expects a `csv_data/` folder containing data in the following naming format (compatible with TradingView logs):
-*   `1H_{SYMBOL}.csv` (Primary Timeframe)
-*   `1D_{SYMBOL}.csv`
-*   `1W_{SYMBOL}.csv`
-*   `1M_{SYMBOL}.csv`
-
-### 2. Running the Full Pipeline
+### A. Environment Setup
 ```bash
-# 1. Train the model and generate the OOS proba map
-python universal_ml_engine.py --outdir ./data/
-
-# 2. Run the high-precision backtest
-python backtest_engine.py --outdir ./data/
+# 1. Open your terminal in the Universal-ML folder
+# 2. Install dependencies
+pip install -r requirements.txt
 ```
 
+### B. The 2-Step Execution Playbook
+
+#### STEP 1: Train & Validate (The Brain)
+This script processes your `csv_data` files, engineers features, and trains the model using a leak-proof walk-forward process.
+```bash
+python universal_ml_engine.py
+```
+*   **Output**: Saves `{symbol}_ultimate_model.pkl` and a **crucial** `{symbol}_oos_proba.pkl` for the backtester.
+
+#### STEP 2: Backtest & Verify (The Reality Check)
+Once the model is trained, use this to see how it would have performed across history.
+```bash
+python backtest_engine.py
+```
+*   **Output**: Generates a detailed performance report (`{symbol}_backtest_report.png`) with equity curves and win rates.
+
 ---
 
-## ⚠️ Risk Disclaimer
-Financial trading involves significant risk. This software is provided "as is" for research purposes. While the backtested metrics show massive edge (+18.3pp over baseline), live market conditions introduce slippage, execution latency, and partial fills that may differ from simulated results.
+## ⚙️ 3. ENGINE MECHANICS
+*   **Manual CSV Feed**: You control the data. The engine handles the math.
+*   **Zero Leakage**: Built with a strict walk-forward timeline. It never looks at "future" bars while training on "past" bars.
+*   **Dual-Horizon**: The backtester will only enter a trade if the **Daily (1D)** trend aligns with the **Hourly (1H)** prediction.
+*   **Fee Model**: 0.05% per side (adjust in `backtest_engine.py` if your exchange is different).
+
+---
+
+## 📦 4. REQUIREMENTS
+The engine relies on these core scientific libraries:
+*   `LightGBM`: High-speed gradient boosting.
+*   `Pandas`: Data structure management.
+*   `Scikit-Learn`: Metrics and preprocessing.
+*   `Matplotlib`: Report generation.
+*   `Joblib`: Model persistence.
