@@ -1,0 +1,28 @@
+# --- DATA (Manual Feed) ---
+csv_data/*.csv
+
+# --- TRAINED MODELS & PROBA MAPS ---
+*.pkl
+*.model
+
+# --- PERFORMANCE REPORTS & PLOTS ---
+*.png
+*.jpg
+*.pdf
+
+# --- PYTHON ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# --- IDEs & OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.log
