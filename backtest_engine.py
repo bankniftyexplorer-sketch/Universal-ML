@@ -17,13 +17,14 @@ from universal_ml_engine import (
     parse_tv_log, add_features_single, add_calendar_features,
     merge_higher_tf, BARRIER_ATR_MULT, BARRIER_HORIZON_BARS,
     LIVE_CONFIDENCE_THRESHOLD, VOL_GATE_LOOKBACK,
-    EXEC_FEE_PCT, simulate_trade_path_from_arrays
+    EXEC_FEE_PCT, simulate_trade_path_from_arrays, predict_trade_plan
 )
 
 def format_currency(val):
     return f"${val:,.2f}"
 
-def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pct=0.02,
+def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=None,
+                 initial_capital=10000.0, risk_pct=0.02,
                  conf_threshold=LIVE_CONFIDENCE_THRESHOLD, fixed_risk=True,
                  slippage_bps=0.0003, max_hold_bars=BARRIER_HORIZON_BARS):
     equity = initial_capital
@@ -88,6 +89,22 @@ def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pc
                 continue
 
         risk_dollar = (initial_capital if fixed_risk else equity) * risk_pct
+        trade_plan = predict_trade_plan(
+            trade_plan_models or {},
+            feature_cols,
+            df.iloc[i].copy(),
+            'UP' if direction == 'LONG' else 'DOWN',
+            float(current_atr)
+        )
+        stop_dist = float(current_atr * BARRIER_ATR_MULT)
+        tp1_dist = stop_dist
+        tp2_dist = stop_dist * 2.0
+        trail_dist = stop_dist
+        if np.isfinite(trade_plan.get('stop_atr', np.nan)):
+            stop_dist = float(current_atr * trade_plan['stop_atr'])
+            tp1_dist = float(current_atr * trade_plan['tp1_atr'])
+            tp2_dist = float(current_atr * trade_plan['tp2_atr'])
+            trail_dist = float(current_atr * trade_plan['trail_r'])
         trade_path = simulate_trade_path_from_arrays(
             open_arr,
             high_arr,
@@ -96,7 +113,10 @@ def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pc
             time_arr,
             i + 1,
             direction,
-            float(current_atr * BARRIER_ATR_MULT),
+            stop_dist,
+            tp1_dist=tp1_dist,
+            tp2_dist=tp2_dist,
+            trail_dist=trail_dist,
             horizon=max_hold_bars,
             fee_pct=EXEC_FEE_PCT,
             slippage_bps=slippage_bps
@@ -122,6 +142,9 @@ def run_backtest(df, prob_array, prob_array_1d, initial_capital=10000.0, risk_pc
             'status': 'CLOSED',
             'tp1_hit': trade_path['tp1_hit'],
             'tp2_hit': trade_path['tp2_hit'],
+            'stop_atr': (stop_dist / (current_atr + 1e-9)),
+            'tp1_atr': (tp1_dist / (current_atr + 1e-9)),
+            'tp2_atr': (tp2_dist / (current_atr + 1e-9)),
         })
 
         for k in range(i + 1, min(trade_path['exit_idx'], len(df) - 1) + 1):
@@ -301,6 +324,7 @@ def main():
     
     model_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model_1d.pkl')
     feat_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features_1d.txt')
+    trade_plan_path = os.path.join(DATA_DIR, f'{file_prefix}_trade_plan_models.pkl')
 
     if not os.path.exists(model_path) or not os.path.exists(feat_path):
         print(f"[!] Could not find {model_path} or {feat_path}.")
@@ -321,6 +345,11 @@ def main():
         
     with open(feat_1d_path, 'r') as f:
         feature_cols_1d = [line.strip() for line in f.readlines() if line.strip()]
+    trade_plan_models = joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
+    if trade_plan_models:
+        print(f"  [=] Trade-plan models loaded. {len(trade_plan_models)} ML exit models available.")
+    else:
+        print("  [!] WARNING: No ML trade-plan models found. Falling back to static ATR exits.")
 
     print("  [=] Reconstructing feature space over historical data...")
     df_full = add_features_single(df_1h.copy(), prefix='', compute_vwap=True)  # UME-3 FIX
@@ -398,6 +427,8 @@ def main():
         df_backtest,
         prob_array,
         prob_array_1d,
+        feature_cols,
+        trade_plan_models=trade_plan_models,
         initial_capital=10000.0,
         risk_pct=0.02,
         conf_threshold=LIVE_CONFIDENCE_THRESHOLD

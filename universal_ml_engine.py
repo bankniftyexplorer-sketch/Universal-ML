@@ -41,6 +41,10 @@ EXEC_SLIPPAGE_BPS = 0.0003
 TIME_COL_CANDIDATES = ('Date', 'date', 'Datetime', 'datetime', 'Timestamp', 'timestamp', 'Time', 'time')
 MESSAGE_COL_CANDIDATES = ('Message', 'message')
 MODEL_N_JOBS = 4
+TRADE_PLAN_LABEL_COLS = (
+    'long_mfe_atr', 'long_mae_atr',
+    'short_mfe_atr', 'short_mae_atr'
+)
 
 # ─────────────────────────────────────────────
 # 1. PARSER  (handles Indian comma-formatted numbers)
@@ -487,6 +491,9 @@ def simulate_trade_path_from_arrays(opens: np.ndarray,
                                     entry_idx: int,
                                     direction: str,
                                     risk_dist: float,
+                                    tp1_dist: float | None = None,
+                                    tp2_dist: float | None = None,
+                                    trail_dist: float | None = None,
                                     horizon: int = BARRIER_HORIZON_BARS,
                                     fee_pct: float = EXEC_FEE_PCT,
                                     slippage_bps: float = EXEC_SLIPPAGE_BPS) -> dict:
@@ -512,9 +519,12 @@ def simulate_trade_path_from_arrays(opens: np.ndarray,
         return {'total_r': np.nan, 'exit_idx': entry_idx, 'exit_time': None, 'exit_reason': 'INVALID_ENTRY'}
 
     entry_price = raw_entry * (1 + slippage_bps) if is_long else raw_entry * (1 - slippage_bps)
+    tp1_dist = risk_dist * TP1_R_MULT if tp1_dist is None else tp1_dist
+    tp2_dist = risk_dist * TP2_R_MULT if tp2_dist is None else tp2_dist
+    trail_dist = risk_dist * TRAIL_R_MULT if trail_dist is None else trail_dist
     stop = entry_price - risk_dist if is_long else entry_price + risk_dist
-    tp1 = entry_price + (risk_dist * TP1_R_MULT) if is_long else entry_price - (risk_dist * TP1_R_MULT)
-    tp2 = entry_price + (risk_dist * TP2_R_MULT) if is_long else entry_price - (risk_dist * TP2_R_MULT)
+    tp1 = entry_price + tp1_dist if is_long else entry_price - tp1_dist
+    tp2 = entry_price + tp2_dist if is_long else entry_price - tp2_dist
     remaining = {'tp1': TP1_FRACTION, 'tp2': TP2_FRACTION, 'runner': RUNNER_FRACTION}
     total_r = -_fee_r(entry_price, risk_dist, 1.0, fee_pct)
     tp1_hit = False
@@ -629,7 +639,7 @@ def simulate_trade_path_from_arrays(opens: np.ndarray,
 
         if remaining['runner'] > 0 and tp1_hit:
             trail_base = tp1 if tp2_hit else entry_price
-            trail_candidate = bar_close - (risk_dist * TRAIL_R_MULT) if is_long else bar_close + (risk_dist * TRAIL_R_MULT)
+            trail_candidate = bar_close - trail_dist if is_long else bar_close + trail_dist
             stop = _lift_stop(stop, trail_base, is_long)
             stop = _lift_stop(stop, trail_candidate, is_long)
 
@@ -686,6 +696,10 @@ def add_target(df: pd.DataFrame,
     short_path_r = np.full(n, np.nan, dtype=float)
     target_edge_r = np.full(n, np.nan, dtype=float)
     best_path_r = np.full(n, np.nan, dtype=float)
+    long_mfe_atr = np.full(n, np.nan, dtype=float)
+    long_mae_atr = np.full(n, np.nan, dtype=float)
+    short_mfe_atr = np.full(n, np.nan, dtype=float)
+    short_mae_atr = np.full(n, np.nan, dtype=float)
 
     last_start_idx = max(-1, n - horizon - 1)
     for i in range(last_start_idx + 1):
@@ -712,6 +726,15 @@ def add_target(df: pd.DataFrame,
         target_edge_r[i] = abs(long_r - short_r)
         entry_prices[i] = long_trade['entry_price']
         target_distances[i] = dist
+        horizon_end = min(n, entry_idx + horizon)
+        if horizon_end > entry_idx and atrs[i] > 0:
+            window_high = np.nanmax(highs[entry_idx:horizon_end])
+            window_low = np.nanmin(lows[entry_idx:horizon_end])
+            entry_price = entry_prices[i]
+            long_mfe_atr[i] = max(0.0, (window_high - entry_price) / (atrs[i] + 1e-9))
+            long_mae_atr[i] = max(0.0, (entry_price - window_low) / (atrs[i] + 1e-9))
+            short_mfe_atr[i] = max(0.0, (entry_price - window_low) / (atrs[i] + 1e-9))
+            short_mae_atr[i] = max(0.0, (window_high - entry_price) / (atrs[i] + 1e-9))
 
         if long_r >= short_r + MIN_LABEL_EDGE_R and long_r >= MIN_LABEL_BEST_R:
             target[i] = 1.0
@@ -731,6 +754,10 @@ def add_target(df: pd.DataFrame,
     df['short_path_r'] = short_path_r
     df['target_edge_r'] = target_edge_r
     df['best_path_r'] = best_path_r
+    df['long_mfe_atr'] = long_mfe_atr
+    df['long_mae_atr'] = long_mae_atr
+    df['short_mfe_atr'] = short_mfe_atr
+    df['short_mae_atr'] = short_mae_atr
 
     if drop_unresolved:
         df = df.dropna(subset=['target'])
@@ -764,6 +791,26 @@ def _build_lgbm_classifier() -> lgb.LGBMClassifier:
     )
 
 
+def _build_lgbm_regressor(alpha: float) -> lgb.LGBMRegressor:
+    return lgb.LGBMRegressor(
+        n_estimators=400,
+        learning_rate=0.03,
+        num_leaves=31,
+        max_depth=5,
+        min_child_samples=40,
+        subsample=0.75,
+        subsample_freq=1,
+        colsample_bytree=0.75,
+        reg_alpha=0.10,
+        reg_lambda=0.10,
+        random_state=42,
+        n_jobs=MODEL_N_JOBS,
+        verbose=-1,
+        objective='quantile',
+        alpha=alpha
+    )
+
+
 def _fit_lgbm_with_inner_validation(X_train_full: pd.DataFrame,
                                     y_train_full: pd.Series) -> tuple[lgb.LGBMClassifier, pd.DataFrame, pd.Series]:
     inner_val_size = max(100, int(len(X_train_full) * 0.15))
@@ -787,6 +834,84 @@ def _fit_lgbm_with_inner_validation(X_train_full: pd.DataFrame,
         ]
     )
     return model, X_val_inner, y_val_inner
+
+
+def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
+    specs = {
+        'up_stop_atr':   (1, 'long_mae_atr', 0.80),
+        'up_tp1_atr':    (1, 'long_mfe_atr', 0.50),
+        'up_tp2_atr':    (1, 'long_mfe_atr', 0.80),
+        'down_stop_atr': (0, 'short_mae_atr', 0.80),
+        'down_tp1_atr':  (0, 'short_mfe_atr', 0.50),
+        'down_tp2_atr':  (0, 'short_mfe_atr', 0.80),
+    }
+    models = {}
+    for key, (target_value, label_col, alpha) in specs.items():
+        train_df = df[df['target'] == target_value].dropna(subset=feature_cols + [label_col]).copy()
+        if len(train_df) < 300:
+            continue
+        model = _build_lgbm_regressor(alpha)
+        model.fit(train_df[feature_cols], train_df[label_col])
+        models[key] = model
+    return models
+
+
+def predict_trade_plan(plan_models: dict,
+                       feature_cols: list,
+                       latest_row: pd.Series,
+                       direction: str,
+                       atr_value: float) -> dict:
+    fallback_r = BARRIER_ATR_MULT
+    if direction not in {'UP', 'DOWN'} or atr_value <= 0:
+        return {
+            'sl': np.nan, 'tp1': np.nan, 'tp2': np.nan,
+            'stop_atr': np.nan, 'tp1_atr': np.nan, 'tp2_atr': np.nan,
+            'trail_r': np.nan, 'note': 'No directional trade plan available.'
+        }
+
+    prefix = 'up' if direction == 'UP' else 'down'
+    required = [f'{prefix}_stop_atr', f'{prefix}_tp1_atr', f'{prefix}_tp2_atr']
+    missing_cols = [col for col in feature_cols if col not in latest_row.index]
+    if missing_cols:
+        for col in missing_cols:
+            latest_row[col] = 0.0
+    X = latest_row[feature_cols].values.reshape(1, -1)
+
+    if all(key in plan_models for key in required):
+        stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 4.00))
+        tp1_atr = float(np.clip(plan_models[required[1]].predict(X)[0], 0.25, 6.00))
+        tp2_atr = float(np.clip(plan_models[required[2]].predict(X)[0], 0.50, 8.00))
+        tp1_atr = max(tp1_atr, stop_atr * 0.80)
+        tp2_atr = max(tp2_atr, tp1_atr + 0.25)
+        trail_r = float(np.clip(stop_atr, 0.50, 3.00))
+        note = 'ML-derived levels from quantile excursion models.'
+    else:
+        stop_atr = fallback_r
+        tp1_atr = fallback_r
+        tp2_atr = fallback_r * TP2_R_MULT
+        trail_r = TRAIL_R_MULT
+        note = 'Fallback ATR plan: excursion models unavailable.'
+
+    close_price = float(latest_row['close'])
+    if direction == 'UP':
+        sl = close_price - (atr_value * stop_atr)
+        tp1 = close_price + (atr_value * tp1_atr)
+        tp2 = close_price + (atr_value * tp2_atr)
+    else:
+        sl = close_price + (atr_value * stop_atr)
+        tp1 = close_price - (atr_value * tp1_atr)
+        tp2 = close_price - (atr_value * tp2_atr)
+
+    return {
+        'sl': sl,
+        'tp1': tp1,
+        'tp2': tp2,
+        'stop_atr': stop_atr,
+        'tp1_atr': tp1_atr,
+        'tp2_atr': tp2_atr,
+        'trail_r': trail_r,
+        'note': note
+    }
 
 
 def walk_forward(df: pd.DataFrame,
@@ -983,6 +1108,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None, symbol
         
         # Get dynamic symbol from pred_info or default to BANKNIFTY
         symbol_display = pred_info.get('symbol', 'BANKNIFTY').upper()
+        note_line = f"  Filter Note : {pred_info['note']}\n" if pred_info.get('note') else ""
         
         report_text = (
             f"======================================================================\n"
@@ -998,6 +1124,7 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None, symbol
             f"  Target 1    : {pred_info['tp1']}\n"
             f"  Target 2    : {pred_info['tp2']}\n"
             f"  Trail Stop  : {pred_info['trail']}\n"
+            f"{note_line}"
             f"======================================================================"
         )
         ax1.text(0.5, 0.5, report_text, color=bg_color, fontsize=16, 
@@ -1227,13 +1354,14 @@ if __name__ == '__main__':
     exclude_cols = {'time', 'open', 'high', 'low', 'close', 'volume',
                     'target', 'next_ret_pct', 'bars_to_target', 'entry_price_next_bar', 'target_distance',
                     'long_path_r', 'short_path_r', 'target_edge_r', 'best_path_r',
+                    'long_mfe_atr', 'long_mae_atr', 'short_mfe_atr', 'short_mae_atr',
                     'd_open', 'd_high', 'd_low', 'd_close', 'd_volume', # Exclude raw higher TF data
                     'w_open', 'w_high', 'w_low', 'w_close', 'w_volume',
                     'm_open', 'm_high', 'm_low', 'm_close', 'm_volume'}
     feature_cols = [c for c in df_full.columns if c not in exclude_cols]
     
     # Ensure all feature columns are numerical and handle potential infinities/NaNs from feature engineering
-    df_model_ready = df_full[feature_cols + ['target', 'time', 'close']].copy()
+    df_model_ready = df_full[feature_cols + ['target', 'time', 'close'] + list(TRADE_PLAN_LABEL_COLS)].copy()
     for col in feature_cols:
         df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
     
@@ -1291,11 +1419,16 @@ if __name__ == '__main__':
         print(f"  OOS proba map saved to '{oos_path}' ({len(wf_results['oos_proba_map'])} bars)")
         model = wf_results['final_model']
         feature_cols_to_use = wf_results['feature_cols']
+        trade_plan_models = train_trade_plan_models(df_model_ready, feature_cols_to_use)
+        trade_plan_path = os.path.join(DATA_DIR, f'{file_prefix}_trade_plan_models.pkl')
+        joblib.dump(trade_plan_models, trade_plan_path)
+        print(f"  Trade-plan models saved to '{trade_plan_path}' ({len(trade_plan_models)} models)")
         last_completable_row = df_model_ready.iloc[-1] 
         pred = predict_next_bar(model, feature_cols_to_use, last_completable_row, confidence_threshold=LIVE_CONFIDENCE_THRESHOLD)
         close_price = float(last_completable_row['close'])
         atr = float(last_completable_row.get('atr14', 150.0))
         volatility_ok = bool(last_completable_row.get('atr_expanding', 1))
+        trade_plan = predict_trade_plan(trade_plan_models, feature_cols_to_use, last_completable_row.copy(), pred['direction'], atr)
         
         print("\n" + "=" * 70)
         print(f"  {SYMBOL.upper()} ULTIMATE FORECAST (EXECUTION-ALIGNED)")
@@ -1308,41 +1441,28 @@ if __name__ == '__main__':
         print("----------------------------------------------------------------------")
         print(f"  Entry Price : {close_price:,.2f} (Current Close)")
 
-        risk_m = BARRIER_ATR_MULT
-        trail_str = f"{TRAIL_R_MULT:.2f}R trailing stop after TP1"
+        trail_str = "N/A"
+        filter_note = trade_plan['note']
+        if pred['direction'] in {"UP", "DOWN"} and np.isfinite(trade_plan['sl']):
+            sl_str = f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
+            tp1_str = f"{trade_plan['tp1']:,.2f}  (ML TP1 {trade_plan['tp1_atr']:.2f}x ATR14)"
+            tp2_str = f"{trade_plan['tp2']:,.2f}  (ML TP2 {trade_plan['tp2_atr']:.2f}x ATR14)"
+            trail_str = f"{trade_plan['trail_r']:.2f}R trailing stop after TP1"
+        else:
+            sl_str, tp1_str, tp2_str = "N/A", "N/A", "N/A"
 
         if pred['signal_strength'] == 'NO_TRADE':
-            sl_str, tp1_str, tp2_str, trail_str = "N/A", "N/A", "N/A", "N/A"
             if not volatility_ok:
-                print("  [Filtered out: ATR is below its 50-bar average]")
+                filter_note = f"{filter_note} Filtered out: ATR is below its 50-bar average".strip()
             else:
-                print(f"  [Filtered out: confidence below {LIVE_CONFIDENCE_THRESHOLD:.2f}]")
-        elif pred['direction'] == "UP":
-            sl_val = close_price - (atr * risk_m)
-            tp1_val = close_price + (atr * risk_m)
-            tp2_val = close_price + (atr * risk_m * TP2_R_MULT)
-
-            sl_str = f"{sl_val:,.2f}  (Entry - {risk_m:.2f}x ATR14)"
-            tp1_str = f"{tp1_val:,.2f}  (50% off at +{TP1_R_MULT:.2f}R)"
-            tp2_str = f"{tp2_val:,.2f}  (25% off at +{TP2_R_MULT:.2f}R)"
-
+                filter_note = f"{filter_note} Filtered out: confidence below {LIVE_CONFIDENCE_THRESHOLD:.2f}".strip()
+        if pred['direction'] in {"UP", "DOWN"}:
             print(f"  Stop Loss   : {sl_str}")
             print(f"  Target 1    : {tp1_str}")
             print(f"  Target 2    : {tp2_str}")
             print(f"  Trail Stop  : {trail_str}")
-        elif pred['direction'] == "DOWN":
-            sl_val = close_price + (atr * risk_m)
-            tp1_val = close_price - (atr * risk_m)
-            tp2_val = close_price - (atr * risk_m * TP2_R_MULT)
-
-            sl_str = f"{sl_val:,.2f}  (Entry + {risk_m:.2f}x ATR14)"
-            tp1_str = f"{tp1_val:,.2f}  (50% off at +{TP1_R_MULT:.2f}R)"
-            tp2_str = f"{tp2_val:,.2f}  (25% off at +{TP2_R_MULT:.2f}R)"
-
-            print(f"  Stop Loss   : {sl_str}")
-            print(f"  Target 1    : {tp1_str}")
-            print(f"  Target 2    : {tp2_str}")
-            print(f"  Trail Stop  : {trail_str}")
+            if filter_note:
+                print(f"  [Filtered out: {filter_note}]")
         else:
             sl_str, tp1_str, tp2_str, trail_str = "N/A", "N/A", "N/A", "N/A"
             print("  [No clear directional edge, targets N/A]")
@@ -1360,7 +1480,8 @@ if __name__ == '__main__':
             'sl': sl_str,
             'tp1': tp1_str,
             'tp2': tp2_str,
-            'trail': trail_str
+            'trail': trail_str,
+            'note': filter_note
         }
 
         # Save the performance chart AND text report in one PNG
