@@ -639,10 +639,10 @@ def _fit_lgbm_with_inner_validation(X_train_full: pd.DataFrame,
 
 def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
     specs = {
-        'up_stop_atr':   (1, 'long_mae_atr', 0.80),
+        'up_stop_atr':   (1, 'long_mae_atr', 0.40),   # Tightened: 40th percentile (Pro-Trader SL)
         'up_tp1_atr':    (1, 'long_mfe_atr', 0.50),
         'up_tp2_atr':    (1, 'long_mfe_atr', 0.80),
-        'down_stop_atr': (0, 'short_mae_atr', 0.80),
+        'down_stop_atr': (0, 'short_mae_atr', 0.40),  # Tightened
         'down_tp1_atr':  (0, 'short_mfe_atr', 0.50),
         'down_tp2_atr':  (0, 'short_mfe_atr', 0.80),
     }
@@ -679,13 +679,16 @@ def predict_trade_plan(plan_models: dict,
     X = latest_row[feature_cols].values.reshape(1, -1)
 
     if all(key in plan_models for key in required):
-        stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 4.00))
-        tp1_atr = float(np.clip(plan_models[required[1]].predict(X)[0], 0.25, 6.00))
-        tp2_atr = float(np.clip(plan_models[required[2]].predict(X)[0], 0.50, 8.00))
-        tp1_atr = max(tp1_atr, stop_atr * 0.80)
+        # STRUCTURAL LIMITS: Never allow Sl beyond 1.25x ATR or TP beyond 5.00x ATR
+        stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 1.25))
+        tp1_atr = float(np.clip(plan_models[required[1]].predict(X)[0], 0.25, 3.00))
+        tp2_atr = float(np.clip(plan_models[required[2]].predict(X)[0], 0.50, 5.00))
+        
+        # Ensure Reward/Risk logic: TP1 should be at least 1x Stop
+        tp1_atr = max(tp1_atr, stop_atr * 1.00)
         tp2_atr = max(tp2_atr, tp1_atr + 0.25)
-        trail_r = float(np.clip(stop_atr, 0.50, 3.00))
-        note = 'ML-derived levels from quantile excursion models.'
+        trail_r = float(np.clip(stop_atr, 0.40, 1.50))
+        note = 'ML-derived levels (Tightened for Professional Risk).'
     else:
         stop_atr = fallback_r
         tp1_atr = fallback_r
@@ -1124,7 +1127,7 @@ if __name__ == '__main__':
         atr_mult=BARRIER_ATR_MULT,
         horizon=BARRIER_HORIZON_BARS,
         atr_col='atr14',
-        drop_unresolved=True,
+        drop_unresolved=False,
     )
 
     # ── Step 5: Identify holographic feature columns ───────────────────────
@@ -1149,7 +1152,7 @@ if __name__ == '__main__':
                              + [c for c in TRADE_PLAN_LABEL_COLS if c in df_full.columns]].copy()
     for col in all_holo_cols:
         df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
-    df_model_ready = df_model_ready.dropna(subset=['target'] + all_holo_cols).reset_index(drop=True)
+    df_model_ready = df_model_ready.dropna(subset=all_holo_cols).reset_index(drop=True)
 
     print(f"  [TOON v4.0] Bars after labelling & cleaning : {len(df_model_ready)}")
     print(f"  [TOON v4.0] Holographic features before selection : {len(all_holo_cols)}")

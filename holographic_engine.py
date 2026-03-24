@@ -496,7 +496,7 @@ def feature_selection_pipeline(
     """
     print(f"\n  [HOLO] Feature selection starting with {len(feature_cols)} features…")
 
-    p1 = correlation_filter(df, feature_cols)
+    p1 = feature_cols # correlation_filter(df, feature_cols)
     p2 = phase1_ranking(df, p1, target_col=target_col)
 
     final = p2
