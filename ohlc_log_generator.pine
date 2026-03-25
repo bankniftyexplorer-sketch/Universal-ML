@@ -1,0 +1,8 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © bankniftyexplorer
+
+//@version=6
+indicator("ohlc log generator")
+
+log.info("SYMBOL:{0} ,OPEN:{1} , HIGH:{2} , LOW:{3} , CLOSE:{4} , VOLUME:{5} , CLOSE TIME:{6} , TIME FRAME:{7}" ,syminfo.ticker, open , high , low , close ,
+nz(volume , 0) ,time_close , timeframe.period)
