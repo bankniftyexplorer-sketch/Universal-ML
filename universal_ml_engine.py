@@ -10,9 +10,6 @@ import warnings
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import TimeSeriesSplit
 import matplotlib
 import argparse
 import os
@@ -25,9 +22,8 @@ import matplotlib.gridspec as gridspec
 from holographic_engine import (
     holographic_feature_engine,
     feature_selection_pipeline,
-    HOLO_WINDOWS_1H, HOLO_WINDOWS_1D, HOLO_WINDOWS_1W, HOLO_WINDOWS_1M,
-    FINAL_FEAT_BUDGET,
 )
+from numba import njit
 
 warnings.filterwarnings('ignore')
 
@@ -251,10 +247,7 @@ def merge_higher_tf(df_1h: pd.DataFrame,
                            tolerance=pd.Timedelta('14 days'))
     merged = pd.merge_asof(merged, df_1m_feat, on='time', direction='backward',
                            tolerance=pd.Timedelta('62 days'))
-
-    return merged
-
-
+    merged = merged.ffill()
 
     return merged
 
@@ -263,208 +256,396 @@ def merge_higher_tf(df_1h: pd.DataFrame,
 # 3. TARGET
 # ─────────────────────────────────────────────
 
+@njit(nopython=True)
 def _lift_stop(stop: float, candidate: float, is_long: bool) -> float:
     return max(stop, candidate) if is_long else min(stop, candidate)
 
-
+@njit(nopython=True)
 def _favorable_touch(price: float, level: float, is_long: bool) -> bool:
     return price >= level if is_long else price <= level
 
-
+@njit(nopython=True)
 def _adverse_touch(price: float, level: float, is_long: bool) -> bool:
     return price <= level if is_long else price >= level
 
-
+@njit(nopython=True)
 def _realized_r(entry_price: float, exit_price: float, risk_dist: float, fraction: float, is_long: bool) -> float:
     gross = (exit_price - entry_price) if is_long else (entry_price - exit_price)
     return (gross / (risk_dist + 1e-9)) * fraction
 
-
+@njit(nopython=True)
 def _fee_r(price: float, risk_dist: float, fraction: float, fee_pct: float) -> float:
     return (price * fee_pct / (risk_dist + 1e-9)) * fraction
 
-
-def simulate_trade_path_from_arrays(opens: np.ndarray,
-                                    highs: np.ndarray,
-                                    lows: np.ndarray,
-                                    closes: np.ndarray,
-                                    times: np.ndarray | None,
-                                    entry_idx: int,
-                                    direction: str,
-                                    risk_dist: float,
-                                    tp1_dist: float | None = None,
-                                    tp2_dist: float | None = None,
-                                    trail_dist: float | None = None,
-                                    horizon: int = BARRIER_HORIZON_BARS,
-                                    fee_pct: float = EXEC_FEE_PCT,
-                                    slippage_bps: float = EXEC_SLIPPAGE_BPS) -> dict:
-    """Simulate the exact trade plan used by both training labels and backtest.
-
-    Execution model:
-    - Entry on next bar open with slippage.
-    - 50% off at TP1 = 1R.
-    - Move stop to breakeven after TP1.
-    - 25% off at TP2 = 2R.
-    - Raise stop to TP1 after TP2.
-    - Trail the final 25% using a 1R stop behind close.
-    - Force-close any remainder at horizon expiry.
-    - Same-bar ambiguities are resolved conservatively against the trade.
-    """
+@njit(nopython=True)
+def simulate_trade_path_from_arrays_jit(
+    opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+    entry_idx: int, is_long: bool, risk_dist: float, tp1_dist: float, tp2_dist: float, trail_dist: float,
+    horizon: int, fee_pct: float, slippage_bps: float, 
+    tp1_frac: float, tp2_frac: float, runner_frac: float
+):
     n = len(opens)
     if entry_idx >= n or risk_dist <= 0 or not np.isfinite(risk_dist):
-        return {'total_r': np.nan, 'exit_idx': entry_idx, 'exit_time': None, 'exit_reason': 'INVALID'}
+        return (np.nan, entry_idx, 0, 0.0, 0.0, False, False, 0.0)
 
-    is_long = direction.upper() == 'LONG'
     raw_entry = float(opens[entry_idx])
     if not np.isfinite(raw_entry):
-        return {'total_r': np.nan, 'exit_idx': entry_idx, 'exit_time': None, 'exit_reason': 'INVALID_ENTRY'}
+        return (np.nan, entry_idx, 1, 0.0, 0.0, False, False, 0.0)
 
     entry_price = raw_entry * (1 + slippage_bps) if is_long else raw_entry * (1 - slippage_bps)
-    tp1_dist = risk_dist * TP1_R_MULT if tp1_dist is None else tp1_dist
-    tp2_dist = risk_dist * TP2_R_MULT if tp2_dist is None else tp2_dist
-    trail_dist = risk_dist * TRAIL_R_MULT if trail_dist is None else trail_dist
     stop = entry_price - risk_dist if is_long else entry_price + risk_dist
     tp1 = entry_price + tp1_dist if is_long else entry_price - tp1_dist
     tp2 = entry_price + tp2_dist if is_long else entry_price - tp2_dist
-    remaining = {'tp1': TP1_FRACTION, 'tp2': TP2_FRACTION, 'runner': RUNNER_FRACTION}
+    
+    rem_tp1 = tp1_frac
+    rem_tp2 = tp2_frac
+    rem_runner = runner_frac
+    
     total_r = -_fee_r(entry_price, risk_dist, 1.0, fee_pct)
     tp1_hit = False
     tp2_hit = False
-    exit_reason = 'TIME_EXIT'
+    exit_reason = 2
     exit_idx = min(n - 1, entry_idx + max(horizon - 1, 0))
     last_fill_price = entry_price
 
-    def remaining_total() -> float:
-        return float(remaining['tp1'] + remaining['tp2'] + remaining['runner'])
-
-    def fill_fraction(key: str, fill_price: float) -> None:
-        nonlocal total_r, last_fill_price
-        fraction = remaining[key]
-        if fraction <= 0:
-            return
-        total_r += _realized_r(entry_price, fill_price, risk_dist, fraction, is_long)
-        total_r -= _fee_r(fill_price, risk_dist, fraction, fee_pct)
-        remaining[key] = 0.0
-        last_fill_price = fill_price
-
-    def fill_all_remaining(fill_price: float) -> None:
-        nonlocal total_r, last_fill_price
-        leftover = remaining_total()
-        if leftover <= 0:
-            return
-        total_r += _realized_r(entry_price, fill_price, risk_dist, leftover, is_long)
-        total_r -= _fee_r(fill_price, risk_dist, leftover, fee_pct)
-        remaining['tp1'] = 0.0
-        remaining['tp2'] = 0.0
-        remaining['runner'] = 0.0
-        last_fill_price = fill_price
-
-    last_idx = min(n - 1, entry_idx + max(horizon - 1, 0))
+    last_idx = exit_idx
     for j in range(entry_idx, last_idx + 1):
         bar_open = float(opens[j])
         bar_high = float(highs[j])
         bar_low = float(lows[j])
         bar_close = float(closes[j])
         if not np.isfinite(bar_open) or not np.isfinite(bar_high) or not np.isfinite(bar_low) or not np.isfinite(bar_close):
-            exit_reason = 'BAD_BAR'
+            exit_reason = 3
             exit_idx = j
             break
 
         if _adverse_touch(bar_open, stop, is_long):
-            fill_all_remaining(bar_open)
-            exit_reason = 'SL_GAP'
+            leftover = rem_tp1 + rem_tp2 + rem_runner
+            if leftover > 0:
+                total_r += _realized_r(entry_price, bar_open, risk_dist, leftover, is_long)
+                total_r -= _fee_r(bar_open, risk_dist, leftover, fee_pct)
+                rem_tp1 = 0.0; rem_tp2 = 0.0; rem_runner = 0.0
+                last_fill_price = bar_open
+            exit_reason = 4
             exit_idx = j
             break
 
-        if remaining['tp1'] > 0 and _favorable_touch(bar_open, tp1, is_long):
-            fill_fraction('tp1', tp1)
+        if rem_tp1 > 0 and _favorable_touch(bar_open, tp1, is_long):
+            total_r += _realized_r(entry_price, tp1, risk_dist, rem_tp1, is_long)
+            total_r -= _fee_r(tp1, risk_dist, rem_tp1, fee_pct)
+            rem_tp1 = 0.0
+            last_fill_price = tp1
             tp1_hit = True
             stop = _lift_stop(stop, entry_price, is_long)
 
-        if remaining['tp2'] > 0 and _favorable_touch(bar_open, tp2, is_long):
-            fill_fraction('tp2', tp2)
+        if rem_tp2 > 0 and _favorable_touch(bar_open, tp2, is_long):
+            total_r += _realized_r(entry_price, tp2, risk_dist, rem_tp2, is_long)
+            total_r -= _fee_r(tp2, risk_dist, rem_tp2, fee_pct)
+            rem_tp2 = 0.0
+            last_fill_price = tp2
             tp2_hit = True
             stop = _lift_stop(stop, tp1, is_long)
 
-        if remaining_total() <= 0:
-            exit_reason = 'TARGETS_GAP_FILLED'
+        rem_total = rem_tp1 + rem_tp2 + rem_runner
+        if rem_total <= 0:
+            exit_reason = 5
             exit_idx = j
             break
 
         bar_best = bar_high if is_long else bar_low
         bar_worst = bar_low if is_long else bar_high
-        favorable_same_bar = (
-            (remaining['tp1'] > 0 and _favorable_touch(bar_best, tp1, is_long)) or
-            (remaining['tp2'] > 0 and _favorable_touch(bar_best, tp2, is_long))
-        )
-        adverse_same_bar = _adverse_touch(bar_worst, stop, is_long)
+        fav_same_bar = (rem_tp1 > 0 and _favorable_touch(bar_best, tp1, is_long)) or (rem_tp2 > 0 and _favorable_touch(bar_best, tp2, is_long))
+        adv_same_bar = _adverse_touch(bar_worst, stop, is_long)
 
-        if adverse_same_bar and favorable_same_bar:
-            fill_all_remaining(stop)
-            exit_reason = 'AMBIGUOUS_BAR_SL'
-            exit_idx = j
-            break
-        if adverse_same_bar:
-            fill_all_remaining(stop)
-            exit_reason = 'SL_HIT'
+        if adv_same_bar and fav_same_bar:
+            leftover = rem_tp1 + rem_tp2 + rem_runner
+            if leftover > 0:
+                total_r += _realized_r(entry_price, stop, risk_dist, leftover, is_long)
+                total_r -= _fee_r(stop, risk_dist, leftover, fee_pct)
+                rem_tp1 = 0.0; rem_tp2 = 0.0; rem_runner = 0.0
+                last_fill_price = stop
+            exit_reason = 6
             exit_idx = j
             break
 
-        if remaining['tp1'] > 0 and _favorable_touch(bar_best, tp1, is_long):
-            fill_fraction('tp1', tp1)
+        if adv_same_bar:
+            leftover = rem_tp1 + rem_tp2 + rem_runner
+            if leftover > 0:
+                total_r += _realized_r(entry_price, stop, risk_dist, leftover, is_long)
+                total_r -= _fee_r(stop, risk_dist, leftover, fee_pct)
+                rem_tp1 = 0.0; rem_tp2 = 0.0; rem_runner = 0.0
+                last_fill_price = stop
+            exit_reason = 7
+            exit_idx = j
+            break
+
+        if rem_tp1 > 0 and _favorable_touch(bar_best, tp1, is_long):
+            total_r += _realized_r(entry_price, tp1, risk_dist, rem_tp1, is_long)
+            total_r -= _fee_r(tp1, risk_dist, rem_tp1, fee_pct)
+            rem_tp1 = 0.0
+            last_fill_price = tp1
             tp1_hit = True
             stop = _lift_stop(stop, entry_price, is_long)
-            if remaining_total() <= 0:
-                exit_reason = 'TP1_FILLED'
+            rem_total = rem_tp1 + rem_tp2 + rem_runner
+            if rem_total <= 0:
+                exit_reason = 8
                 exit_idx = j
                 break
             if _adverse_touch(bar_worst, stop, is_long):
-                fill_all_remaining(stop)
-                exit_reason = 'POST_TP1_STOP'
+                leftover = rem_tp1 + rem_tp2 + rem_runner
+                if leftover > 0:
+                    total_r += _realized_r(entry_price, stop, risk_dist, leftover, is_long)
+                    total_r -= _fee_r(stop, risk_dist, leftover, fee_pct)
+                    rem_tp1 = 0.0; rem_tp2 = 0.0; rem_runner = 0.0
+                    last_fill_price = stop
+                exit_reason = 9
                 exit_idx = j
                 break
 
-        if remaining['tp2'] > 0 and _favorable_touch(bar_best, tp2, is_long):
-            fill_fraction('tp2', tp2)
+        if rem_tp2 > 0 and _favorable_touch(bar_best, tp2, is_long):
+            total_r += _realized_r(entry_price, tp2, risk_dist, rem_tp2, is_long)
+            total_r -= _fee_r(tp2, risk_dist, rem_tp2, fee_pct)
+            rem_tp2 = 0.0
+            last_fill_price = tp2
             tp2_hit = True
             stop = _lift_stop(stop, tp1, is_long)
-            if remaining_total() <= 0:
-                exit_reason = 'TP2_FILLED'
+            rem_total = rem_tp1 + rem_tp2 + rem_runner
+            if rem_total <= 0:
+                exit_reason = 10
                 exit_idx = j
                 break
             if _adverse_touch(bar_worst, stop, is_long):
-                fill_all_remaining(stop)
-                exit_reason = 'POST_TP2_STOP'
+                leftover = rem_tp1 + rem_tp2 + rem_runner
+                if leftover > 0:
+                    total_r += _realized_r(entry_price, stop, risk_dist, leftover, is_long)
+                    total_r -= _fee_r(stop, risk_dist, leftover, fee_pct)
+                    rem_tp1 = 0.0; rem_tp2 = 0.0; rem_runner = 0.0
+                    last_fill_price = stop
+                exit_reason = 11
                 exit_idx = j
                 break
 
-        if remaining['runner'] > 0 and tp1_hit:
-            trail_base = tp1 if tp2_hit else entry_price
+        if rem_runner > 0 and trail_dist > 0:
             trail_candidate = bar_close - trail_dist if is_long else bar_close + trail_dist
-            stop = _lift_stop(stop, trail_base, is_long)
             stop = _lift_stop(stop, trail_candidate, is_long)
+            if tp1_hit:
+                trail_base = tp1 if tp2_hit else entry_price
+                stop = _lift_stop(stop, trail_base, is_long)
 
     else:
-        fill_all_remaining(float(closes[last_idx]))
-        exit_reason = 'TIME_EXIT'
+        leftover = rem_tp1 + rem_tp2 + rem_runner
+        if leftover > 0:
+            fill_price = float(closes[last_idx])
+            total_r += _realized_r(entry_price, fill_price, risk_dist, leftover, is_long)
+            total_r -= _fee_r(fill_price, risk_dist, leftover, fee_pct)
+            rem_tp1 = 0.0; rem_tp2 = 0.0; rem_runner = 0.0
+            last_fill_price = fill_price
+        exit_reason = 2
         exit_idx = last_idx
 
-    if remaining_total() > 0 and exit_reason in {'BAD_BAR'}:
-        fill_all_remaining(float(closes[min(exit_idx, n - 1)]))
+    rem_total_final = rem_tp1 + rem_tp2 + rem_runner
+    if rem_total_final > 0 and exit_reason == 3:
+        idx_to_fill = min(exit_idx, n - 1)
+        fill_price = float(closes[idx_to_fill])
+        total_r += _realized_r(entry_price, fill_price, risk_dist, rem_total_final, is_long)
+        total_r -= _fee_r(fill_price, risk_dist, rem_total_final, fee_pct)
+        last_fill_price = fill_price
 
-    exit_time = None if times is None else times[min(exit_idx, n - 1)]
+    return (
+        float(total_r), int(exit_idx), int(exit_reason), float(entry_price),
+        float(last_fill_price), bool(tp1_hit), bool(tp2_hit), float(stop)
+    )
+
+def simulate_trade_path_from_arrays(opens: np.ndarray, highs: np.ndarray, lows: np.ndarray,
+                                    closes: np.ndarray, times, entry_idx: int,
+                                    direction: str, risk_dist: float, tp1_dist = None,
+                                    tp2_dist = None, trail_dist = None,
+                                    horizon: int = BARRIER_HORIZON_BARS, fee_pct: float = EXEC_FEE_PCT,
+                                    slippage_bps: float = EXEC_SLIPPAGE_BPS) -> dict:
+    is_long = direction.upper() == 'LONG'
+    tp1_d = risk_dist * TP1_R_MULT if tp1_dist is None else tp1_dist
+    tp2_d = risk_dist * TP2_R_MULT if tp2_dist is None else tp2_dist
+    trail_d = risk_dist * TRAIL_R_MULT if trail_dist is None else trail_dist
+
+    ret = simulate_trade_path_from_arrays_jit(
+        opens, highs, lows, closes, entry_idx, is_long, risk_dist,
+        tp1_d, tp2_d, trail_d, horizon, fee_pct, slippage_bps,
+        TP1_FRACTION, TP2_FRACTION, RUNNER_FRACTION
+    )
+    
+    total_r, exin, ereas, epr, xpr, tp1h, tp2h, fst = ret
+    
+    reasons = {
+        0: 'INVALID', 1: 'INVALID_ENTRY', 2: 'TIME_EXIT', 3: 'BAD_BAR',
+        4: 'SL_GAP', 5: 'TARGETS_GAP_FILLED', 6: 'AMBIGUOUS_BAR_SL',
+        7: 'SL_HIT', 8: 'TP1_FILLED', 9: 'POST_TP1_STOP', 10: 'TP2_FILLED', 11: 'POST_TP2_STOP'
+    }
+    
+    exit_time = None if times is None else times[min(exin, len(opens) - 1)]
     return {
         'entry_idx': entry_idx,
-        'entry_price': entry_price,
-        'exit_price': float(last_fill_price),
-        'exit_idx': min(exit_idx, n - 1),
+        'entry_price': epr,
+        'exit_price': xpr,
+        'exit_idx': min(exin, len(opens) - 1),
         'exit_time': exit_time,
-        'exit_reason': exit_reason,
-        'total_r': float(total_r),
-        'tp1_hit': tp1_hit,
-        'tp2_hit': tp2_hit,
-        'final_stop': float(stop)
+        'exit_reason': reasons.get(ereas, 'UNKNOWN'),
+        'total_r': total_r,
+        'tp1_hit': tp1h,
+        'tp2_hit': tp2h,
+        'final_stop': fst
     }
+
+
+@njit(nopython=True)
+def _add_target_loop_jit(
+    opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, atrs: np.ndarray,
+    atr_mult: float, horizon: int,
+    tp1_r_mult: float, tp2_r_mult: float, trail_r_mult: float,
+    fee_pct: float, slippage_bps: float,
+    tp1_frac: float, tp2_frac: float, runner_frac: float
+):
+    n = len(opens)
+    last_start_idx = max(-1, n - horizon - 1)
+    
+    target = np.full(n, np.nan, dtype=np.float64)
+    next_ret_pct = np.full(n, np.nan, dtype=np.float64)
+    bars_to_target = np.full(n, np.nan, dtype=np.float64)
+    entry_prices = np.full(n, np.nan, dtype=np.float64)
+    target_distances = np.full(n, np.nan, dtype=np.float64)
+    long_path_r = np.full(n, np.nan, dtype=np.float64)
+    short_path_r = np.full(n, np.nan, dtype=np.float64)
+    target_edge_r = np.full(n, np.nan, dtype=np.float64)
+    best_path_r = np.full(n, np.nan, dtype=np.float64)
+    long_mfe_atr = np.full(n, np.nan, dtype=np.float64)
+    long_mae_atr = np.full(n, np.nan, dtype=np.float64)
+    short_mfe_atr = np.full(n, np.nan, dtype=np.float64)
+    short_mae_atr = np.full(n, np.nan, dtype=np.float64)
+    
+    for i in range(last_start_idx + 1):
+        entry_idx = i + 1
+        dist = atrs[i] * atr_mult
+        if not np.isfinite(dist) or dist <= 0:
+            continue
+
+        long_trade = simulate_trade_path_from_arrays_jit(
+            opens, highs, lows, closes, entry_idx, True, dist,
+            dist * tp1_r_mult, dist * tp2_r_mult, dist * trail_r_mult,
+            horizon, fee_pct, slippage_bps, tp1_frac, tp2_frac, runner_frac
+        )
+        short_trade = simulate_trade_path_from_arrays_jit(
+            opens, highs, lows, closes, entry_idx, False, dist,
+            dist * tp1_r_mult, dist * tp2_r_mult, dist * trail_r_mult,
+            horizon, fee_pct, slippage_bps, tp1_frac, tp2_frac, runner_frac
+        )
+
+        long_r = long_trade[0]
+        short_r = short_trade[0]
+        long_exit_idx = long_trade[1]
+        short_exit_idx = short_trade[1]
+        long_entry_price = long_trade[3]
+        
+        if not np.isfinite(long_r) or not np.isfinite(short_r):
+            continue
+
+        long_path_r[i] = long_r
+        short_path_r[i] = short_r
+        best_path_r[i] = max(long_r, short_r)
+        target_edge_r[i] = abs(long_r - short_r)
+        entry_prices[i] = long_entry_price
+        target_distances[i] = dist
+
+        horizon_end = min(n, entry_idx + horizon)
+        if horizon_end > entry_idx and atrs[i] > 0:
+            entry_price = float(long_entry_price)
+            curr_atr = float(atrs[i])
+            
+            # LONG MAE/MFE JIT natively
+            sl_dist_l = 2.0 * curr_atr
+            sl_price_l = entry_price - sl_dist_l
+            
+            peak_high_l = entry_price
+            peak_low_l = entry_price
+            hit_l = False
+            for j in range(entry_idx, horizon_end):
+                val_high = float(highs[j])
+                val_low  = float(lows[j])
+                
+                if val_low <= sl_price_l:
+                    if val_high > peak_high_l:
+                        peak_high_l = val_high
+                    peak_low_l = sl_price_l
+                    hit_l = True
+                    break
+                else:
+                    if val_high > peak_high_l:
+                        peak_high_l = val_high
+                    if val_low < peak_low_l:
+                        peak_low_l = val_low
+                        
+            long_mfe_atr[i] = max(0.0, (peak_high_l - entry_price) / (curr_atr + 1e-9))
+            long_mae_atr[i] = max(0.0, (entry_price - peak_low_l)  / (curr_atr + 1e-9))
+            
+            # SHORT MAE/MFE JIT natively
+            sl_dist_s = 2.0 * curr_atr
+            sl_price_s = entry_price + sl_dist_s
+            
+            peak_low_s = entry_price
+            peak_high_s = entry_price
+            hit_s = False
+            for j in range(entry_idx, horizon_end):
+                val_high = float(highs[j])
+                val_low  = float(lows[j])
+                
+                if val_high >= sl_price_s:
+                    if val_low < peak_low_s:
+                        peak_low_s = val_low
+                    peak_high_s = sl_price_s
+                    hit_s = True
+                    break
+                else:
+                    if val_low < peak_low_s:
+                        peak_low_s = val_low
+                    if val_high > peak_high_s:
+                        peak_high_s = val_high
+                        
+            short_mfe_atr[i] = max(0.0, (entry_price - peak_low_s) / (curr_atr + 1e-9))
+            short_mae_atr[i] = max(0.0, (peak_high_s - entry_price) / (curr_atr + 1e-9))
+
+        if horizon_end > entry_idx and atrs[i] > 0:
+            mfe_l = long_mfe_atr[i]
+            mae_l = long_mae_atr[i]
+            raw_long = mfe_l / (mfe_l + mae_l + 1e-9)
+            vel_l = 1.0 - ((long_exit_idx - i) / horizon)
+            long_kinscore = raw_long * max(0.01, vel_l)
+
+            mfe_s = short_mfe_atr[i]
+            mae_s = short_mae_atr[i]
+            raw_short = mfe_s / (mfe_s + mae_s + 1e-9)
+            vel_s = 1.0 - ((short_exit_idx - i) / horizon)
+            short_kinscore = raw_short * max(0.01, vel_s)
+
+            if long_kinscore > short_kinscore and long_kinscore > 0.15:
+                target[i] = 0.5 + (long_kinscore / 2.0)
+                next_ret_pct[i] = (long_r * dist / (entry_prices[i] + 1e-9)) * 100.0
+                bars_to_target[i] = long_exit_idx - i
+            elif short_kinscore > long_kinscore and short_kinscore > 0.15:
+                target[i] = 0.5 - (short_kinscore / 2.0)
+                next_ret_pct[i] = -(short_r * dist / (entry_prices[i] + 1e-9)) * 100.0
+                bars_to_target[i] = short_exit_idx - i
+            else:
+                target[i] = 0.5
+                next_ret_pct[i] = 0.0
+                bars_to_target[i] = horizon
+        else:
+            target[i] = 0.5
+            next_ret_pct[i] = 0.0
+            bars_to_target[i] = horizon
+            
+    return (
+        target, next_ret_pct, bars_to_target, entry_prices, target_distances,
+        long_path_r, short_path_r, target_edge_r, best_path_r,
+        long_mfe_atr, long_mae_atr, short_mfe_atr, short_mae_atr
+    )
 
 
 def add_target(df: pd.DataFrame,
@@ -488,63 +669,17 @@ def add_target(df: pd.DataFrame,
     times = df['time'].to_numpy() if 'time' in df.columns else None
     atrs = df[atr_col].to_numpy(dtype=float)
 
-    target = np.full(n, np.nan, dtype=float)
-    next_ret_pct = np.full(n, np.nan, dtype=float)
-    bars_to_target = np.full(n, np.nan, dtype=float)
-    entry_prices = np.full(n, np.nan, dtype=float)
-    target_distances = np.full(n, np.nan, dtype=float)
-    long_path_r = np.full(n, np.nan, dtype=float)
-    short_path_r = np.full(n, np.nan, dtype=float)
-    target_edge_r = np.full(n, np.nan, dtype=float)
-    best_path_r = np.full(n, np.nan, dtype=float)
-    long_mfe_atr = np.full(n, np.nan, dtype=float)
-    long_mae_atr = np.full(n, np.nan, dtype=float)
-    short_mfe_atr = np.full(n, np.nan, dtype=float)
-    short_mae_atr = np.full(n, np.nan, dtype=float)
-
-    last_start_idx = max(-1, n - horizon - 1)
-    for i in range(last_start_idx + 1):
-        entry_idx = i + 1
-        dist = atrs[i] * atr_mult
-        if not np.isfinite(dist) or dist <= 0:
-            continue
-
-        long_trade = simulate_trade_path_from_arrays(
-            opens, highs, lows, closes, times, entry_idx, 'LONG', dist, horizon=horizon
-        )
-        short_trade = simulate_trade_path_from_arrays(
-            opens, highs, lows, closes, times, entry_idx, 'SHORT', dist, horizon=horizon
-        )
-
-        long_r = long_trade['total_r']
-        short_r = short_trade['total_r']
-        if not np.isfinite(long_r) or not np.isfinite(short_r):
-            continue
-
-        long_path_r[i] = long_r
-        short_path_r[i] = short_r
-        best_path_r[i] = max(long_r, short_r)
-        target_edge_r[i] = abs(long_r - short_r)
-        entry_prices[i] = long_trade['entry_price']
-        target_distances[i] = dist
-        horizon_end = min(n, entry_idx + horizon)
-        if horizon_end > entry_idx and atrs[i] > 0:
-            window_high = np.nanmax(highs[entry_idx:horizon_end])
-            window_low = np.nanmin(lows[entry_idx:horizon_end])
-            entry_price = entry_prices[i]
-            long_mfe_atr[i] = max(0.0, (window_high - entry_price) / (atrs[i] + 1e-9))
-            long_mae_atr[i] = max(0.0, (entry_price - window_low) / (atrs[i] + 1e-9))
-            short_mfe_atr[i] = max(0.0, (entry_price - window_low) / (atrs[i] + 1e-9))
-            short_mae_atr[i] = max(0.0, (window_high - entry_price) / (atrs[i] + 1e-9))
-
-        if long_r >= short_r + MIN_LABEL_EDGE_R and long_r >= MIN_LABEL_BEST_R:
-            target[i] = 1.0
-            next_ret_pct[i] = (long_r * dist / (entry_prices[i] + 1e-9)) * 100.0
-            bars_to_target[i] = long_trade['exit_idx'] - i
-        elif short_r >= long_r + MIN_LABEL_EDGE_R and short_r >= MIN_LABEL_BEST_R:
-            target[i] = 0.0
-            next_ret_pct[i] = -(short_r * dist / (entry_prices[i] + 1e-9)) * 100.0
-            bars_to_target[i] = short_trade['exit_idx'] - i
+    (
+        target, next_ret_pct, bars_to_target, entry_prices, target_distances,
+        long_path_r, short_path_r, target_edge_r, best_path_r,
+        long_mfe_atr, long_mae_atr, short_mfe_atr, short_mae_atr
+    ) = _add_target_loop_jit(
+        opens, highs, lows, closes, atrs,
+        atr_mult, horizon,
+        TP1_R_MULT, TP2_R_MULT, TRAIL_R_MULT,
+        EXEC_FEE_PCT, EXEC_SLIPPAGE_BPS,
+        TP1_FRACTION, TP2_FRACTION, RUNNER_FRACTION
+    )
 
     df['target'] = target
     df['next_ret_pct'] = next_ret_pct
@@ -561,10 +696,9 @@ def add_target(df: pd.DataFrame,
     df['short_mae_atr'] = short_mae_atr
 
     if drop_unresolved:
-        df = df.dropna(subset=['target'])
-        df['target'] = df['target'].astype(int)
+        df = df[df['target'] != 0.5].dropna(subset=['target']).copy()
     else:
-        df['target'] = df['target'].astype('Int64')
+        df['target'] = df['target'].fillna(0.5)
     return df
 
 
@@ -572,8 +706,8 @@ def add_target(df: pd.DataFrame,
 # 4. WALK-FORWARD VALIDATION (Optimized for CPU)
 # ─────────────────────────────────────────────
 
-def _build_lgbm_classifier() -> lgb.LGBMClassifier:
-    return lgb.LGBMClassifier(
+def _build_lgbm_model() -> lgb.LGBMRegressor:
+    return lgb.LGBMRegressor(
         n_estimators=800,
         learning_rate=0.02,
         num_leaves=31,
@@ -587,8 +721,8 @@ def _build_lgbm_classifier() -> lgb.LGBMClassifier:
         random_state=42,
         n_jobs=MODEL_N_JOBS,
         verbose=-1,
-        objective='binary',
-        metric='logloss'
+        objective='regression',
+        metric='mae'
     )
 
 
@@ -613,22 +747,26 @@ def _build_lgbm_regressor(alpha: float) -> lgb.LGBMRegressor:
 
 
 def _fit_lgbm_with_inner_validation(X_train_full: pd.DataFrame,
-                                    y_train_full: pd.Series) -> tuple[lgb.LGBMClassifier, pd.DataFrame, pd.Series]:
+                                    y_train_full: pd.Series) -> tuple[lgb.LGBMRegressor, pd.DataFrame, pd.Series]:
     inner_val_size = max(100, int(len(X_train_full) * 0.15))
     inner_val_size = min(inner_val_size, len(X_train_full) - 1)
     if inner_val_size <= 0:
         raise ValueError("Not enough training rows for inner validation.")
 
-    X_train_inner = X_train_full.iloc[:-inner_val_size]
-    y_train_inner = y_train_full.iloc[:-inner_val_size]
+    purge_gap = 24  # must match BARRIER_HORIZON_BARS
+    purged_end = -(inner_val_size + purge_gap)
+    if abs(purged_end) >= len(X_train_full):
+        purged_end = 0  # fallback: not enough data, use all for training (no purge possible)
+    X_train_inner = X_train_full.iloc[:purged_end] if purged_end != 0 else X_train_full.iloc[:-inner_val_size]
+    y_train_inner = y_train_full.iloc[:purged_end] if purged_end != 0 else y_train_full.iloc[:-inner_val_size]
     X_val_inner   = X_train_full.iloc[-inner_val_size:]
     y_val_inner   = y_train_full.iloc[-inner_val_size:]
 
-    model = _build_lgbm_classifier()
+    model = _build_lgbm_model()
     model.fit(
         X_train_inner, y_train_inner,
         eval_set=[(X_val_inner, y_val_inner)],
-        eval_metric='logloss',
+        eval_metric='mae',
         callbacks=[
             lgb.early_stopping(stopping_rounds=60, verbose=False),
             lgb.log_evaluation(period=10000)
@@ -788,66 +926,54 @@ def walk_forward(df: pd.DataFrame,
         if len(X_test) == 0:
             continue
 
-        # ── UME-1 FIX: Inner validation from TRAINING window only ──
-        # Test fold is never seen by eval_set — no lookahead pollution.
-        model, X_val_inner, y_val_inner = _fit_lgbm_with_inner_validation(X_train_full, y_train_full)
+        # [TOON vX.0] True Early Stopping + Thread Safety
+        model, _, _ = _fit_lgbm_with_inner_validation(X_train_full, y_train_full)
 
-        # M4 FIX: Isotonic calibration on inner validation set
-        from sklearn.calibration import CalibratedClassifierCV
-        from sklearn.frozen import FrozenEstimator
-        calibrated_model = CalibratedClassifierCV(FrozenEstimator(model), method='isotonic')
-        calibrated_model.fit(X_val_inner, y_val_inner)
-
-        preds = calibrated_model.predict(X_test)
-        proba = calibrated_model.predict_proba(X_test)[:, 1]
-        acc   = accuracy_score(y_test, preds)
-
-        # ── UME-2 FIX: Record every OOS prediction by its bar's timestamp ──
-        if 'time' in df.columns:
-            test_times = df['time'].iloc[train_end:test_end].values
-            for ts, prob in zip(test_times, proba):
-                oos_proba_map[pd.Timestamp(ts)] = float(prob)
-
-        # High-confidence subset analysis
-        conf_mask = np.maximum(proba, 1.0 - proba) >= LIVE_CONFIDENCE_THRESHOLD
+        preds = model.predict(X_test)
         
-        acc_conf  = np.nan
-        high_conf_bars_count = conf_mask.sum()
-        if high_conf_bars_count > 10:
-            acc_conf  = accuracy_score(y_test[conf_mask], preds[conf_mask])
+        # In a regression context over [0.0, 1.0], direction is >0.5 or <0.5
+        # The true binary direction for evaluation
+        true_binary = (y_test > 0.5).astype(int)
+        pred_binary = (preds > 0.5).astype(int)
+        acc = (true_binary == pred_binary).mean()
         
+        # High confidence predictions via continuous score
+        # e.g. >0.80 (Strong LONG), <0.20 (Strong SHORT)
+        high_conf_mask = (preds >= LIVE_CONFIDENCE_THRESHOLD) | (preds <= (1.0 - LIVE_CONFIDENCE_THRESHOLD))
+        if high_conf_mask.sum() > 0:
+            hc_preds_bin = pred_binary[high_conf_mask]
+            hc_true_bin  = true_binary[high_conf_mask]
+            conf_acc = (hc_preds_bin == hc_true_bin).mean()
+        else:
+            conf_acc = float('nan')
+
+        fraction_conf = high_conf_mask.sum() / len(preds)
+        baseline = true_binary.mean()
+
+        print(f"  Split {i+1:>2} | Train: {len(X_train_full):>5} | Test: {len(X_test):>5} | "
+              f"Acc:{acc:.3f} | ConfAcc(>={LIVE_CONFIDENCE_THRESHOLD:.2f}):{conf_acc:.3f} | "
+              f"ConfBars: {fraction_conf*100:>4.1f}% | Baseline(UP):{baseline:.3f}")
+
         results.append({
             'split': i + 1,
-            'train_bars': train_end,
+            'train_bars': len(X_train_full),
             'test_bars': len(X_test),
             'accuracy': acc,
-            'acc_high_conf': acc_conf,
-            'high_conf_pct': conf_mask.mean() if high_conf_bars_count > 0 else 0.0,
-            'baseline_up': y_test.mean(),
-            'baseline_down': 1 - y_test.mean(),
-            'proba_mean': proba.mean(),
-            'proba_std': proba.std(),
-            'high_conf_bars': high_conf_bars_count
+            'acc_high_conf': conf_acc,
+            'high_conf_pct': fraction_conf,
+            'baseline_up': baseline,
         })
         
         feature_importance_sum += model.feature_importances_
-        all_test_preds.extend(preds)
-        all_test_trues.extend(y_test)
         
-        conf_str = f"{acc_conf:.3f}" if not np.isnan(acc_conf) else " n/a"
-        print(f"  Split {i+1:2d} | Train:{train_end:>6} | Test:{len(X_test):>5} | "
-              f"Acc:{acc:.3f} | ConfAcc(>={LIVE_CONFIDENCE_THRESHOLD:.2f}):{conf_str} | "
-              f"ConfBars:{conf_mask.mean()*100:5.1f}% | Baseline(UP):{y_test.mean():.3f}")
+        if 'time' in df.columns:
+            test_times = df['time'].iloc[train_end:test_end]
+            for ts, prob in zip(test_times, preds):
+                # Ensure OOS map aligns perfectly with backtest IST localized times
+                oos_proba_map[pd.Timestamp(ts)] = float(prob)
 
-    # ── UME-2 FIX: Final model for LIVE INFERENCE ONLY ──
-    # Trained on all history so live predictions use the fullest possible signal.
-    # Any backtest MUST use oos_proba_map — never batch-predict from this model on historical data.
-    final_model = _build_lgbm_classifier()
-    final_model.fit(df[feature_cols], df['target']) # Train on all available history
-
-    # Overall accuracy calculation
-    overall_acc = accuracy_score(all_test_trues, all_test_preds)
-    overall_baseline_up = np.mean(all_test_trues)
+    # Train ultimate model on all data
+    final_model, _, _ = _fit_lgbm_with_inner_validation(df[feature_cols], df['target'])
 
     return {
         'splits': results,
@@ -855,9 +981,9 @@ def walk_forward(df: pd.DataFrame,
         'final_model': final_model,
         'feature_cols': feature_cols,
         'df': df,
-        'overall_accuracy': overall_acc,
-        'overall_baseline_up': overall_baseline_up,
-        'oos_proba_map': oos_proba_map  # UME-2: ONLY valid source for honest backtesting
+        'overall_accuracy': np.mean([r['accuracy'] for r in results]),
+        'overall_baseline_up': np.mean([r['baseline_up'] for r in results]),
+        'oos_proba_map': oos_proba_map
     }
 
 
@@ -980,60 +1106,25 @@ def save_report(wf_results: dict, save_path: str, pred_info: dict = None, symbol
 # 6. PREDICTION FUNCTION (live use)
 # ─────────────────────────────────────────────
 
-def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidence_threshold: float = LIVE_CONFIDENCE_THRESHOLD) -> dict:
-    """
-    Pass in the latest fully-formed 1H row (with all features computed).
-    Returns direction prediction + confidence.
-    """
-    if model is None or not feature_cols or latest_row.empty:
-        return {
-            'direction': 'ERROR',
-            'prob_up': np.nan,
-            'prob_down': np.nan,
-            'confidence': np.nan,
-            'signal_strength': 'ERROR',
-            'message': 'Model or data not properly loaded.'
-        }
-
-    # Ensure all feature_cols are present in latest_row, fill missing with 0 if necessary (though usually they should be computed)
-    missing_cols = [col for col in feature_cols if col not in latest_row.index]
-    if missing_cols:
-        print(f"  Warning: Missing columns in latest_row, filling with 0: {missing_cols}")
-        for col in missing_cols:
-            latest_row[col] = 0.0
-
-    X = latest_row[feature_cols].values.reshape(1, -1)
+def predict_next_bar(model: lgb.LGBMRegressor, feature_cols: list, row: pd.Series,
+                     confidence_threshold: float = LIVE_CONFIDENCE_THRESHOLD) -> dict:
+    X_inf = row[feature_cols].to_frame().T.astype(float)
+    proba_up = float(model.predict(X_inf)[0])
     
-    try:
-        proba = model.predict_proba(X)[0][1] # Probability of class 1 (UP)
-    except Exception as e:
-        return {
-            'direction': 'ERROR',
-            'prob_up': np.nan,
-            'prob_down': np.nan,
-            'confidence': np.nan,
-            'signal_strength': 'ERROR',
-            'message': f'Error during prediction: {e}'
-        }
-        
-    direction = 'UP' if proba > 0.5 else 'DOWN'
-    prob_up = round(proba, 4)
-    prob_down = round(1 - proba, 4)
-    confidence = max(prob_up, prob_down)
-    
-    volatility_ok = bool(latest_row.get('atr_expanding', 1))
-    if confidence < confidence_threshold or not volatility_ok:
-        signal = 'NO_TRADE'
+    direction = 'UP' if proba_up > 0.5 else 'DOWN'
+    # Confidence in Regressor: distance from 0.5 mapped to 0-100% equivalent
+    confidence = max(proba_up, 1.0 - proba_up)
+
+    if confidence >= confidence_threshold:
+        signal = "STRONG"
     else:
-        signal = 'STRONG'
-    
+        signal = "WEAK"
+
     return {
         'direction': direction,
-        'prob_up': prob_up,
-        'prob_down': prob_down,
         'confidence': confidence,
         'signal_strength': signal,
-        'message': 'Prediction successful.'
+        'raw_score': proba_up
     }
 
 
@@ -1041,64 +1132,150 @@ def predict_next_bar(model, feature_cols: list, latest_row: pd.Series, confidenc
 # 7. MAIN EXECUTION (Optimized for performance)
 # ─────────────────────────────────────────────
 
+def inject_thermodynamic_basis(df_fut: pd.DataFrame, df_idx: pd.DataFrame) -> pd.DataFrame:
+    """
+    Universally aligns Spot/Index to Futures and computes thermodynamic basis mechanics.
+    Strict backward ASOF merge prevents forward-peeking.
+    """
+    if df_idx is None or df_idx.empty:
+        print("  [Basis] Warning: No Spot/Index provided. Basis mechanics disabled.")
+        return df_fut.copy()
+
+    # Ensure temporal sorting
+    fut = df_fut.sort_values('time').reset_index(drop=True)
+    idx = df_idx[['time', 'close']].rename(columns={'close': 'spot_close'}).sort_values('time')
+
+    # Align Spot to Future (Strict backward mapping)
+    merged = pd.merge_asof(fut, idx, on='time', direction='backward')
+
+    # Core Thermodynamics
+    merged['basis_pts'] = merged['close'] - merged['spot_close']
+    merged['basis_pct'] = merged['basis_pts'] / (merged['spot_close'] + 1e-9)
+
+    # Cross-Sectional Extremes (Z-Score)
+    basis_pct = merged['basis_pct']
+    basis_ema20 = basis_pct.ewm(span=20, adjust=False).mean()
+    basis_dev = (basis_pct - basis_ema20).abs().ewm(span=20, adjust=False).mean()
+    merged['basis_z_score'] = (basis_pct - basis_ema20) / (basis_dev + 1e-9)
+
+    # Temporal Physics (Velocity replaces DTE for universal Perp/Dated compatibility)
+    merged['basis_vel_5'] = merged['basis_pct'].diff(5)
+    merged['basis_vel_10'] = merged['basis_pct'].diff(10)
+
+    # Cleanup
+    merged = merged.drop(columns=['spot_close']).fillna(0.0)
+    return merged
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Universal ML Direction Predictor")
     parser.add_argument('--outdir', type=str, default='/home/km/Universal-ML/', help="Output directory for models and reports")
+    parser.add_argument('--symbol', type=str, required=True, help="Target Base Symbol (e.g., BANKNIFTY, BTC)")
 
     args = parser.parse_args()
 
     DATA_DIR = args.outdir
-    CSV_DIR = os.path.join(DATA_DIR, 'csv_data')
-    os.makedirs(CSV_DIR, exist_ok=True)
-    
-    print("=" * 70)
-    print("  AUTO-SCANNING CSV FOLDER (csv_data/) FOR SYMBOL AND TIMEFRAMES")
-    print("=" * 70)
-    
-    csv_files = [f for f in os.listdir(CSV_DIR) if f.endswith('.csv')]
-    if not csv_files:
-        print(f"  [!] No CSV files found in {CSV_DIR}")
-        print("      Please drop your 3 CSV files (1H, 1D, 1W) into this folder, no specific naming required.")
-        exit()
-
-    df_1h, df_1d, df_1w, df_1m = None, None, None, None
-    SYMBOL = "UNKNOWN"
-
-    for ffile in csv_files:
-        path = os.path.join(CSV_DIR, ffile)
-        df, sym, tf = parse_tv_log(path)
-        tf = str(tf).upper()
-        
-        if sym and sym != "UNKNOWN":
-            SYMBOL = sym.replace('!', '') # Output clean symbol without !
-
-        if tf in ['60', '1H']:
-            df_1h = df
-            print(f"  [+] Detected 1H File: {ffile}")
-        elif tf in ['1D', 'D']:
-            df_1d = df
-            print(f"  [+] Detected 1D File: {ffile}")
-        elif tf in ['1W', 'W']:
-            df_1w = df
-            print(f"  [+] Detected 1W File: {ffile}")
-        elif tf in ['1M', 'M']:
-            df_1m = df
-            print(f"  [+] Detected 1M File: {ffile}")
-
-    if df_1h is None or df_1d is None or df_1w is None or df_1m is None:
-        print(f"\n  [!] Error: Could not find all 4 timeframes (60, 1D, 1W, 1M) from inside you CSVs.")
-        print(f"      Make sure the actual text in the CSVs say 'TIME FRAME:60', 'TIME FRAME:1D', 'TIME FRAME:1W', and 'TIME FRAME:1M'")
-        exit()
-
+    SYMBOL = args.symbol.upper()
     file_prefix = SYMBOL.lower().replace(' ', '_')
+    
+    # CRITICAL: Create Symbol-Specific Artifact Vault
+    SYMBOL_DIR = os.path.join(DATA_DIR, SYMBOL)
+    os.makedirs(SYMBOL_DIR, exist_ok=True)
+    
+    print("=" * 70)
+    print(f"  INITIATING DATABASE UPLINK FOR: {SYMBOL}")
+    print("=" * 70)
+
+    # Connect to Bridge
+    import sys
+    sys.path.append(os.path.join(DATA_DIR, 'data_vault'))
+    try:
+        from inference_bridge import InferenceBridge
+    except ImportError:
+        print("  [!] FATAL: Cannot locate inference_bridge.py in data_vault directory.")
+        exit()
+
+    bridge = InferenceBridge(db_path=os.path.join(DATA_DIR, 'data_vault', 'ohlcv.db'))
+
+    # Fetch Holographic Stacks
+    tf_maps = {
+        'FUT': bridge.fetch_holographic_stack(SYMBOL, 'FUT'),
+        'SPOT': bridge.fetch_holographic_stack(SYMBOL, 'SPOT')
+    }
+
+    # Enforce Derivative-First Architecture
+    df_1h = tf_maps['FUT'].get('1H')
+    df_1d = tf_maps['FUT'].get('1D')
+    df_1w = tf_maps['FUT'].get('1W')
+    df_1m = tf_maps['FUT'].get('1M')
+
+    if df_1h is None or df_1h.empty:
+        print(f"\n  [!] FATAL: No 1H FUT data for {SYMBOL} in database. Derivative execution layer missing.")
+        exit()
 
     print(f"  1H bars : {len(df_1h):>7}  ({df_1h['time'].min().date()} → {df_1h['time'].max().date()})")
-    print(f"  1D bars : {len(df_1d):>7}  ({df_1d['time'].min().date()} → {df_1d['time'].max().date()})")
-    print(f"  1W bars : {len(df_1w):>7}  ({df_1w['time'].min().date()} → {df_1w['time'].max().date()})")
-    print(f"  1M bars : {len(df_1m):>7}  ({df_1m['time'].min().date()} → {df_1m['time'].max().date()})")
-    
+    if df_1d is not None and not df_1d.empty:
+        print(f"  1D bars : {len(df_1d):>7}  ({df_1d['time'].min().date()} → {df_1d['time'].max().date()})")
+    if df_1w is not None and not df_1w.empty:
+        print(f"  1W bars : {len(df_1w):>7}  ({df_1w['time'].min().date()} → {df_1w['time'].max().date()})")
+    if df_1m is not None and not df_1m.empty:
+        print(f"  1M bars : {len(df_1m):>7}  ({df_1m['time'].min().date()} → {df_1m['time'].max().date()})")
+
+    spot_1h = tf_maps['SPOT'].get('1H')
+    if spot_1h is not None and not spot_1h.empty:
+        # Strip timezones for a pure chronological set comparison
+        fut_times = set(df_1h['time'].dt.tz_localize(None))
+        spot_times = set(spot_1h['time'].dt.tz_localize(None))
+        
+        missing_in_spot = fut_times - spot_times
+        missing_in_fut = spot_times - fut_times
+        
+        if missing_in_spot or missing_in_fut:
+            print("\n" + "=" * 70)
+            print("  [!] FATAL ERROR: TIMESTAMP PARITY VIOLATION")
+            print("=" * 70)
+            print(f"  SPOT and FUT timelines for {SYMBOL} are asymmetrical.")
+            print(f"  - FUT bars missing SPOT data: {len(missing_in_spot)}")
+            print(f"  - SPOT bars missing FUT data: {len(missing_in_fut)}")
+            print("  This destroys Thermodynamic Math. Verify broker data continuity.")
+            print("  System locked to protect capital.")
+            exit()
+        else:
+            print(f"  [+] Holographic Parity Verified: 100% Temporal Alignment (SPOT <-> FUT).")
+    else:
+        print(f"  [!] WARNING: No SPOT data found for {SYMBOL}. Thermodynamics will be zeroed.")
+
     print("\n  [TOON v4.0] Building Holographic Feature Engine...")
     print("  Philosophy: Pure geometry. No classical indicators.")
+
+    # ── Step 0: Inject Thermodynamic Basis (Cross-Asset Physics) ─────────
+    print("  [TOON] Injecting Universal Spread Mechanics (Spot-to-Derivative)...")
+    df_1h = inject_thermodynamic_basis(df_1h, tf_maps['SPOT'].get('1H'))
+    if df_1d is not None and tf_maps['SPOT'].get('1D') is not None:
+        df_1d = inject_thermodynamic_basis(df_1d, tf_maps['SPOT'].get('1D'))
+    if df_1w is not None and tf_maps['SPOT'].get('1W') is not None:
+        df_1w = inject_thermodynamic_basis(df_1w, tf_maps['SPOT'].get('1W'))
+
+    # ── Step 0.5: Inject Session Awareness (Gap Hunting Physics) ─────────
+    print("  [TOON] Encoding Session Time Vectors for Gap Prediction...")
+    if 'time' in df_1h.columns:
+        # Extract purely the time of day, ignoring the date
+        time_dt = pd.to_datetime(df_1h['time'])
+        minutes_from_midnight = time_dt.dt.hour * 60 + time_dt.dt.minute
+        
+        # Normalize to typical Indian Market hours (9:15 AM = 555 mins, 3:30 PM = 930 mins)
+        # We use a broad normalization so it works for 24/7 crypto or 6.5hr equities
+        min_val = minutes_from_midnight.min()
+        max_val = minutes_from_midnight.max()
+        
+        # EOD Proximity Vector: 0.0 = Market Open, 1.0 = Market Close
+        df_1h['session_time_pos'] = (minutes_from_midnight - min_val) / (max_val - min_val + 1e-9)
+        
+        # EOD Basis Velocity: How fast is the premium moving in the last hour?
+        df_1h['eod_basis_momentum'] = df_1h['basis_pct'].diff(3) * df_1h['session_time_pos']
+    else:
+        df_1h['session_time_pos'] = 0.0
+        df_1h['eod_basis_momentum'] = 0.0
 
     # ── Step 1: Compute atr14 on 1H ONLY for labelling scaffold ──────────
     # atr14 is needed by add_target() to set barrier distances.
@@ -1136,6 +1313,7 @@ if __name__ == '__main__':
     NON_FEATURE_COLS = {
         'time', 'open', 'high', 'low', 'close', 'volume',
         'atr14',                                           # labelling only
+        'basis_pct', 'basis_z_score', 'basis_vel_5', 'basis_vel_10', # Thermodynamic state
         'target', 'next_ret_pct', 'bars_to_target',
         'entry_price_next_bar', 'target_distance',
         'long_path_r', 'short_path_r', 'target_edge_r', 'best_path_r',
@@ -1148,10 +1326,14 @@ if __name__ == '__main__':
     all_holo_cols = [c for c in df_full.columns if c not in NON_FEATURE_COLS]
 
     # Sanitize: replace inf/nan
-    df_model_ready = df_full[all_holo_cols + ['target', 'time', 'close']
+    state_cols = ['target', 'time', 'close', 'atr14']
+    for b_col in ['basis_pct', 'basis_z_score', 'basis_vel_5', 'basis_vel_10']:
+        if b_col in df_full.columns: state_cols.append(b_col)
+        
+    df_model_ready = df_full[all_holo_cols + state_cols
                              + [c for c in TRADE_PLAN_LABEL_COLS if c in df_full.columns]].copy()
     for col in all_holo_cols:
-        df_model_ready[col] = df_model_ready[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+        df_model_ready[col] = df_model_ready[col].map(lambda x: np.nan if np.isinf(x) else x).fillna(0)
     df_model_ready = df_model_ready.dropna(subset=all_holo_cols).reset_index(drop=True)
 
     print(f"  [TOON v4.0] Bars after labelling & cleaning : {len(df_model_ready)}")
@@ -1212,7 +1394,7 @@ if __name__ == '__main__':
         fft_n   = sum(1 for c in final_feats if '_fft_' in c)
         skel_n  = sum(1 for c in final_feats if '_skel_' in c)
         conf_n  = sum(1 for c in final_feats if c.startswith('mtf_conf'))
-        print(f"\n  Feature layer breakdown in final model:")
+        print("\n  Feature layer breakdown in final model:")
         print(f"    DNA:  {dna_n:3d}  |  Grammar: {gram_n:3d}  |  Spectral: {fft_n:3d}"
               f"  |  Skeleton: {skel_n:3d}  |  Confluence: {conf_n:3d}")
         if fft_n == 0:
@@ -1221,15 +1403,15 @@ if __name__ == '__main__':
 
         # Save final model and feature list
         import joblib
-        mod_path  = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model.pkl')
-        feat_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features.txt')
+        mod_path  = os.path.join(SYMBOL_DIR, f'{file_prefix}_ultimate_model.pkl')
+        feat_path = os.path.join(SYMBOL_DIR, f'{file_prefix}_ultimate_features.txt')
         joblib.dump(wf_results['final_model'], mod_path)
         with open(feat_path, 'w') as f:
             for col in wf_results['feature_cols']:
                 f.write(f"{col}\n")
         print(f"\n  Final model saved to '{mod_path}'")
 
-        oos_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba.pkl')
+        oos_path = os.path.join(SYMBOL_DIR, f'{file_prefix}_oos_proba.pkl')
         joblib.dump(wf_results['oos_proba_map'], oos_path)
         print(f"  OOS proba map saved to '{oos_path}' ({len(wf_results['oos_proba_map'])} bars)")
 
@@ -1241,7 +1423,7 @@ if __name__ == '__main__':
         trade_plan_models = train_trade_plan_models(
             df_model_ready.iloc[:_tp_train_end], feature_cols_to_use
         )
-        trade_plan_path   = os.path.join(DATA_DIR, f'{file_prefix}_trade_plan_models.pkl')
+        trade_plan_path   = os.path.join(SYMBOL_DIR, f'{file_prefix}_trade_plan_models.pkl')
         joblib.dump(trade_plan_models, trade_plan_path)
         print(f"  Trade-plan models saved to '{trade_plan_path}' ({len(trade_plan_models)} models)")
 
@@ -1260,7 +1442,7 @@ if __name__ == '__main__':
         if 'time' in last_row:
             print(f"  Bar time    : {last_row['time']}")
         print(f"  Direction   : {pred['direction']}")
-        print(f"  Confidence  : {pred['confidence']*100:.1f}%")
+        print(f"  Confidence  : {pred['confidence']:.1%} (Regressor Score: {pred['raw_score']:.3f})")
         print(f"  Signal      : {pred['signal_strength']}")
         print("----------------------------------------------------------------------")
         print(f"  Entry Price : {close_price:,.2f} (Current Close)")
@@ -1302,7 +1484,7 @@ if __name__ == '__main__':
             'trail': trail_str, 'note': filter_note,
         }
 
-        report_file = os.path.join(DATA_DIR, f'{file_prefix}_ml_report_ultimate.png')
+        report_file = os.path.join(SYMBOL_DIR, f'{file_prefix}_ml_report_ultimate.png')
         save_report(wf_results, report_file, pred_info=pred_info)
 
         fi_sorted = sorted(wf_results['feature_importance'].items(), key=lambda x: x[1], reverse=True)
@@ -1314,7 +1496,7 @@ if __name__ == '__main__':
         if os.path.exists(backtest_script):
             print("\n  Launching aligned backtest report generation...")
             completed = subprocess.run(
-                [sys.executable, backtest_script, '--outdir', DATA_DIR],
+                [sys.executable, backtest_script, '--outdir', DATA_DIR, '--symbol', SYMBOL],
                 check=False
             )
             if completed.returncode != 0:

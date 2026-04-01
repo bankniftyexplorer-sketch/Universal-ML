@@ -7,17 +7,16 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from collections import defaultdict
 
 # Suppress lightgbm warnings locally if needed
 import warnings
 warnings.filterwarnings('ignore')
 
 from universal_ml_engine import (
-    parse_tv_log, merge_higher_tf, _compute_atr14,
-    BARRIER_ATR_MULT, BARRIER_HORIZON_BARS,
-    LIVE_CONFIDENCE_THRESHOLD, VOL_GATE_LOOKBACK,
-    EXEC_FEE_PCT, simulate_trade_path_from_arrays, predict_trade_plan
+    merge_higher_tf, _compute_atr14,
+    BARRIER_HORIZON_BARS,
+    LIVE_CONFIDENCE_THRESHOLD, EXEC_FEE_PCT, simulate_trade_path_from_arrays, predict_trade_plan,
+    inject_thermodynamic_basis
 )
 from holographic_engine import holographic_feature_engine
 
@@ -45,7 +44,29 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
     low_arr = df['low'].values
     time_arr = df['time'].values
     atr_arr = df['atr14'].values
-    atr_ma50_arr = pd.Series(atr_arr).rolling(VOL_GATE_LOOKBACK).mean().to_numpy()
+    
+    # Secure Thermodynamic State Array (Fallback to 0.0 if not injected)
+    if 'basis_z_score' in df.columns:
+        z_arr = df['basis_z_score'].values
+    else:
+        z_arr = np.zeros(len(df))
+        
+    shock_blocks = 0
+    
+    # [TOON vX.0 Alpha] Phase 4: Thermodynamic Rough Volatility (Hurst Exponent)
+    hurst_arr = np.full(len(close_arr), 0.5)
+    window_h = 100
+    for j in range(window_h, len(close_arr)):
+        slice_c = close_arr[j-window_h:j]
+        diffs = np.diff(slice_c)
+        if len(diffs) > 0:
+            S = np.std(diffs)
+            if S > 0:
+                y = diffs - np.mean(diffs)
+                Z = np.cumsum(y)
+                R = np.max(Z) - np.min(Z)
+                if R > 0:
+                    hurst_arr[j] = np.log(R/S) / np.log(window_h)
 
     i = 0
     while i < len(df) - 1:
@@ -64,25 +85,47 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
             i += 1
             continue
 
+        # Continuous Regressor Confidence
         confidence = max(proba_up, 1.0 - proba_up)
-        atr_ma50 = atr_ma50_arr[i]
-        if confidence < conf_threshold:
-            peak_equity = max(peak_equity, equity)
-            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
-            i += 1
-            continue
-        if not np.isfinite(current_atr) or current_atr <= 0:
-            i += 1
-            continue
-        if not np.isfinite(atr_ma50) or current_atr <= atr_ma50:
-            volatility_blocks += 1
+        current_hurst = hurst_arr[i]
+
+        # 0. EOD Session Block (Neutralizes negative EOD gap-against expectancy)
+        # Gate on the ENTRY bar (i+1), not the signal bar (i), to close the
+        # 13:00-signal → 14:00-execution temporal leak.
+        next_time = pd.to_datetime(time_arr[i + 1])
+        if next_time.hour >= 14:
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
             i += 1
             continue
 
-        # No cross-TF conflict gate in TOON v4.0 — confluence is learned inside
-        # the holographic features (mtf_conf_* layer). Skip the hard gate.
+        if confidence < conf_threshold:
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
+
+        if not np.isfinite(current_atr) or current_atr <= 0:
+            i += 1
+            continue
+
+        # 1. The Thermodynamic Shock Gate (Blocks Structural Liquidation/Euphoria Extremes)
+        current_z = z_arr[i]
+        if np.isfinite(current_z) and abs(current_z) > 2.5:
+            shock_blocks += 1
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
+
+        # 2. The Thermodynamic Hurst Gate (Blocks Anti-persistent Noise)
+        if not np.isfinite(current_hurst) or current_hurst < 0.45:
+            volatility_blocks += 1
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
+            
         direction = 'LONG' if proba_up > 0.5 else 'SHORT'
 
 
@@ -94,15 +137,20 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
             'UP' if direction == 'LONG' else 'DOWN',
             float(current_atr)
         )
-        stop_dist = float(current_atr * BARRIER_ATR_MULT)
-        tp1_dist = stop_dist
-        tp2_dist = stop_dist * 2.0
-        trail_dist = stop_dist
+        
+        # [TOON v4.2] Regime-Resistant Asymmetry Matrix
+        # Capitalizes on the 56% ML Win Rate by harvesting risk at 1:1.
+        stop_dist  = float(current_atr * 2.0)    # Catastrophic stop (2 ATR)
+        tp1_dist   = float(current_atr * 2.0)    # Realize 50% at 2 ATR (1:1 R/R to lock in the edge)
+        tp2_dist   = float(current_atr * 4.0)    # Realize 25% at 4 ATR
+        trail_dist = float(current_atr * 1.0)    # Aggressive trailing to prevent runner bleed
+
         if np.isfinite(trade_plan.get('stop_atr', np.nan)):
             stop_dist = float(current_atr * trade_plan['stop_atr'])
             tp1_dist = float(current_atr * trade_plan['tp1_atr'])
             tp2_dist = float(current_atr * trade_plan['tp2_atr'])
             trail_dist = float(current_atr * trade_plan['trail_r'])
+
         trade_path = simulate_trade_path_from_arrays(
             open_arr,
             high_arr,
@@ -119,6 +167,7 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
             fee_pct=EXEC_FEE_PCT,
             slippage_bps=slippage_bps
         )
+        
         if not np.isfinite(trade_path['total_r']):
             i += 1
             continue
@@ -158,12 +207,13 @@ def run_backtest(df, prob_array, prob_array_1d, feature_cols, trade_plan_models=
         'time_curve': time_curve,
         'conflict_blocks': conflict_blocks,
         'volatility_blocks': volatility_blocks,
+        'shock_blocks': shock_blocks,
         'no_prediction_bars': no_prediction_bars,
         'prediction_bars': int(np.isfinite(prob_array).sum())
     }
     return results
 
-def calculate_metrics(trades):
+def calculate_metrics(trades, equity_curve=None, time_curve=None):
     if not trades:
         return {}
     
@@ -180,11 +230,43 @@ def calculate_metrics(trades):
     
     expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
 
-    # E6: Risk-adjusted metrics
-    r_multiples = [t['pnl'] / (t.get('initial_risk', 1) + 1e-9) for t in trades]
-    sharpe = (np.mean(r_multiples) / (np.std(r_multiples) + 1e-9)) * np.sqrt(252) if len(r_multiples) > 1 else 0.0
-    downside_returns = [r for r in r_multiples if r < 0]
-    sortino = (np.mean(r_multiples) / (np.std(downside_returns) + 1e-9)) * np.sqrt(252) if downside_returns else float('inf')
+    # E6: True Time-Series Risk-Adjusted Metrics
+    if equity_curve is not None and time_curve is not None and len(equity_curve) > 1:
+        eq_series = pd.Series(equity_curve, index=pd.to_datetime(time_curve))
+        # Resample to daily frequency, forward-fill inactive days, calculate daily % return
+        daily_returns = eq_series.resample('D').last().ffill().pct_change().dropna()
+        
+        sharpe = (daily_returns.mean() / (daily_returns.std() + 1e-9)) * np.sqrt(252) if len(daily_returns) > 1 else 0.0
+        downside_returns = daily_returns[daily_returns < 0]
+        sortino = (daily_returns.mean() / (downside_returns.std() + 1e-9)) * np.sqrt(252) if len(downside_returns) > 0 else float('inf')
+    else:
+        # Fallback to unannualized trade-based expectancy ratio if curves are missing
+        r_multiples = [t['pnl'] / (t.get('initial_risk', 1) + 1e-9) for t in trades]
+        sharpe = np.mean(r_multiples) / (np.std(r_multiples) + 1e-9) if len(r_multiples) > 1 else 0.0
+        downside_returns = [r for r in r_multiples if r < 0]
+        sortino = np.mean(r_multiples) / (np.std(downside_returns) + 1e-9) if downside_returns else float('inf')
+
+    # Calculate True Time Under Water (anchored to first executed trade,
+    # ignoring the pre-trade ML warmup cold-start period)
+    true_tuw_days = 0
+    if trades and equity_curve is not None and time_curve is not None:
+        first_trade_time = pd.to_datetime(trades[0]['entry_time'])
+        post_warmup_mask = [pd.to_datetime(t) >= first_trade_time for t in time_curve]
+        if any(post_warmup_mask):
+            active_times  = [t for i, t in enumerate(time_curve)  if post_warmup_mask[i]]
+            active_equity = [e for i, e in enumerate(equity_curve) if post_warmup_mask[i]]
+            peak      = active_equity[0]
+            peak_time = active_times[0]
+            max_drought = pd.Timedelta(days=0)
+            for t, e in zip(active_times, active_equity):
+                if e > peak:
+                    peak      = e
+                    peak_time = t
+                else:
+                    drought = pd.to_datetime(t) - pd.to_datetime(peak_time)
+                    if drought > max_drought:
+                        max_drought = drought
+            true_tuw_days = max_drought.days
 
     # Max consecutive losses
     max_consec_loss = 0
@@ -207,7 +289,8 @@ def calculate_metrics(trades):
         'gross_loss': gross_loss,
         'sharpe': sharpe,
         'sortino': sortino,
-        'max_consec_loss': max_consec_loss
+        'max_consec_loss': max_consec_loss,
+        'true_tuw_days': true_tuw_days
     }
 
 def generate_report(results, metrics, symbol, save_path):
@@ -250,10 +333,9 @@ def generate_report(results, metrics, symbol, save_path):
         f"  Win Rate       : {m.get('win_rate', 0)*100:.1f}%\n"
         f"  Profit Factor  : {m.get('profit_factor', 0):.3f}\n"
         f"  Sharpe Ratio   : {m.get('sharpe', 0):.3f}\n"
-        f"  Sortino Ratio  : {m.get('sortino', 0):.3f}\n"
-        f"  Max Consec Loss: {m.get('max_consec_loss', 0)}\n"
         f"  Expectancy     : {format_currency(m.get('expectancy', 0))} per trade\n"
-        f"  Conflict Gated : {results.get('conflict_blocks', 0)} blocks bypassed\n"
+        f"  Macro Shocks   : {results.get('shock_blocks', 0)} aborted (|Z| > 2.5)\n"
+        f"  Vol Gated      : {results.get('volatility_blocks', 0)} aborted\n"
         f"  Gross Profit   : {format_currency(m.get('gross_profit', 0))}\n"
         f"  Gross Loss     : {format_currency(-m.get('gross_loss', 0))}\n"
         f"=========================================================\n"
@@ -269,61 +351,48 @@ def generate_report(results, metrics, symbol, save_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--outdir', type=str, default='/home/km/Universal-ML/', help='Directory with models and csv')
+    parser.add_argument('--outdir', type=str, default='/home/km/Universal-ML/', help='Project root directory')
+    parser.add_argument('--symbol', type=str, required=True, help='Target Base Symbol (e.g., BANKNIFTY, BTC)')
 
     args = parser.parse_args()
-    
+
     DATA_DIR = args.outdir
-    CSV_DIR = os.path.join(DATA_DIR, 'csv_data')
-    if not os.path.exists(CSV_DIR):
-        print(f"[!] No csv_data folder in {DATA_DIR}")
-        return
+    SYMBOL = args.symbol.upper()
+    SYMBOL_DIR = os.path.join(DATA_DIR, SYMBOL)
+    file_prefix = SYMBOL.lower().replace(' ', '_')
 
-    # Find valid models manually or infer symbol
-    csv_files = [f for f in os.listdir(CSV_DIR) if f.endswith('.csv')]
-    if len(csv_files) < 4:
-        print("[!] Need 4 CSV files (1H, 1D, 1W, 1M) to reconstruct features.")
+    import sys
+    sys.path.append(os.path.join(DATA_DIR, 'data_vault'))
+    try:
+        from inference_bridge import InferenceBridge
+    except ImportError:
+        print("[!] FATAL: Cannot locate inference_bridge.py.")
         return
-
-    df_1h, df_1d, df_1w, df_1m = None, None, None, None
-    SYMBOL = "UNKNOWN"
 
     print("=" * 60)
     print("  INITIALIZING BACKTEST ENGINE")
     print("=" * 60)
 
-    for ffile in csv_files:
-        path = os.path.join(CSV_DIR, ffile)
-        df, sym, tf = parse_tv_log(path)
-        tf = str(tf).upper()
-        
-        if sym and sym != "UNKNOWN":
-            SYMBOL = sym.replace('!', '')
+    bridge = InferenceBridge(db_path=os.path.join(DATA_DIR, 'data_vault', 'ohlcv.db'))
+    tf_maps = {
+        'FUT':  bridge.fetch_holographic_stack(SYMBOL, 'FUT'),
+        'SPOT': bridge.fetch_holographic_stack(SYMBOL, 'SPOT')
+    }
 
-        if tf in ['60', '1H']:
-            df_1h = df
-            print(f"  [+] Loaded 1H: {ffile}")
-        elif tf in ['1D', 'D']:
-            df_1d = df
-            print(f"  [+] Loaded 1D: {ffile}")
-        elif tf in ['1W', 'W']:
-            df_1w = df
-            print(f"  [+] Loaded 1W: {ffile}")
-        elif tf in ['1M', 'M']:
-            df_1m = df
-            print(f"  [+] Loaded 1M: {ffile}")
+    df_1h = tf_maps['FUT'].get('1H')
+    df_1d = tf_maps['FUT'].get('1D')
+    df_1w = tf_maps['FUT'].get('1W')
+    df_1m = tf_maps['FUT'].get('1M')
 
     if df_1h is None or df_1d is None or df_1w is None or df_1m is None:
-        print("[!] Missing either 1H, 1D, 1W, or 1M file.")
+        print(f"[!] Missing 1H/1D/1W/1M FUT data for {SYMBOL} in database.")
         return
 
-    file_prefix = SYMBOL.lower().replace(' ', '_')
-    model_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model.pkl')
-    feat_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features.txt')
-    
-    model_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_model_1d.pkl')
-    feat_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_ultimate_features_1d.txt')
-    trade_plan_path = os.path.join(DATA_DIR, f'{file_prefix}_trade_plan_models.pkl')
+    model_path      = os.path.join(SYMBOL_DIR, f'{file_prefix}_ultimate_model.pkl')
+    feat_path       = os.path.join(SYMBOL_DIR, f'{file_prefix}_ultimate_features.txt')
+    model_1d_path   = os.path.join(SYMBOL_DIR, f'{file_prefix}_ultimate_model_1d.pkl')
+    feat_1d_path    = os.path.join(SYMBOL_DIR, f'{file_prefix}_ultimate_features_1d.txt')
+    trade_plan_path = os.path.join(SYMBOL_DIR, f'{file_prefix}_trade_plan_models.pkl')
 
     if not os.path.exists(model_path) or not os.path.exists(feat_path):
         print(f"[!] Could not find {model_path} or {feat_path}.")
@@ -343,6 +412,13 @@ def main():
         print("  [!] WARNING: No ML trade-plan models found. Falling back to static ATR exits.")
 
     print("  [=] Reconstructing holographic feature space over historical data...")
+    # Step 0: Inject Thermodynamic Basis (Cross-Asset Physics) for Backtest Gate
+    df_1h = inject_thermodynamic_basis(df_1h, tf_maps['SPOT']['1H'])
+    if df_1d is not None and tf_maps['SPOT']['1D'] is not None:
+        df_1d = inject_thermodynamic_basis(df_1d, tf_maps['SPOT']['1D'])
+    if df_1w is not None and tf_maps['SPOT']['1W'] is not None:
+        df_1w = inject_thermodynamic_basis(df_1w, tf_maps['SPOT']['1W'])
+
     # Step 1: compute atr14 labelling scaffold (used for volatility gate only,
     #         not as a model input)
     df_1h_labelled = _compute_atr14(df_1h.copy())
@@ -359,7 +435,7 @@ def main():
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
 
     # Build model-ready frame; keep atr14 as side-channel for vol-gate
-    all_needed_cols = list(set(feature_cols + ['time', 'open', 'high', 'low', 'close', 'volume', 'atr14']))
+    all_needed_cols = list(set(feature_cols + ['time', 'open', 'high', 'low', 'close', 'volume', 'atr14', 'basis_z_score']))
     available = [c for c in all_needed_cols if c in df_full.columns]
     df_model_ready = df_full[available].copy()
     for col in feature_cols:
@@ -373,7 +449,7 @@ def main():
 
     # ── UME-2 FIX: Load OOS probability map for honest backtesting ──
     # Align OOS probabilities onto the full historical bar timeline.
-    oos_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba.pkl')
+    oos_path = os.path.join(SYMBOL_DIR, f'{file_prefix}_oos_proba.pkl')
     df_backtest = df_model_ready
     if os.path.exists(oos_path):
         oos_proba_map = joblib.load(oos_path)
@@ -391,7 +467,7 @@ def main():
     # ── E3 FIX: Use genuine OOS 1D probabilities for conflict gating ──
     # Load the saved 1D OOS proba map. Only bars with OOS 1D predictions use
     # the genuine probability. Bars without OOS data remain NaN and do not gate.
-    oos_1d_path = os.path.join(DATA_DIR, f'{file_prefix}_oos_proba_1d.pkl')
+    oos_1d_path = os.path.join(SYMBOL_DIR, f'{file_prefix}_oos_proba_1d.pkl')
     if os.path.exists(oos_1d_path):
         oos_proba_map_1d = joblib.load(oos_1d_path)
         date_to_prob_1d = {}
@@ -403,7 +479,7 @@ def main():
         ])
         print(f"  [=] 1D OOS proba map loaded. {len(date_to_prob_1d)} honest OOS days available for gating.")
     else:
-        print(f"  [!] WARNING: No 1D OOS proba map found. 1D filtering disabled.")
+        print("  [!] WARNING: No 1D OOS proba map found. 1D filtering disabled.")
         prob_array_1d = np.full(len(df_backtest), np.nan)
 
 
@@ -422,7 +498,7 @@ def main():
     if results is None: 
         return
 
-    metrics = calculate_metrics(results['trades'])
+    metrics = calculate_metrics(results['trades'], results.get('equity_curve'), results.get('time_curve'))
 
     print("\n" + "=" * 60)
     print("  PORTFOLIO SIMULATION RESULTS")
@@ -435,14 +511,42 @@ def main():
     print(f"  Sharpe Ratio   : {metrics.get('sharpe', 0):.3f}")
     print(f"  Sortino Ratio  : {metrics.get('sortino', 0):.3f}")
     print(f"  Max Consec Loss: {metrics.get('max_consec_loss', 0)}")
+    print(f"  True TUW       : {metrics.get('true_tuw_days', 0)} Days")
     print(f"  Conflict Gated : {results.get('conflict_blocks', 0)} blocks bypassed")
+    print(f"  Shock Gate     : {results.get('shock_blocks', 0)} bars bypassed (|Z| > 2.5)")
     print(f"  Volatility Gate: {results.get('volatility_blocks', 0)} bars bypassed")
     print(f"  Max Drawdown   : {results['max_drawdown']*100:.2f}%")
     print("=" * 60)
 
-    report_path = os.path.join(DATA_DIR, f'{file_prefix}_backtest_report.png')
+    report_path = os.path.join(SYMBOL_DIR, f'{file_prefix}_backtest_report.png')
     generate_report(results, metrics, SYMBOL, report_path)
     print(f"\n  [✓] Report visually packaged and saved to {report_path}")
+    
+    # -- Seed the Performance Ledger 
+    try:
+        import sys
+        sys.path.append(os.path.join(DATA_DIR, 'data_vault'))
+        from vault_engine import DataVault
+        
+        vault = DataVault(db_path=os.path.join(DATA_DIR, 'data_vault', 'ohlcv.db'))
+        vault_trades = []
+        for t in results['trades']:
+            v_t = {
+                'timestamp': str(t['entry_time']),
+                'base_symbol': SYMBOL,
+                'direction': 'UP' if t['type'] == 'LONG' else 'DOWN',
+                'conf_score': t['confidence'],
+                'entry_price': t['entry_price'],
+                'exit_price': t['exit_price'],
+                'pnl_r': t['pnl'] / (t['initial_risk'] + 1e-9),
+                'win_loss_target': 1 if t['pnl'] > 0 else 0
+            }
+            vault_trades.append(v_t)
+            
+        vault.log_bulk_trades(vault_trades)
+        print(f"  [VAULT] Injected {len(vault_trades)} historic trades into Performance Ledger to neutralize Shadow Brain cold-start.")
+    except Exception as e:
+        print(f"  [VAULT] Failed to seed historic trades: {e}")
 
 if __name__ == '__main__':
     main()

@@ -11,7 +11,6 @@ warnings.filterwarnings('ignore')
 
 import universal_ml_engine as ume
 from universal_ml_engine import (
-    parse_tv_log,
     merge_higher_tf,
     add_target,
     train_trade_plan_models,
@@ -21,7 +20,6 @@ from universal_ml_engine import (
     MODEL_N_JOBS,
     LIVE_CONFIDENCE_THRESHOLD,
     BARRIER_HORIZON_BARS,
-    MIN_LABEL_BEST_R,
 )
 from holographic_engine import (
     holographic_feature_engine,
@@ -288,7 +286,7 @@ def meta_select_strategy(
                 risk_pct=BACKTEST_RISK_PCT,
                 conf_threshold=conf_threshold,
             )
-            bt_metrics = calculate_metrics(bt_results['trades'])
+            bt_metrics = calculate_metrics(bt_results['trades'], bt_results.get('equity_curve'), bt_results.get('time_curve'))
             final_equity = float(bt_results.get('final_equity', np.nan))
             total_return_pct = (
                 ((final_equity / BACKTEST_INITIAL_CAPITAL) - 1.0) * 100.0
@@ -462,63 +460,51 @@ def verdict_output(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TOON meta-strategy selector')
     parser.add_argument('--outdir', default='/home/km/Universal-ML/', help='Project output directory')
+    parser.add_argument('--symbol', type=str, required=True, help='Target Base Symbol (e.g., BANKNIFTY, BTC)')
     args = parser.parse_args()
 
     outdir = os.path.abspath(args.outdir)
-    csv_dir = os.path.join(outdir, 'csv_data')
-    if not os.path.isdir(csv_dir):
-        print(f"  [Meta] Missing csv_data directory: {csv_dir}")
+    SYMBOL = args.symbol.upper()
+    SYMBOL_DIR = os.path.join(outdir, SYMBOL)
+    os.makedirs(SYMBOL_DIR, exist_ok=True)
+
+    import sys
+    sys.path.insert(0, os.path.join(outdir, 'data_vault'))
+    try:
+        from inference_bridge import InferenceBridge
+    except ImportError:
+        print("  [Meta] FATAL: Cannot locate inference_bridge.py.")
         raise SystemExit(1)
 
-    csv_paths = sorted(
-        os.path.join(csv_dir, name)
-        for name in os.listdir(csv_dir)
-        if name.lower().endswith('.csv')
-    )
-    if not csv_paths:
-        print(f"  [Meta] No CSV files found in {csv_dir}")
-        raise SystemExit(1)
-
-    timeframes: dict[str, pd.DataFrame] = {}
-    detected_symbol = None
-    timeframe_aliases = {
-        '1H': {'60', '1H', 'H'},
-        '1D': {'1D', 'D'},
-        '1W': {'1W', 'W'},
-        '1M': {'1M', 'M'},
+    bridge = InferenceBridge(db_path=os.path.join(outdir, 'data_vault', 'ohlcv.db'))
+    tf_raw = {
+        'FUT':  bridge.fetch_holographic_stack(SYMBOL, 'FUT'),
+        'SPOT': bridge.fetch_holographic_stack(SYMBOL, 'SPOT'),
     }
 
-    for path in csv_paths:
-        df, symbol, timeframe = parse_tv_log(path)
-        if df.empty or timeframe is None:
-            continue
+    df_1h = tf_raw['FUT'].get('1H')
+    df_1d = tf_raw['FUT'].get('1D')
+    df_1w = tf_raw['FUT'].get('1W')
+    df_1m = tf_raw['FUT'].get('1M')
 
-        tf_norm = str(timeframe).strip().upper()
-        for canonical_tf, aliases in timeframe_aliases.items():
-            if tf_norm in aliases:
-                timeframes[canonical_tf] = df.copy()
-                if symbol:
-                    detected_symbol = str(symbol).strip()
-                break
-
-    missing = [tf for tf in ('1H', '1D', '1W', '1M') if tf not in timeframes]
+    missing = [tf for tf, df in [('1H', df_1h), ('1D', df_1d), ('1W', df_1w), ('1M', df_1m)] if df is None or df.empty]
     if missing:
-        print(f"  [Meta] Missing required timeframes: {', '.join(missing)}")
+        print(f"  [Meta] Missing required FUT timeframes: {', '.join(missing)}")
         raise SystemExit(1)
 
-    symbol = detected_symbol or 'UNKNOWN'
-    baseline_model_path = os.path.join(outdir, f"{symbol.lower()}_ultimate_model.pkl")
-    baseline_oos_path = os.path.join(outdir, f"{symbol.lower()}_oos_proba.pkl")
+    symbol = SYMBOL
+    baseline_model_path = os.path.join(SYMBOL_DIR, f"{symbol.lower()}_ultimate_model.pkl")
+    baseline_oos_path   = os.path.join(SYMBOL_DIR, f"{symbol.lower()}_oos_proba.pkl")
     if os.path.exists(baseline_model_path):
         print(f"  [Meta] Found baseline model: {baseline_model_path}")
     if os.path.exists(baseline_oos_path):
         print(f"  [Meta] Found baseline OOS probabilities: {baseline_oos_path}")
 
     print(f"  [Meta] Building feature frame for {symbol} ...")
-    df_1h = timeframes['1H'].copy()
-    df_1d = timeframes['1D'].copy()
-    df_1w = timeframes['1W'].copy()
-    df_1m = timeframes['1M'].copy()
+    df_1h = df_1h.copy()
+    df_1d = df_1d.copy()
+    df_1w = df_1w.copy()
+    df_1m = df_1m.copy()
 
     df_1h_labelled = _compute_atr14(df_1h.copy())
     df_full = holographic_feature_engine(
@@ -539,7 +525,7 @@ if __name__ == '__main__':
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     verdict = verdict_output(winner_key, metrics, zoo_results, symbol, ts)
 
-    report_path = os.path.join(outdir, f"{symbol.lower()}_meta_report.png")
+    report_path = os.path.join(SYMBOL_DIR, f"{symbol.lower()}_meta_report.png")
     fig = plt.figure(figsize=(14, 10), facecolor='#0d0d0d')
     ax_top = fig.add_subplot(2, 1, 1)
     ax_bottom = fig.add_subplot(2, 1, 2)
@@ -630,6 +616,6 @@ if __name__ == '__main__':
     verdict['report_path'] = report_path
     print(f"  [Meta] Report saved → {report_path}")
 
-    verdict_path = os.path.join(outdir, f"{symbol.lower()}_meta_verdict.pkl")
+    verdict_path = os.path.join(SYMBOL_DIR, f"{symbol.lower()}_meta_verdict.pkl")
     joblib.dump(verdict, verdict_path)
     print(f"  [Meta] Verdict saved → {verdict_path}")

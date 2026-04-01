@@ -32,7 +32,7 @@ HOLO_WINDOWS_1D = [3, 5, 8, 13, 21]
 HOLO_WINDOWS_1W = [3, 5, 8]
 HOLO_WINDOWS_1M = [3, 5]
 
-SKEL_PROMINENCE   = 0.10   # peak must stand 10% of window range above neighbours
+SKEL_PROMINENCE   = 0.05   # [TOON vX.0] Relaxed prominence for fine skeleton detection
 CORR_THRESHOLD    = 0.80   # correlation cutoff for twin removal
 PHASE1_FOLDS      = 5
 PHASE1_MAX_DEPTH  = 3
@@ -73,21 +73,24 @@ def _bbox(opens, highs, lows, closes, volumes):
     vols = np.nan_to_num(volumes, nan=0.0)
     total_vol = vols.sum()
     vol_frac = vols / total_vol if total_vol > 1e-9 else np.full(n, 1.0 / n)
-
-    near_hi = np.maximum(norm_o, norm_c)
-    near_lo = np.minimum(norm_o, norm_c)
-    crange = norm_h - norm_l + 1e-9
-
-    body_dom   = np.abs(norm_c - norm_o) / crange
-    upper_wick = (norm_h - near_hi) / crange
-    lower_wick = (near_lo - norm_l) / crange
+    prev_close = np.roll(closes, 1)
+    prev_close[0] = closes[0] # Handle first index
+    
+    price_move = (2 * closes) - prev_close - opens
+    
+    # norm_bias replaces old body/wick logic
+    norm_bias = ((((closes - lo) - (hi - closes)) / (rng + 1e-9)) + 1.0) / 2.0
+    
+    # volume_bias (Cumulative Delta Imbalance)
+    buy_vol = np.where(price_move > 0, vols, 0)
+    sell_vol = np.where(price_move < 0, vols, 0)
+    volume_bias = (np.sum(buy_vol) - np.sum(sell_vol)) / (np.sum(vols) + 1e-9)
 
     return dict(
         norm_o=norm_o, norm_h=norm_h, norm_l=norm_l, norm_c=norm_c,
         vol_frac=np.clip(vol_frac, 0.0, 1.0),
-        body_dom=np.clip(body_dom, 0.0, 1.0),
-        upper_wick=np.clip(upper_wick, 0.0, 1.0),
-        lower_wick=np.clip(lower_wick, 0.0, 1.0),
+        norm_bias=np.clip(norm_bias, 0.0, 1.0),
+        volume_bias=float(np.clip(volume_bias, -1.0, 1.0)),
     )
 
 
@@ -96,20 +99,25 @@ def _bbox(opens, highs, lows, closes, volumes):
 # ─────────────────────────────────────────────────────────────
 
 def _dna(b: dict, tf: str, w: int) -> Dict[str, float]:
-    """9 numbers per candle × N candles."""
+    """13 numbers per candle (Geometric + Thermodynamic)."""
     n = len(b['norm_c'])
     out: Dict[str, float] = {}
     for k in range(n):
         p = f"{tf}_w{w}_bar{k+1}"
-        out[f"{p}_time_pos"]   = (k + 1) / n
-        out[f"{p}_open"]       = float(b['norm_o'][k])
-        out[f"{p}_high"]       = float(b['norm_h'][k])
-        out[f"{p}_low"]        = float(b['norm_l'][k])
+        # Expose only norm_c, norm_bias, and volume_bias per bar
         out[f"{p}_close"]      = float(b['norm_c'][k])
-        out[f"{p}_vol_frac"]   = float(b['vol_frac'][k])
-        out[f"{p}_body_dom"]   = float(b['body_dom'][k])
-        out[f"{p}_upper_wick"] = float(b['upper_wick'][k])
-        out[f"{p}_lower_wick"] = float(b['lower_wick'][k])
+        out[f"{p}_norm_bias"]  = float(b['norm_bias'][k])
+        out[f"{p}_volume_bias"]= float(b['volume_bias'])
+        
+        # Thermodynamic Expose (Defaults to 0.0 if not injected)
+        out[f"{p}_basis_pct"]  = float(b.get('basis_pct', [0.0]*n)[k])
+        out[f"{p}_basis_z"]    = float(b.get('basis_z_score', [0.0]*n)[k])
+        out[f"{p}_basis_v5"]   = float(b.get('basis_vel_5', [0.0]*n)[k])
+        out[f"{p}_basis_v10"]  = float(b.get('basis_vel_10', [0.0]*n)[k])
+        
+        # Session Gap Physics
+        out[f"{p}_session_pos"] = float(b.get('session_time_pos', [0.0]*n)[k])
+        out[f"{p}_eod_momentum"] = float(b.get('eod_basis_momentum', [0.0]*n)[k])
     return out
 
 
@@ -118,25 +126,27 @@ def _dna(b: dict, tf: str, w: int) -> Dict[str, float]:
 # ─────────────────────────────────────────────────────────────
 
 def _grammar(b: dict, tf: str, w: int) -> Dict[str, float]:
-    """4 transition consistency numbers (requires w >= 3)."""
+    """[TOON vX.0] Full sequence encoding via lag matrix. LightGBM sees order natively."""
     if w < 3:
         return {}
-    nc, nh, vf, bd = b['norm_c'], b['norm_h'], b['vol_frac'], b['body_dom']
+    
+    nc, vf = b['norm_c'], b['vol_frac']
+    nb, vb = b['norm_bias'], b['volume_bias']
     n = len(nc)
-    cr = hr = ve = be = 0.0
-    pairs = n - 1
-    for k in range(1, n):
-        cr += 1.0 if nc[k] > nc[k-1] else 0.0
-        hr += 1.0 if nh[k] > nh[k-1] else 0.0
-        ve += 1.0 if vf[k] > vf[k-1] else 0.0
-        be += 1.0 if bd[k] > bd[k-1] else 0.0
-    p = f"{tf}_w{w}_gram"
-    return {
-        f"{p}_close_rising":   cr / pairs,
-        f"{p}_high_rising":    hr / pairs,
-        f"{p}_vol_expanding":  ve / pairs,
-        f"{p}_body_expanding": be / pairs,
-    }
+    out = {}
+    
+    # Send up to the entire window size backward as distinct lag columns
+    for lag in range(min(w, 21)):
+        # -1 is the most recent bar, -2 is previous, etc.
+        idx = (n - 1) - lag
+        if idx >= 0:
+            out[f"{tf}_w{w}_gram_nb_lag{lag}"] = float(nb[idx])
+            out[f"{tf}_w{w}_gram_vb_lag{lag}"] = float(vb)
+        else:
+            out[f"{tf}_w{w}_gram_nb_lag{lag}"] = 0.0
+            out[f"{tf}_w{w}_gram_vb_lag{lag}"] = 0.0
+            
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -144,17 +154,21 @@ def _grammar(b: dict, tf: str, w: int) -> Dict[str, float]:
 # ─────────────────────────────────────────────────────────────
 
 def _spectral(b: dict, tf: str, w: int) -> Dict[str, float]:
-    """FFT magnitudes F1–F4 on close, body, vol sequences. No phase."""
-    if w < 8:
+    """[TOON vX.0] Replace FFT with Rolling Autocorrelation at Fibonacci lags."""
+    if w < 10:
         return {}
+    
     out: Dict[str, float] = {}
-    signals = {'close': b['norm_c'], 'body': b['body_dom'], 'vol': b['vol_frac']}
-    hann = np.hanning(w)
-    for name, sig in signals.items():
-        mags = np.abs(np.fft.rfft(sig * hann))
-        for fi in range(1, 5):
-            v = float(mags[fi]) / w if fi < len(mags) else 0.0
-            out[f"{tf}_w{w}_fft_{name}_f{fi}"] = 0.0 if not np.isfinite(v) else v
+    sig = b['norm_c']
+    
+    for lag in [1, 2, 3, 5, 8]:
+        if len(sig) > lag:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                r = np.corrcoef(sig[lag:], sig[:-lag])[0, 1]
+            out[f"{tf}_w{w}_fft_nc_ac{lag}"] = 0.0 if not np.isfinite(r) else float(r)
+        else:
+            out[f"{tf}_w{w}_fft_nc_ac{lag}"] = 0.0
+            
     return out
 
 
@@ -178,47 +192,41 @@ def _skeleton(b: dict, tf: str, w: int) -> Dict[str, float]:
         elif mid < left and mid < right and (min(left, right) - mid) >= prom:
             troughs.append(k)
 
-    def _slope(idxs):
-        if len(idxs) < 2:
-            return 0.0
-        return float(nc[idxs[-1]] - nc[idxs[0]])
-
-    def _first_pos(idxs):
-        return float(idxs[0] / (n - 1)) if idxs else 0.5
-
-    def _last_pos(idxs):
-        return float(idxs[-1] / (n - 1)) if idxs else 0.5
-
     def _last_vol(idxs):
-        return float(vf[idxs[-1]]) if idxs else 0.0
+        return float(vf[idxs[-1]]) if idxs and 'vol_frac' in b else 0.0
 
-    pk_slope = _slope(peaks)
-    tr_slope = _slope(troughs)
+    pk_vals = [nc[k] for k in peaks if k < n - 1]
+    tr_vals = [nc[k] for k in troughs if k < n - 1]
+    last_swing_high = pk_vals[-1] if pk_vals else 1.0
+    last_protected_low = tr_vals[-1] if tr_vals else 0.0
+    
+    nc_last = nc[-1]
+    nb_last = b['norm_bias'][-1]
+    
+    skel_smc_phase = 0.0
+    if nc_last > last_swing_high:
+        pk_slope = pk_vals[-1] - pk_vals[0] if len(pk_vals) >= 2 else 0.0
+        # +1.0: Bullish BOS (Close > Last Swing High in Up-Trend)
+        # +2.0: Bullish CHoCH (Close > Last Protected High in Down-Trend)
+        skel_smc_phase = 1.0 if pk_slope >= 0 else 2.0
+    elif nc_last < last_protected_low:
+        tr_slope = tr_vals[-1] - tr_vals[0] if len(tr_vals) >= 2 else 0.0
+        skel_smc_phase = -1.0 if tr_slope <= 0 else -2.0
 
-    if   pk_slope > 0 and tr_slope > 0:  regime =  1.0
-    elif pk_slope < 0 and tr_slope < 0:  regime = -1.0
-    elif pk_slope > 0 and tr_slope < 0:  regime =  0.5
-    elif pk_slope < 0 and tr_slope > 0:  regime = -0.5
-    else:                                 regime =  0.0
-
-    prior_peak_vals = [nc[k] for k in peaks if k < n - 1]
-    breakout = 1.0 if prior_peak_vals and nc[-1] > max(prior_peak_vals) else 0.0
+    skel_liquidity_grab = 0.0
+    if nc_last < last_protected_low and nb_last > 0.7:
+        skel_liquidity_grab = 1.0
+        
+    vol_at_last_peak = _last_vol(peaks)
+    skel_ob_validity = vol_at_last_peak * abs(skel_smc_phase)
 
     p = f"{tf}_w{w}_skel"
     return {
-        f"{p}_npeaks":          float(len(peaks)),
-        f"{p}_ntroughs":        float(len(troughs)),
-        f"{p}_first_peak_pos":  _first_pos(peaks),
-        f"{p}_last_peak_pos":   _last_pos(peaks),
-        f"{p}_peaks_slope":     pk_slope,
-        f"{p}_vol_at_last_peak": _last_vol(peaks),
-        f"{p}_first_trough_pos": _first_pos(troughs),
-        f"{p}_last_trough_pos":  _last_pos(troughs),
-        f"{p}_troughs_slope":    tr_slope,
-        f"{p}_vol_at_last_trough": _last_vol(troughs),
-        f"{p}_regime":           regime,
-        f"{p}_breakout":         breakout,
-        f"{p}_drift":            float(nc[-1] - nc[0]),
+        f"{p}_smc_phase":       float(skel_smc_phase),
+        f"{p}_liquidity_grab":  float(skel_liquidity_grab),
+        f"{p}_ob_validity":     float(skel_ob_validity),
+        f"{p}_last_swing_high": float(last_swing_high),
+        f"{p}_last_swing_low":  float(last_protected_low),
     }
 
 
@@ -235,29 +243,27 @@ def _confluence(row_feats: Dict[str, float]) -> Dict[str, float]:
     def g(k, default=0.0):
         return row_feats.get(k, default)
 
-    drift_1h = g('1h_w5_skel_drift')
-    drift_1d = g('1d_w5_skel_drift')
-    drift_1w = g('1w_w5_skel_drift')
-    cr_1h    = g('1h_w5_gram_close_rising', 0.5)
-    cr_1d    = g('1d_w5_gram_close_rising', 0.5)
-    reg8_1h  = g('1h_w8_skel_regime')
-    reg8_1d  = g('1d_w8_skel_regime')
-    pk_1h    = g('1h_w5_skel_peaks_slope')
-    pk_1d    = g('1d_w5_skel_peaks_slope')
-    tr_1h    = g('1h_w5_skel_troughs_slope')
-    tr_1d    = g('1d_w5_skel_troughs_slope')
-
+    phase_1h = g('1h_w13_skel_smc_phase')
+    phase_1d = g('1d_w13_skel_smc_phase')
+    phase_1w = g('1w_w8_skel_smc_phase')
+    
+    if phase_1h > 0 and phase_1d > 0 and phase_1w > 0:
+        mtf_conf_smc_sync = 1.0
+    elif phase_1h < 0 and phase_1d < 0 and phase_1w < 0:
+        mtf_conf_smc_sync = -1.0
+    else:
+        mtf_conf_smc_sync = 0.0
+        
+    # Premium / Discount Pricing
+    h1_close = g('1h_w13_bar13_close') 
+    d1_high = g('1d_w13_skel_last_swing_high', 1.0)
+    d1_low = g('1d_w13_skel_last_swing_low', 0.0)
+    
+    pd_zone = (h1_close - d1_low) / (d1_high - d1_low + 1e-9)
+    
     return {
-        'mtf_conf_all_up':          1.0 if drift_1h > 0 and drift_1d > 0 and drift_1w > 0 else 0.0,
-        'mtf_conf_all_down':        1.0 if drift_1h < 0 and drift_1d < 0 and drift_1w < 0 else 0.0,
-        'mtf_conf_1h_1d_conflict':  1.0 if drift_1h * drift_1d < 0 else 0.0,
-        'mtf_conf_bull_grammar':    1.0 if cr_1h > 0.6 and cr_1d > 0.6 else 0.0,
-        'mtf_conf_peaks_aligned':   1.0 if np.sign(pk_1h) == np.sign(pk_1d) and pk_1h != 0 else 0.0,
-        'mtf_conf_troughs_aligned': 1.0 if np.sign(tr_1h) == np.sign(tr_1d) and tr_1h != 0 else 0.0,
-        'mtf_conf_compression':     1.0 if reg8_1h == -0.5 and reg8_1d == -0.5 else 0.0,
-        'mtf_conf_expansion':       1.0 if reg8_1h ==  0.5 and reg8_1d ==  0.5 else 0.0,
-        'mtf_conf_drift_diff':      float(drift_1h - drift_1d),
-        'mtf_conf_drift_product':   float(abs(drift_1h) * abs(drift_1d)),
+        'mtf_conf_smc_sync': float(mtf_conf_smc_sync),
+        'mtf_conf_pd_zone':  float(pd_zone)
     }
 
 
@@ -299,7 +305,7 @@ def _process_tf(
             avail = i          # bars 0…i-1 are closed before bar i
         else:
             t = base_times[i]
-            avail = int(np.searchsorted(src_times, t, side='left'))
+            avail = max(0, int(np.searchsorted(src_times, t, side='right')) - 1)
 
         feat: Dict[str, float] = {}
         for w in windows:
@@ -311,6 +317,15 @@ def _process_tf(
                 src_l[start:avail], src_c[start:avail],
                 src_v[start:avail],
             )
+            # Passthrough Thermodynamic & Session vectors
+            if 'basis_pct' in src_df.columns:
+                b['basis_pct'] = src_df['basis_pct'].to_numpy(dtype=float)[start:avail]
+                b['basis_z_score'] = src_df['basis_z_score'].to_numpy(dtype=float)[start:avail]
+                b['basis_vel_5'] = src_df['basis_vel_5'].to_numpy(dtype=float)[start:avail]
+                b['basis_vel_10'] = src_df['basis_vel_10'].to_numpy(dtype=float)[start:avail]
+            if 'session_time_pos' in src_df.columns:
+                b['session_time_pos'] = src_df['session_time_pos'].to_numpy(dtype=float)[start:avail]
+                b['eod_basis_momentum'] = src_df['eod_basis_momentum'].to_numpy(dtype=float)[start:avail]
             feat.update(_dna(b, tf_label, w))
             if w >= 3:
                 feat.update(_grammar(b, tf_label, w))
@@ -524,7 +539,7 @@ def feature_selection_pipeline(
         'confluence': sum(1 for c in final if c.startswith('mtf_conf')),
     }
 
-    print(f"\n  [HOLO] ┌─ Selection Complete ─────────────────────────────────┐")
+    print("\n  [HOLO] ┌─ Selection Complete ─────────────────────────────────┐")
     print(f"  [HOLO] │  Generated   : {len(feature_cols)}")
     print(f"  [HOLO] │  After corr  : {len(p1)}")
     print(f"  [HOLO] │  After probe : {len(p2)}")
@@ -532,7 +547,7 @@ def feature_selection_pipeline(
     print(f"  [HOLO] │  DNA:{layer['dna']}  Gram:{layer['grammar']}  "
           f"FFT:{layer['spectral']}  Skel:{layer['skeleton']}  "
           f"Conf:{layer['confluence']}")
-    print(f"  [HOLO] └────────────────────────────────────────────────────────┘")
+    print("  [HOLO] └────────────────────────────────────────────────────────┘")
 
     if layer['spectral'] == 0:
         print("  [HOLO] NOTE: Zero FFT features survived final selection. "

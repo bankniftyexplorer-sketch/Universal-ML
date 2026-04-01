@@ -2,8 +2,6 @@ import os
 import argparse
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from sklearn.metrics import accuracy_score
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -11,7 +9,8 @@ import matplotlib.gridspec as gridspec
 import warnings
 warnings.filterwarnings('ignore')
 
-from universal_ml_engine import parse_tv_log, add_features_single, add_calendar_features, walk_forward
+from universal_ml_engine import parse_tv_log, walk_forward, _compute_atr14
+from holographic_engine import holographic_feature_engine
 
 def calculate_metrics(trades):
     if not trades: return {}
@@ -94,8 +93,9 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
                 equity += position['pnl']
                 trades.append(position)
                 position = None
+                continue
 
-        if position is None:
+        elif position is None:
             confidence = max(proba_up, proba_down)
             if confidence >= conf_threshold:
                 direction = 'LONG' if proba_up > 0.5 else 'SHORT'
@@ -133,7 +133,6 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
     return {'equity': equity, 'dd': max_drawdown, 'trades': trades, 'eq_c': equity_curve, 't_c': time_curve}
 
 def main():
-    import argparse, os
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', type=str, default='/home/km/BankniftyML/')
     args = parser.parse_args()
@@ -161,19 +160,26 @@ def main():
         print("[!] Could not find both 1D and 1W CSV files. Aborting.")
         return
 
-    # 1D features
-    df_full = add_features_single(df_1d.copy(), prefix='')
-    df_full = add_calendar_features(df_full)
-
-    # Merge 1W
-    df_1w_feat = add_features_single(df_1w.copy(), prefix='w_')
-    w_cols = [c for c in df_1w_feat.columns if c.startswith('w_')] + ['time', 'close', 'high', 'low']
-    df_1w_feat = df_1w_feat[w_cols].copy()
-    df_1w_feat.rename(columns={'close': 'w_close', 'high': 'w_high', 'low': 'w_low'}, inplace=True)
-    df_full = df_full.sort_values('time')
-    df_1w_feat = df_1w_feat.sort_values('time')
-    merged = pd.merge_asof(df_full, df_1w_feat, on='time', direction='backward', tolerance=pd.Timedelta('7 days'))
-    merged['pos_in_weekly_range'] = (merged['close'] - merged['w_low']) / (merged['w_high'] - merged['w_low']).replace(0, np.nan)
+    # RDM-1 FIX: Align to TOON v4.0 Holographic Engine
+    print("  [+] Generating TOON Holographic Features for 1D Model...")
+    df_1d_labelled = _compute_atr14(df_1d.copy())
+    
+    # Treat 1D as the base timeframe, feed 1W as the higher context
+    merged = holographic_feature_engine(
+        df_1h=df_1d_labelled,
+        df_1d=None, 
+        df_1w=df_1w.copy(), 
+        df_1m=None
+    )
+    
+    # Optional: Keep the specific legacy relative strength calculation if it was critical
+    # (Extracting the weekly close safely without look-ahead via asof merge)
+    w_raw = df_1w[['time', 'close', 'high', 'low']].copy()
+    w_raw.columns = ['time', 'w_close', 'w_high', 'w_low']
+    w_raw['time'] = w_raw['time'] + pd.Timedelta(weeks=1) # Look-ahead prevention
+    merged = merged.sort_values('time')
+    w_raw = w_raw.sort_values('time')
+    merged = pd.merge_asof(merged, w_raw, on='time', direction='backward')
     merged['rel_strength_w'] = (merged['close'] - merged['w_close']) / (merged['w_close'] + 1e-9)
 
     # Target: next daily bar direction
