@@ -197,24 +197,18 @@ def main() -> None:
 
     prob_array_1d = np.full(len(df_backtest), np.nan)
 
-    import backtest_engine
-
-    original_eod = getattr(backtest_engine, "EOD_GATE_HOUR", 14)
-    try:
-        backtest_engine.EOD_GATE_HOUR = EOD_GATE_HOUR_DAILY
-        results = run_backtest(
-            df_backtest,
-            prob_array,
-            prob_array_1d,
-            feature_cols,
-            trade_plan_models=trade_plan_models,
-            initial_capital=10000.0,
-            risk_pct=0.02,
-            conf_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
-            max_hold_bars=BARRIER_HORIZON_BARS_DAILY,
-        )
-    finally:
-        backtest_engine.EOD_GATE_HOUR = original_eod
+    results = run_backtest(
+        df_backtest,
+        prob_array,
+        prob_array_1d,
+        feature_cols,
+        trade_plan_models=trade_plan_models,
+        initial_capital=10000.0,
+        risk_pct=0.02,
+        conf_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
+        max_hold_bars=BARRIER_HORIZON_BARS_DAILY,
+        eod_gate_hour=EOD_GATE_HOUR_DAILY,
+    )
 
     if results is None:
         return

@@ -151,7 +151,7 @@ def run_strategy_zoo(
                 atr_mult=atr_mult,
                 horizon=BARRIER_HORIZON_BARS,
                 atr_col="atr14",
-                drop_unresolved=False,
+                drop_unresolved=True,
             )
         finally:
             ume.BARRIER_ATR_MULT = original_atr_mult

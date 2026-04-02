@@ -1,3 +1,6 @@
+# DEPRECATED: Superseded by daily_ml_engine.py + daily_backtest_engine.py.
+# Uses Python holographic engine (not Julia). Artifacts saved outside the
+# ARTIFACT_NAME_SCHEME. Do NOT use for production model generation.
 import os
 import argparse
 import numpy as np
@@ -10,7 +13,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from universal_ml_engine import parse_tv_log, walk_forward, _compute_atr14
-from holographic_engine import holographic_feature_engine
+from julia_bridge import holographic_feature_engine_fast as holographic_feature_engine
 
 def calculate_metrics(trades):
     if not trades: return {}

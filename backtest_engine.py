@@ -47,6 +47,7 @@ def run_backtest(
     fixed_risk=True,
     slippage_bps=0.0003,
     max_hold_bars=BARRIER_HORIZON_BARS,
+    eod_gate_hour: int = EOD_GATE_HOUR,
 ):
     equity = initial_capital
     peak_equity = equity
@@ -113,7 +114,7 @@ def run_backtest(
         # Gate on the ENTRY bar (i+1), not the signal bar (i), to close the
         # 13:00-signal → 14:00-execution temporal leak.
         next_time = pd.to_datetime(time_arr[i + 1])
-        if next_time.hour >= EOD_GATE_HOUR:
+        if next_time.hour >= eod_gate_hour:
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
             i += 1

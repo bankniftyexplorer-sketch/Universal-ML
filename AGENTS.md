@@ -4,6 +4,12 @@
 
 Universal-ML is a machine learning trading system that predicts financial instrument direction using holographic (pure geometry-based) features. It processes OHLCV data from TradingView CSV logs across multiple timeframes (1H, 1D, 1W, 1M).
 
+## Fast AI Read
+
+- Read `PROJECT_MAP.md` first for the shortest accurate architecture map.
+- Read `LAUNCH_INSTRUCTIONS.md` for run commands and operating routine.
+- Open the large engine files only after the map tells you which lane matters.
+
 ## Build/Lint/Test Commands
 
 ### Environment Setup

@@ -115,8 +115,9 @@ class DataVault:
             FROM performance_ledger p
             LEFT JOIN market_dna m 
               ON p.base_symbol = m.base_symbol 
-              AND p.timestamp = m.timestamp
+              AND datetime(p.timestamp) = datetime(m.timestamp)
               AND m.timeframe = '1H'
+              AND m.asset_class = 'FUT'
             WHERE p.base_symbol = ?
               AND p.timestamp >= datetime('now', '-{days} days')
             ORDER BY p.timestamp ASC
