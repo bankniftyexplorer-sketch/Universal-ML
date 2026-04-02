@@ -4,7 +4,6 @@ import sqlite3
 import re
 import pandas as pd
 import numpy as np
-from datetime import datetime
 
 class DataVault:
     def __init__(self, db_path='ohlcv.db', inbox_path='inbox'):
@@ -125,7 +124,7 @@ class DataVault:
         return pd.read_sql_query(query, self.conn, params=(base_symbol,))
 
     def _parse_ticker_dna(self, raw_ticker):
-        """Strips ONLY valid TradingView continuous futures suffixes (! or 1!)."""
+        """Assumes TradingView convention: '!' or '1!' suffix = futures. Non-TV tickers ending in '!' will be misclassified."""
         raw_ticker = raw_ticker.strip()
         
         # Refined Regex: Matches an optional '1' followed by '!' at the VERY end
@@ -152,7 +151,7 @@ class DataVault:
             v = float(self.re_vol.search(message).group(1).replace(',', ''))
             
             return pd.Series([base_symbol, asset_class, timeframe, o, h, l, c, v])
-        except AttributeError as e:
+        except AttributeError:
             # Failsafe for corrupted rows
             return pd.Series([None, None, None, None, None, None, None, None])
 
@@ -319,7 +318,7 @@ class DataVault:
             
             # Remove file after successful ingestion
             os.remove(file)
-            print(f"Successfully processed and archived into database.\n")
+            print("Successfully processed and archived into database.\n")
 
     def _upsert_dataframe(self, df):
         """Performs a highly efficient SQLite INSERT OR REPLACE."""
@@ -328,7 +327,7 @@ class DataVault:
         # Ensure timestamp is correctly formatted as UTC ISO8601 for SQLite storage
         ts = df_db['timestamp']
         if not pd.api.types.is_datetime64_any_dtype(ts):
-            ts = pd.to_datetime(ts)
+            ts = pd.to_datetime(ts, utc=True)
         
         # Defensive check: if it somehow arrives naive, assume it's IST from the TV export
         if ts.dt.tz is None:

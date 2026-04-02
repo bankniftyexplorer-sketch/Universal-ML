@@ -186,8 +186,15 @@ highs = df['high'].to_numpy(dtype=float)
 7. Train final model on all data
 
 ### Output Files
-- `{symbol}_ultimate_model.pkl` - Trained LightGBM model
-- `{symbol}_ultimate_features.txt` - Feature column names
-- `{symbol}_oos_proba.pkl` - Out-of-sample probability map
-- `{symbol}_trade_plan_models.pkl` - Trade plan (SL/TP) models
-- `{symbol}_backtest_report.png` - Equity curve and metrics
+- `{symbol}_1H_model.pkl` - Trained 1H LightGBM model
+- `{symbol}_1H_features.txt` - 1H feature column names
+- `{symbol}_1H_oos_proba.pkl` - 1H out-of-sample probability map
+- `{symbol}_1H_trade_plan_models.pkl` - 1H trade plan (SL/TP) models
+- `{symbol}_1H_ml_report.png` - 1H forecast/model report
+- `{symbol}_1H_backtest_report.png` - 1H equity curve and metrics
+- `{symbol}_1D_model.pkl` - Trained 1D LightGBM model
+- `{symbol}_1D_features.txt` - 1D feature column names
+- `{symbol}_1D_oos_proba.pkl` - 1D out-of-sample probability map
+- `{symbol}_1D_trade_plan_models.pkl` - 1D trade plan (SL/TP) models
+- `{symbol}_1D_ml_report.png` - 1D forecast/model report
+- `{symbol}_1D_backtest_report.png` - 1D equity curve and metrics

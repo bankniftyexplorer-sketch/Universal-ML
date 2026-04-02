@@ -23,6 +23,12 @@ from typing import Dict, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
 
+# ════════════════════════════════════════════════════════════════
+# LEGACY: Feature extraction replaced by ToonMath.jl via julia_bridge.py.
+# Retained for: (1) reference, (2) feature_selection_pipeline host.
+# For new code: from julia_bridge import holographic_feature_engine_fast
+# ════════════════════════════════════════════════════════════════
+
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
@@ -31,6 +37,7 @@ HOLO_WINDOWS_1H = [3, 5, 8, 13, 21]
 HOLO_WINDOWS_1D = [3, 5, 8, 13, 21]
 HOLO_WINDOWS_1W = [3, 5, 8]
 HOLO_WINDOWS_1M = [3, 5]
+HOLO_WINDOWS_3M = [3, 5]
 
 SKEL_PROMINENCE   = 0.05   # [TOON vX.0] Relaxed prominence for fine skeleton detection
 CORR_THRESHOLD    = 0.80   # correlation cutoff for twin removal
@@ -511,7 +518,7 @@ def feature_selection_pipeline(
     """
     print(f"\n  [HOLO] Feature selection starting with {len(feature_cols)} features…")
 
-    p1 = feature_cols # correlation_filter(df, feature_cols)
+    p1 = correlation_filter(df, feature_cols)
     p2 = phase1_ranking(df, p1, target_col=target_col)
 
     final = p2

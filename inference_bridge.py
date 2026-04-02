@@ -18,19 +18,17 @@ class InferenceBridge:
         Converts the UTC database time back to IST ('Asia/Kolkata') for ML execution.
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            
-            # The Brutally Perfect SQL Query: Pull everything for this specific asset
-            query = """
-                SELECT timeframe, timestamp, open, high, low, close, volume, is_synthetic_vol 
-                FROM market_dna 
-                WHERE base_symbol = ? AND asset_class = ?
-                ORDER BY timestamp ASC
-            """
-            
-            # Read directly into a highly-optimized Pandas DataFrame
-            raw_df = pd.read_sql_query(query, conn, params=(base_symbol, asset_class))
-            conn.close()
+            with sqlite3.connect(self.db_path) as conn:
+                # The Brutally Perfect SQL Query: Pull everything for this specific asset
+                query = """
+                    SELECT timeframe, timestamp, open, high, low, close, volume, is_synthetic_vol 
+                    FROM market_dna 
+                    WHERE base_symbol = ? AND asset_class = ?
+                    ORDER BY timestamp ASC
+                """
+                
+                # Read directly into a highly-optimized Pandas DataFrame
+                raw_df = pd.read_sql_query(query, conn, params=(base_symbol, asset_class))
 
             if raw_df.empty:
                 print(f"[!] DATABASE WARNING: No data found for {base_symbol} {asset_class}.")

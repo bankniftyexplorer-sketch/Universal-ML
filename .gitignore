@@ -1,5 +1,21 @@
 # --- DATA (Manual Feed) ---
 csv_data/*.csv
+data_vault/inbox/
+*.db
+
+# --- INSTRUMENT ARTIFACTS ---
+NIFTY/
+BANKNIFTY/
+FINNIFTY/
+BSX/
+MIDCPNIFTY/
+SENSEX/
+*/*_features.txt
+*/*_model.pkl
+*/*_oos_proba.pkl
+*/*_trade_plan_models.pkl
+*/*_report.png
+*/*_report.jpg
 
 # --- TRAINED MODELS & PROBA MAPS ---
 *.pkl
@@ -18,6 +34,7 @@ __pycache__/
 .Python
 env/
 venv/
+mlenv/
 .env
 
 # --- IDEs & OS ---

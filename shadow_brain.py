@@ -3,7 +3,6 @@ import os
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from datetime import datetime, timedelta
 
 # Dynamically add data_vault into path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'data_vault'))
@@ -102,7 +101,8 @@ class ShadowBrain:
         
         try:
             prob_success = float(self.model.predict_proba(X_inf)[0, 1])
-        except IndexError:
+        except (IndexError, ValueError, Exception) as e:
+            print(f"  [SHADOW] Prediction error ({e}), failing open.")
             prob_success = 1.0
             
         if prob_success < 0.45:
