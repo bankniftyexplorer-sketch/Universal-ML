@@ -469,6 +469,22 @@ def _metric_regressed(current: float | None, baseline: float | None, tol: float)
     return float(current) + tol < float(baseline)
 
 
+def _artifact_identity_status(
+    baseline_artifacts: dict[str, dict[str, Any]],
+    current_artifacts: dict[str, dict[str, Any]],
+) -> tuple[str, list[str]]:
+    changed: list[str] = []
+    for key in HASH_KEYS:
+        if baseline_artifacts.get(key, {}).get("sha256") != current_artifacts.get(
+            key, {}
+        ).get("sha256"):
+            changed.append(key)
+
+    if changed:
+        return "DIFFERENT RUN", changed
+    return "SAME RUN", changed
+
+
 def compare_baseline(args: argparse.Namespace) -> int:
     baseline_path = Path(args.baseline) if args.baseline else _baseline_path(args.base_dir, args.symbol)
     if not baseline_path.exists():
@@ -486,7 +502,20 @@ def compare_baseline(args: argparse.Namespace) -> int:
         current = _capture_lane_snapshot(args.outdir, symbol, lane)
         current_metrics = current["metrics"]
         base_metrics = baseline["lanes"][lane]["metrics"]
+        base_artifacts = baseline["lanes"][lane]["artifacts"]
+        current_artifacts = current["artifacts"]
         _print_lane_metrics(symbol, lane, current_metrics)
+        run_status, changed_artifacts = _artifact_identity_status(
+            base_artifacts,
+            current_artifacts,
+        )
+        if changed_artifacts:
+            print(
+                f"[compare] {lane} artifact identity: {run_status} "
+                f"(changed: {', '.join(changed_artifacts)})"
+            )
+        else:
+            print(f"[compare] {lane} artifact identity: {run_status}")
 
         if current_metrics["oos_coverage"] + args.metric_tolerance < base_metrics["oos_coverage"]:
             failures.append(
@@ -523,8 +552,8 @@ def compare_baseline(args: argparse.Namespace) -> int:
                 f"{base_metrics['edge_over_baseline']:+.3f}"
             )
 
-        for key, artifact in baseline["lanes"][lane]["artifacts"].items():
-            current_artifact = current["artifacts"].get(key, {})
+        for key, artifact in base_artifacts.items():
+            current_artifact = current_artifacts.get(key, {})
             if artifact.get("exists") and artifact.get("sha256") != current_artifact.get("sha256"):
                 print(
                     f"[compare] note: {lane} artifact changed for {key} "
