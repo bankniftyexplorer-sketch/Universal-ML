@@ -169,6 +169,34 @@ Use this only if you want the strategy-comparison verdict layer.
 
 ---
 
+## 6A. Accuracy Guardrail Before Trusting Any Change
+
+Capture the current saved-artifact baseline:
+
+```bash
+cd /home/km/Universal-ML
+source mlenv/bin/activate
+python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
+```
+
+Later, compare the current repo state against that baseline:
+
+```bash
+python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
+```
+
+What this checks:
+
+- rebuilds the model-ready `1H` and `1D` frames from the database
+- replays the saved OOS probability maps against the real target series
+- fails if accuracy, high-confidence accuracy, edge over baseline, or OOS
+  coverage regresses
+
+This is the safest first check before trusting refactors, optimizations, or
+runtime changes.
+
+---
+
 ## 7. Recommended Daily Operating Routine
 
 ### If you want both `1H` and `1D` up to date
@@ -270,4 +298,3 @@ python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
   - `/home/km/Universal-ML/data_vault/ohlcv.db`
 - Keep the symbol folders:
   - they contain trained models and reports
-

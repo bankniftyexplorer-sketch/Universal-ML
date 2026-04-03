@@ -109,6 +109,7 @@ env/
 venv/
 mlenv/
 .env
+.accuracy_baselines/
 
 # --- IDEs & OS ---
 .vscode/

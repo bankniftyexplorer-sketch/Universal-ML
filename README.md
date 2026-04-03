@@ -40,6 +40,13 @@ Fast live intraday inference without retraining:
 python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
+Accuracy guardrail before and after any sensitive change:
+
+```bash
+python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
+python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
+```
+
 ## Read Order
 
 If you are new to the repo, read these in order:
