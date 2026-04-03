@@ -20,19 +20,114 @@ from universal_ml_engine import (
     BARRIER_HORIZON_BARS,
     LIVE_CONFIDENCE_THRESHOLD,
     EXEC_FEE_PCT,
+    fib_structural_basis,
     simulate_trade_path_from_arrays,
     predict_trade_plan,
     prepare_intraday_thermodynamics,
     resolve_artifact_path,
     migrate_legacy_artifacts,
 )
-from julia_bridge import holographic_feature_engine_fast as holographic_feature_engine
+from julia_bridge import (
+    compute_backtest_bar_state_fast,
+    holographic_feature_engine_fast as holographic_feature_engine,
+)
 
 EOD_GATE_HOUR = 14  # IST. Set to 24 for 24/7 crypto.
+SKIP_OK = 0
+SKIP_NO_PREDICTION = 1
+SKIP_EOD_GATE = 2
+SKIP_LOW_CONFIDENCE = 3
+SKIP_INVALID_ATR = 4
+SKIP_SHOCK = 5
+SKIP_LOW_HURST = 6
 
 
 def format_currency(val):
     return f"${val:,.2f}"
+
+
+def _compute_hurst_array_python(
+    close_arr: np.ndarray,
+    window_h: int = 100,
+    default_value: float = 0.5,
+) -> np.ndarray:
+    """
+    Reference implementation for the rough-volatility filter.
+
+    Kept in Python so the Julia migration stays parity-checkable and reversible.
+    """
+    hurst_arr = np.full(len(close_arr), default_value, dtype=float)
+    for j in range(window_h, len(close_arr)):
+        slice_c = close_arr[j - window_h : j]
+        diffs = np.diff(slice_c)
+        if len(diffs) > 0:
+            s_val = np.std(diffs)
+            if s_val > 0:
+                centered = diffs - np.mean(diffs)
+                z_path = np.cumsum(centered)
+                r_val = np.max(z_path) - np.min(z_path)
+                if r_val > 0:
+                    hurst_arr[j] = np.clip(
+                        np.log(r_val / s_val) / np.log(window_h),
+                        0.0,
+                        1.0,
+                    )
+    return hurst_arr
+
+
+def _precompute_backtest_bar_state_python(
+    close_arr: np.ndarray,
+    prob_array: np.ndarray,
+    atr_arr: np.ndarray,
+    z_arr: np.ndarray,
+    next_hour_arr: np.ndarray,
+    window_h: int = 100,
+    default_hurst: float = 0.5,
+    conf_threshold: float = LIVE_CONFIDENCE_THRESHOLD,
+    shock_z_abs: float = 2.5,
+    min_hurst: float = 0.45,
+    eod_gate_hour: int = EOD_GATE_HOUR,
+) -> dict[str, np.ndarray]:
+    """
+    Reference bar-state precompute that mirrors the backtest loop's gating.
+    """
+    hurst_arr = _compute_hurst_array_python(
+        close_arr, window_h=window_h, default_value=default_hurst
+    )
+    confidence_arr = np.full(len(close_arr), np.nan, dtype=float)
+    direction_long_arr = np.zeros(len(close_arr), dtype=bool)
+    skip_code_arr = np.zeros(len(close_arr), dtype=np.int64)
+
+    for i, proba_up in enumerate(prob_array):
+        if not np.isfinite(proba_up):
+            skip_code_arr[i] = SKIP_NO_PREDICTION
+            continue
+
+        confidence = max(proba_up, 1.0 - proba_up)
+        confidence_arr[i] = confidence
+        direction_long_arr[i] = proba_up > 0.5
+
+        if next_hour_arr[i] >= eod_gate_hour:
+            skip_code_arr[i] = SKIP_EOD_GATE
+            continue
+        if confidence < conf_threshold:
+            skip_code_arr[i] = SKIP_LOW_CONFIDENCE
+            continue
+        if not np.isfinite(atr_arr[i]) or atr_arr[i] <= 0:
+            skip_code_arr[i] = SKIP_INVALID_ATR
+            continue
+        if np.isfinite(z_arr[i]) and abs(z_arr[i]) > shock_z_abs:
+            skip_code_arr[i] = SKIP_SHOCK
+            continue
+        if not np.isfinite(hurst_arr[i]) or hurst_arr[i] < min_hurst:
+            skip_code_arr[i] = SKIP_LOW_HURST
+
+    return {
+        "hurst": hurst_arr,
+        "confidence": confidence_arr,
+        "direction_long": direction_long_arr,
+        "skip_code": skip_code_arr,
+    }
 
 
 def run_backtest(
@@ -48,7 +143,15 @@ def run_backtest(
     slippage_bps=0.0003,
     max_hold_bars=BARRIER_HORIZON_BARS,
     eod_gate_hour: int = EOD_GATE_HOUR,
+    use_julia_bar_state: bool = True,
+    use_julia_hurst: bool | None = None,
 ):
+    if use_julia_hurst is not None:
+        # Backward-compatible alias for older callers from the first migration
+        # slice. The Julia path now covers the full bar-state precompute, not
+        # just the Hurst series.
+        use_julia_bar_state = bool(use_julia_hurst)
+
     equity = initial_capital
     peak_equity = equity
     max_drawdown = 0.0
@@ -65,6 +168,12 @@ def run_backtest(
     low_arr = df["low"].values
     time_arr = df["time"].values
     atr_arr = df["atr14"].values
+    time_dt = pd.to_datetime(time_arr)
+
+    hour_arr = np.asarray(time_dt.hour, dtype=np.int64)
+    next_hour_arr = np.full(len(hour_arr), 24, dtype=np.int64)
+    if len(hour_arr) > 1:
+        next_hour_arr[:-1] = hour_arr[1:]
 
     # Secure Thermodynamic State Array (Fallback to 0.0 if not injected)
     if "basis_z_score" in df.columns:
@@ -74,80 +183,76 @@ def run_backtest(
 
     shock_blocks = 0
 
-    # [TOON vX.0 Alpha] Phase 4: Thermodynamic Rough Volatility (Hurst Exponent)
-    hurst_arr = np.full(len(close_arr), 0.5)
-    window_h = 100
-    for j in range(window_h, len(close_arr)):
-        slice_c = close_arr[j - window_h : j]
-        diffs = np.diff(slice_c)
-        if len(diffs) > 0:
-            S = np.std(diffs)
-            if S > 0:
-                y = diffs - np.mean(diffs)
-                Z = np.cumsum(y)
-                R = np.max(Z) - np.min(Z)
-                if R > 0:
-                    hurst_arr[j] = np.clip(np.log(R / S) / np.log(window_h), 0.0, 1.0)
+    # Phase 2 of the selective Julia migration: precompute the per-bar
+    # backtest gate state in Julia while keeping a Python reference path.
+    bar_state = (
+        compute_backtest_bar_state_fast(
+            close_arr,
+            prob_array,
+            atr_arr,
+            z_arr,
+            next_hour_arr,
+            window_h=100,
+            default_hurst=0.5,
+            conf_threshold=conf_threshold,
+            shock_z_abs=2.5,
+            min_hurst=0.45,
+            eod_gate_hour=eod_gate_hour,
+        )
+        if use_julia_bar_state
+        else _precompute_backtest_bar_state_python(
+            close_arr,
+            prob_array,
+            atr_arr,
+            z_arr,
+            next_hour_arr,
+            window_h=100,
+            default_hurst=0.5,
+            conf_threshold=conf_threshold,
+            shock_z_abs=2.5,
+            min_hurst=0.45,
+            eod_gate_hour=eod_gate_hour,
+        )
+    )
+    confidence_arr = bar_state["confidence"]
+    direction_long_arr = bar_state["direction_long"]
+    skip_code_arr = bar_state["skip_code"]
 
     i = 0
     while i < len(df) - 1:
-        current_time = pd.to_datetime(time_arr[i])
+        current_time = time_dt[i]
         current_atr = atr_arr[i]
         equity_curve.append(equity)
         time_curve.append(current_time)
 
-        proba_up = prob_array[i]
-        proba_up_1d = float("nan")  # no separate 1D model in TOON v4.0
-
-        if not np.isfinite(proba_up):
+        skip_code = int(skip_code_arr[i])
+        if skip_code == SKIP_NO_PREDICTION:
             no_prediction_bars += 1
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
             i += 1
             continue
 
-        # Continuous Regressor Confidence
-        confidence = max(proba_up, 1.0 - proba_up)
-        current_hurst = hurst_arr[i]
-
-        # 0. EOD Session Block (Neutralizes negative EOD gap-against expectancy)
-        # Gate on the ENTRY bar (i+1), not the signal bar (i), to close the
-        # 13:00-signal → 14:00-execution temporal leak.
-        next_time = pd.to_datetime(time_arr[i + 1])
-        if next_time.hour >= eod_gate_hour:
-            peak_equity = max(peak_equity, equity)
-            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
-            i += 1
-            continue
-
-        if confidence < conf_threshold:
-            peak_equity = max(peak_equity, equity)
-            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
-            i += 1
-            continue
-
-        if not np.isfinite(current_atr) or current_atr <= 0:
-            i += 1
-            continue
-
-        # 1. The Thermodynamic Shock Gate (Blocks Structural Liquidation/Euphoria Extremes)
-        current_z = z_arr[i]
-        if np.isfinite(current_z) and abs(current_z) > 2.5:
+        if skip_code == SKIP_SHOCK:
             shock_blocks += 1
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
             i += 1
             continue
-
-        # 2. The Thermodynamic Hurst Gate (Blocks Anti-persistent Noise)
-        if not np.isfinite(current_hurst) or current_hurst < 0.45:
+        if skip_code == SKIP_LOW_HURST:
             volatility_blocks += 1
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
             i += 1
             continue
+        if skip_code != SKIP_OK:
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
 
-        direction = "LONG" if proba_up > 0.5 else "SHORT"
+        confidence = float(confidence_arr[i])
+        direction = "LONG" if direction_long_arr[i] else "SHORT"
 
         risk_dollar = (initial_capital if fixed_risk else equity) * risk_pct
         trade_plan = predict_trade_plan(
@@ -348,8 +453,6 @@ def generate_report(results, metrics, symbol, save_path):
     axis_line_color = "#444444"
     accent_color_1 = "#00d4ff"
     accent_color_2 = "#00ff88"
-    accent_color_3 = "#ff6b6b"
-
     # -- Eq Curve panel --
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.set_facecolor(dark_bg_color)
@@ -515,6 +618,12 @@ def main():
         )
     except ValueError:
         return
+
+    df_1h = fib_structural_basis(
+        df_1h,
+        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
+        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
+    )
 
     # Step 1: compute atr14 labelling scaffold (used for volatility gate only,
     #         not as a model input)

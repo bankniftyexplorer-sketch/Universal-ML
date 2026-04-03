@@ -23,6 +23,7 @@ import pandas as pd
 # One-time Julia / ToonMath initialisation
 # ─────────────────────────────────────────────────────────────
 
+
 def _init_julia():
     """
     Load juliacall and include ToonMath.jl exactly once per process.
@@ -40,14 +41,14 @@ def _init_julia():
 
     # Locate ToonMath.jl next to this bridge file
     _bridge_dir = pathlib.Path(__file__).parent.resolve()
-    _toon_path  = _bridge_dir / "ToonMath.jl"
+    _toon_path = _bridge_dir / "ToonMath.jl"
     if not _toon_path.exists():
         raise FileNotFoundError(f"ToonMath.jl not found at {_toon_path}")
 
     jl.seval(f'include("{_toon_path.as_posix()}")')
     jl.seval("using .ToonMath")
 
-    _jl       = jl
+    _jl = jl
     _ToonMath = jl.ToonMath
     return _jl, _ToonMath
 
@@ -55,6 +56,7 @@ def _init_julia():
 # ─────────────────────────────────────────────────────────────
 # INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────
+
 
 def _to_f64(arr: np.ndarray) -> np.ndarray:
     """Ensure contiguous float64 array (zero-copy if already correct dtype+order)."""
@@ -90,23 +92,57 @@ def _extract_ohlcv(df: pd.DataFrame) -> tuple[np.ndarray, ...]:
 
 
 _THERMO_COLS = (
-    "basis_pct", "basis_z_score", "basis_vel_5", "basis_vel_10",
-    "session_time_pos", "eod_basis_momentum",
+    "basis_pct",
+    "basis_z_score",
+    "basis_vel_5",
+    "basis_vel_10",
+    "session_time_pos",
+    "eod_basis_momentum",
 )
+_FIB_SLOTS = ("a", "b", "c")
+_FIB_FIELDS = (
+    "close_pos",
+    "zone",
+    "wick_rej_bull",
+    "wick_rej_bear",
+    "body_acc",
+    "ext_pct",
+)
+_FIB_ALL_COLS = tuple(
+    f"fib_{slot}_{field}" for slot in _FIB_SLOTS for field in _FIB_FIELDS
+)
+_THERMO_NT_FIELDS = (
+    "basis_pct",
+    "basis_z",
+    "basis_v5",
+    "basis_v10",
+    "session_pos",
+    "eod_momentum",
+    *_FIB_ALL_COLS,
+)
+
 
 def _build_thermo(df: pd.DataFrame, n: int):
     """
-    Build thermo NamedTuple for Julia if all thermodynamic columns exist.
+    Build thermo NamedTuple for Julia if all base thermodynamic columns exist.
     Returns None otherwise (Julia side checks for `nothing`).
+
+    Fib columns are included when present and zero-filled when absent so the
+    Julia DNA layer can keep a stable field contract across training and
+    inference paths.
     """
     if not all(c in df.columns for c in _THERMO_COLS):
         return None
 
     jl, _ = _init_julia()
-    thermo_namedtuple = jl.seval(
-        "(basis_pct, basis_z, basis_v5, basis_v10, session_pos, eod_momentum) -> "
-        "(; basis_pct, basis_z, basis_v5, basis_v10, session_pos, eod_momentum)"
-    )
+    field_sig = ", ".join(_THERMO_NT_FIELDS)
+    thermo_namedtuple = jl.seval(f"({field_sig}) -> (; {field_sig})")
+
+    def _fib(col: str) -> np.ndarray:
+        if col in df.columns:
+            return _to_f64(df[col].to_numpy()[:n])
+        return np.zeros(n, dtype=np.float64)
+
     return thermo_namedtuple(
         _to_f64(df["basis_pct"].to_numpy()[:n]),
         _to_f64(df["basis_z_score"].to_numpy()[:n]),
@@ -114,6 +150,7 @@ def _build_thermo(df: pd.DataFrame, n: int):
         _to_f64(df["basis_vel_10"].to_numpy()[:n]),
         _to_f64(df["session_time_pos"].to_numpy()[:n]),
         _to_f64(df["eod_basis_momentum"].to_numpy()[:n]),
+        *[_fib(col) for col in _FIB_ALL_COLS],
     )
 
 
@@ -131,9 +168,72 @@ def _jl_dict_to_df(jl_dict, index: pd.Index) -> pd.DataFrame:
     return pd.DataFrame(py_dict, index=index)
 
 
+def compute_hurst_fast(
+    close_arr: np.ndarray | pd.Series,
+    window_h: int = 100,
+    default_value: float = 0.5,
+) -> np.ndarray:
+    """
+    Compute the backtest Hurst-style volatility filter in Julia.
+
+    This is a parity-first bridge for the existing Python logic in
+    `backtest_engine.run_backtest()`, not a new signal definition.
+    """
+    _, TM = _init_julia()
+    closes = _to_f64(np.asarray(close_arr))
+    result = TM.compute_hurst_series(
+        closes,
+        window_h=int(window_h),
+        default_value=float(default_value),
+    )
+    return np.array(result, dtype=np.float64)
+
+
+def compute_backtest_bar_state_fast(
+    close_arr: np.ndarray | pd.Series,
+    prob_arr: np.ndarray | pd.Series,
+    atr_arr: np.ndarray | pd.Series,
+    z_arr: np.ndarray | pd.Series,
+    next_hour_arr: np.ndarray | pd.Series,
+    window_h: int = 100,
+    default_hurst: float = 0.5,
+    conf_threshold: float = 0.56,
+    shock_z_abs: float = 2.5,
+    min_hurst: float = 0.45,
+    eod_gate_hour: int = 14,
+) -> dict[str, np.ndarray]:
+    """
+    Precompute the backtest bar-state arrays in Julia.
+
+    This bundles the current Python gate logic into a parity-first helper so
+    the Python loop can focus on trade-plan prediction and execution.
+    """
+    _, TM = _init_julia()
+    result = TM.compute_backtest_bar_state(
+        _to_f64(np.asarray(close_arr)),
+        _to_f64(np.asarray(prob_arr)),
+        _to_f64(np.asarray(atr_arr)),
+        _to_f64(np.asarray(z_arr)),
+        _to_i64(np.asarray(next_hour_arr)),
+        window_h=int(window_h),
+        default_hurst=float(default_hurst),
+        conf_threshold=float(conf_threshold),
+        shock_z_abs=float(shock_z_abs),
+        min_hurst=float(min_hurst),
+        eod_gate_hour=int(eod_gate_hour),
+    )
+    return {
+        "hurst": np.array(result.hurst, dtype=np.float64),
+        "confidence": np.array(result.confidence, dtype=np.float64),
+        "direction_long": np.array(result.direction_long, dtype=bool),
+        "skip_code": np.array(result.skip_code, dtype=np.int64),
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # PUBLIC API: holographic_feature_engine_fast
 # ─────────────────────────────────────────────────────────────
+
 
 def holographic_feature_engine_fast(
     df_1h: pd.DataFrame,
@@ -170,13 +270,13 @@ def holographic_feature_engine_fast(
     # Higher-TF arrays — pass empty sentinel vectors if not provided
     def _htf(df: pd.DataFrame | None):
         if df is None or len(df) < 3:
-            empty_f  = np.empty(0, dtype=np.float64)
-            empty_i  = np.empty(0, dtype=np.int64)
+            empty_f = np.empty(0, dtype=np.float64)
+            empty_i = np.empty(0, dtype=np.int64)
             return empty_i, empty_f, empty_f, empty_f, empty_f, empty_f
         src = df.sort_values("time").reset_index(drop=True)
         t = _times_to_ns(src["time"])
-        o, h, l, c, v = _extract_ohlcv(src)
-        return t, o, h, l, c, v
+        o, h, lo, c, v = _extract_ohlcv(src)
+        return t, o, h, lo, c, v
 
     t_1d, o_1d, h_1d, l_1d, c_1d, v_1d = _htf(df_1d)
     t_1w, o_1w, h_1w, l_1w, c_1w, v_1w = _htf(df_1w)
@@ -185,10 +285,29 @@ def holographic_feature_engine_fast(
     # Dispatch to Julia — arrays cross the bridge as PyArray (zero-copy)
     jl_result = TM.compute_holographic_features(
         base_times_ns,
-        o_1h, h_1h, l_1h, c_1h, v_1h,
-        t_1d, o_1d, h_1d, l_1d, c_1d, v_1d,
-        t_1w, o_1w, h_1w, l_1w, c_1w, v_1w,
-        t_1m, o_1m, h_1m, l_1m, c_1m, v_1m,
+        o_1h,
+        h_1h,
+        l_1h,
+        c_1h,
+        v_1h,
+        t_1d,
+        o_1d,
+        h_1d,
+        l_1d,
+        c_1d,
+        v_1d,
+        t_1w,
+        o_1w,
+        h_1w,
+        l_1w,
+        c_1w,
+        v_1w,
+        t_1m,
+        o_1m,
+        h_1m,
+        l_1m,
+        c_1m,
+        v_1m,
         thermo_1h=thermo_1h if thermo_1h is not None else jl.nothing,
     )
 
@@ -197,6 +316,7 @@ def holographic_feature_engine_fast(
     # Attach new columns only (do not overwrite existing OHLCV/time)
     new_cols = [c for c in feat_df.columns if c not in df_1h.columns]
     return pd.concat([df_1h, feat_df[new_cols]], axis=1)
+
 
 def holographic_feature_engine_daily(
     df_1d: pd.DataFrame,
@@ -225,10 +345,29 @@ def holographic_feature_engine_daily(
 
     jl_result = TM.compute_holographic_features_daily(
         base_times_ns,
-        o_1d, h_1d, l_1d, c_1d, v_1d,
-        t_1w, o_1w, h_1w, l_1w, c_1w, v_1w,
-        t_1m, o_1m, h_1m, l_1m, c_1m, v_1m,
-        t_3m, o_3m, h_3m, l_3m, c_3m, v_3m,
+        o_1d,
+        h_1d,
+        l_1d,
+        c_1d,
+        v_1d,
+        t_1w,
+        o_1w,
+        h_1w,
+        l_1w,
+        c_1w,
+        v_1w,
+        t_1m,
+        o_1m,
+        h_1m,
+        l_1m,
+        c_1m,
+        v_1m,
+        t_3m,
+        o_3m,
+        h_3m,
+        l_3m,
+        c_3m,
+        v_3m,
         thermo_1d=thermo_1d if thermo_1d is not None else jl.nothing,
     )
 
@@ -240,6 +379,7 @@ def holographic_feature_engine_daily(
 # ─────────────────────────────────────────────────────────────
 # PUBLIC API: add_target_fast
 # ─────────────────────────────────────────────────────────────
+
 
 def add_target_fast(
     df: pd.DataFrame,
@@ -273,25 +413,29 @@ def add_target_fast(
 
     df = df.copy()
 
-    opens  = _to_f64(df["open"].to_numpy())
-    highs  = _to_f64(df["high"].to_numpy())
-    lows   = _to_f64(df["low"].to_numpy())
+    opens = _to_f64(df["open"].to_numpy())
+    highs = _to_f64(df["high"].to_numpy())
+    lows = _to_f64(df["low"].to_numpy())
     closes = _to_f64(df["close"].to_numpy())
-    atrs   = _to_f64(df[atr_col].to_numpy())
+    atrs = _to_f64(df[atr_col].to_numpy())
 
     # Dispatch — all arrays are zero-copy PyArray on Julia side
     result = TM.add_target_loop(
-        opens, highs, lows, closes, atrs,
-        atr_mult     = float(atr_mult),
-        horizon      = int(horizon),
-        tp1_r_mult   = 1.0,
-        tp2_r_mult   = 2.0,
-        trail_r_mult = 1.0,
-        fee_pct      = 0.0005,
-        slippage_bps = 0.0003,
-        tp1_frac     = 0.50,
-        tp2_frac     = 0.25,
-        runner_frac  = 0.25,
+        opens,
+        highs,
+        lows,
+        closes,
+        atrs,
+        atr_mult=float(atr_mult),
+        horizon=int(horizon),
+        tp1_r_mult=1.0,
+        tp2_r_mult=2.0,
+        trail_r_mult=1.0,
+        fee_pct=0.0005,
+        slippage_bps=0.0003,
+        tp1_frac=0.50,
+        tp2_frac=0.25,
+        runner_frac=0.25,
     )
 
     # Unpack NamedTuple fields — np.array() copies from Julia heap once,
@@ -299,19 +443,19 @@ def add_target_fast(
     def _col(name: str) -> np.ndarray:
         return np.array(getattr(result, name), dtype=np.float64)
 
-    df["target"]               = _col("target")
-    df["next_ret_pct"]         = _col("next_ret_pct")
-    df["bars_to_target"]       = _col("bars_to_target")
+    df["target"] = _col("target")
+    df["next_ret_pct"] = _col("next_ret_pct")
+    df["bars_to_target"] = _col("bars_to_target")
     df["entry_price_next_bar"] = _col("entry_prices")
-    df["target_distance"]      = _col("target_distances")
-    df["long_path_r"]          = _col("long_path_r")
-    df["short_path_r"]         = _col("short_path_r")
-    df["target_edge_r"]        = _col("target_edge_r")
-    df["best_path_r"]          = _col("best_path_r")
-    df["long_mfe_atr"]         = _col("long_mfe_atr")
-    df["long_mae_atr"]         = _col("long_mae_atr")
-    df["short_mfe_atr"]        = _col("short_mfe_atr")
-    df["short_mae_atr"]        = _col("short_mae_atr")
+    df["target_distance"] = _col("target_distances")
+    df["long_path_r"] = _col("long_path_r")
+    df["short_path_r"] = _col("short_path_r")
+    df["target_edge_r"] = _col("target_edge_r")
+    df["best_path_r"] = _col("best_path_r")
+    df["long_mfe_atr"] = _col("long_mfe_atr")
+    df["long_mae_atr"] = _col("long_mae_atr")
+    df["short_mfe_atr"] = _col("short_mfe_atr")
+    df["short_mae_atr"] = _col("short_mae_atr")
 
     if drop_unresolved:
         df = df[df["target"] != 0.5].dropna(subset=["target"]).copy()

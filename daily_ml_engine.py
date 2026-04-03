@@ -27,7 +27,9 @@ from universal_ml_engine import (
     LIVE_CONFIDENCE_THRESHOLD,
     MODEL_N_JOBS,
     TRADE_PLAN_LABEL_COLS,
+    _FIB_RAW_COLS,
     _compute_atr14,
+    fib_structural_basis,
     inject_thermodynamic_basis,
     migrate_legacy_artifacts,
     predict_next_bar,
@@ -72,7 +74,7 @@ NON_FEATURE_COLS_DAILY = {
     "long_mae_atr",
     "short_mfe_atr",
     "short_mae_atr",
-}
+} | _FIB_RAW_COLS
 
 
 def compute_macro_regime(
@@ -472,6 +474,13 @@ def main() -> None:
     # Daily bars do not carry intraday session meaning; keep inert placeholders.
     df_1d["session_time_pos"] = 0.0
     df_1d["eod_basis_momentum"] = 0.0
+
+    print("  [TOON DAILY] Fibonacci Structural Basis (1W→a, 1M→b, 3M→c)...")
+    df_1d = fib_structural_basis(
+        df_1d,
+        htf_frames={"1W": df_1w, "1M": df_1m, "3M": df_3m},
+        pairs=[("1W", "a"), ("1M", "b"), ("3M", "c")],
+    )
 
     print("  [TOON DAILY] Layer 1: Julia holographic extraction (1D + 1W/1M/3M)...")
     df_1d_labelled = _compute_atr14(df_1d.copy())

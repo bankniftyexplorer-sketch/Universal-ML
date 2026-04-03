@@ -19,6 +19,7 @@ from universal_ml_engine import (
     walk_forward,
     predict_next_bar,
     _compute_atr14,
+    fib_structural_basis,
     migrate_legacy_artifacts,
     resolve_artifact_path,
     MODEL_N_JOBS,
@@ -589,6 +590,12 @@ if __name__ == "__main__":
         )
     except ValueError:
         raise SystemExit(1)
+
+    df_1h = fib_structural_basis(
+        df_1h,
+        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
+        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
+    )
 
     df_1h_labelled = _compute_atr14(df_1h.copy())
     df_full = holographic_feature_engine(

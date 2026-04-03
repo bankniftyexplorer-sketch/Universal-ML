@@ -44,6 +44,23 @@ RUNNER_FRACTION = 0.25
 TRAIL_R_MULT = 1.0
 MIN_LABEL_EDGE_R = 0.25
 MIN_LABEL_BEST_R = 0.15
+# ─────────────────────────────────────────────
+# FIBONACCI STRUCTURAL BASIS CONSTANTS
+# ─────────────────────────────────────────────
+FIB_RATIOS = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
+FIB_ATR_PROMINENCE = 0.5
+_FIB_RAW_COLS = frozenset(
+    f"fib_{slot}_{field}"
+    for slot in ("a", "b", "c")
+    for field in (
+        "close_pos",
+        "zone",
+        "wick_rej_bull",
+        "wick_rej_bear",
+        "body_acc",
+        "ext_pct",
+    )
+)
 EXEC_FEE_PCT = 0.0005
 EXEC_SLIPPAGE_BPS = 0.0003
 TIME_COL_CANDIDATES = (
@@ -64,6 +81,49 @@ TRADE_PLAN_LABEL_COLS = (
     "short_mfe_atr",
     "short_mae_atr",
 )
+NON_FEATURE_COLS_SET = frozenset(
+    {
+        "time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "atr14",
+        "basis_pct",
+        "basis_z_score",
+        "basis_vel_5",
+        "basis_vel_10",
+        "target",
+        "next_ret_pct",
+        "bars_to_target",
+        "entry_price_next_bar",
+        "target_distance",
+        "long_path_r",
+        "short_path_r",
+        "target_edge_r",
+        "best_path_r",
+        "long_mfe_atr",
+        "long_mae_atr",
+        "short_mfe_atr",
+        "short_mae_atr",
+        "d_open",
+        "d_high",
+        "d_low",
+        "d_close",
+        "d_volume",
+        "w_open",
+        "w_high",
+        "w_low",
+        "w_close",
+        "w_volume",
+        "m_open",
+        "m_high",
+        "m_low",
+        "m_close",
+        "m_volume",
+    }
+) | _FIB_RAW_COLS
 
 # ─────────────────────────────────────────────
 # 1. PARSER  (handles Indian comma-formatted numbers)
@@ -1500,6 +1560,143 @@ def inject_thermodynamic_basis(
     return merged
 
 
+def fib_structural_basis(
+    df_ltf: pd.DataFrame,
+    htf_frames: dict[str, pd.DataFrame | None],
+    pairs: list[tuple[str, str]],
+) -> pd.DataFrame:
+    """
+    Inject per-bar Fibonacci structural features onto the primary timeframe.
+
+    For each (HTF, slot) pair, the latest qualifying HTF swing high and swing
+    low are detected in real price space, merged backward onto the LTF bars,
+    and converted into six structural interaction columns.
+    """
+    result = df_ltf.sort_values("time").reset_index(drop=True).copy()
+    fib_ratios = np.array(FIB_RATIOS, dtype=np.float64)
+
+    def _write_defaults(prefix: str) -> None:
+        result[f"{prefix}_close_pos"] = 0.5
+        result[f"{prefix}_zone"] = 3.0
+        result[f"{prefix}_wick_rej_bull"] = 0.0
+        result[f"{prefix}_wick_rej_bear"] = 0.0
+        result[f"{prefix}_body_acc"] = 0.0
+        result[f"{prefix}_ext_pct"] = 0.0
+
+    for htf_key, slot in pairs:
+        prefix = f"fib_{slot}"
+        df_htf = htf_frames.get(htf_key)
+        if df_htf is None or df_htf.empty or len(df_htf) < 10:
+            _write_defaults(prefix)
+            continue
+
+        htf = df_htf.sort_values("time").reset_index(drop=True).copy()
+        prev_close = htf["close"].shift(1).fillna(htf["close"])
+        true_range = np.maximum(
+            htf["high"] - htf["low"],
+            np.maximum(
+                np.abs(htf["high"] - prev_close),
+                np.abs(htf["low"] - prev_close),
+            ),
+        )
+        atr14 = true_range.rolling(14).mean().fillna(true_range).to_numpy(dtype=float)
+        highs = htf["high"].to_numpy(dtype=float)
+        lows = htf["low"].to_numpy(dtype=float)
+        n_htf = len(htf)
+
+        swing_highs: list[tuple[int, float]] = []
+        swing_lows: list[tuple[int, float]] = []
+        for j in range(1, n_htf - 1):
+            if (
+                highs[j] > highs[j - 1]
+                and highs[j] > highs[j + 1]
+                and (highs[j] - max(highs[j - 1], highs[j + 1]))
+                >= FIB_ATR_PROMINENCE * atr14[j]
+            ):
+                swing_highs.append((j, highs[j]))
+            if (
+                lows[j] < lows[j - 1]
+                and lows[j] < lows[j + 1]
+                and (min(lows[j - 1], lows[j + 1]) - lows[j])
+                >= FIB_ATR_PROMINENCE * atr14[j]
+            ):
+                swing_lows.append((j, lows[j]))
+
+        fib_swing_low = np.full(n_htf, np.nan, dtype=float)
+        fib_swing_high = np.full(n_htf, np.nan, dtype=float)
+
+        if swing_highs and swing_lows:
+            sh_idx = np.array([idx for idx, _ in swing_highs], dtype=int)
+            sh_price = np.array([price for _, price in swing_highs], dtype=float)
+            sl_idx = np.array([idx for idx, _ in swing_lows], dtype=int)
+            sl_price = np.array([price for _, price in swing_lows], dtype=float)
+            bars = np.arange(n_htf, dtype=int)
+
+            sh_pos = np.searchsorted(sh_idx, bars, side="left") - 1
+            sl_pos = np.searchsorted(sl_idx, bars, side="left") - 1
+
+            valid_h = sh_pos >= 0
+            valid_l = sl_pos >= 0
+            valid = valid_h & valid_l
+            if np.any(valid):
+                last_high = np.full(n_htf, np.nan, dtype=float)
+                last_low = np.full(n_htf, np.nan, dtype=float)
+                last_high[valid_h] = sh_price[sh_pos[valid_h]]
+                last_low[valid_l] = sl_price[sl_pos[valid_l]]
+                non_degenerate = valid & (last_high > last_low)
+                fib_swing_low[non_degenerate] = last_low[non_degenerate]
+                fib_swing_high[non_degenerate] = last_high[non_degenerate]
+
+        merged = pd.merge_asof(
+            result[["time", "open", "high", "low", "close"]].sort_values("time"),
+            pd.DataFrame(
+                {
+                    "time": htf["time"],
+                    "fib_swing_low": fib_swing_low,
+                    "fib_swing_high": fib_swing_high,
+                }
+            ).sort_values("time"),
+            on="time",
+            direction="backward",
+        ).reset_index(drop=True)
+
+        close_vals = merged["close"].to_numpy(dtype=float)
+        fib_low = merged["fib_swing_low"].to_numpy(dtype=float)
+        fib_high = merged["fib_swing_high"].to_numpy(dtype=float)
+        fib_low = np.where(np.isnan(fib_low), close_vals * 0.97, fib_low)
+        fib_high = np.where(np.isnan(fib_high), close_vals * 1.03, fib_high)
+        fib_range = np.where((fib_high - fib_low) < 1e-9, 1e-9, fib_high - fib_low)
+
+        ltf_open = merged["open"].to_numpy(dtype=float)
+        ltf_high = merged["high"].to_numpy(dtype=float)
+        ltf_low = merged["low"].to_numpy(dtype=float)
+        ltf_close = merged["close"].to_numpy(dtype=float)
+
+        close_pos = (ltf_close - fib_low) / fib_range
+        zone = np.searchsorted(fib_ratios, close_pos, side="left").astype(float)
+        zone = np.clip(zone, 0.0, float(len(fib_ratios)))
+
+        level_prices = fib_low[:, None] + fib_range[:, None] * fib_ratios[None, :]
+        nearest_idx = np.argmin(np.abs(level_prices - ltf_close[:, None]), axis=1)
+        nearest_level = level_prices[np.arange(len(ltf_close)), nearest_idx]
+
+        wick_rej_bull = ((ltf_low < nearest_level) & (ltf_close >= nearest_level)).astype(float)
+        wick_rej_bear = ((ltf_high > nearest_level) & (ltf_close <= nearest_level)).astype(float)
+        body_top = np.maximum(ltf_open, ltf_close)
+        body_bot = np.minimum(ltf_open, ltf_close)
+        body_acc = ((body_bot >= nearest_level) | (body_top <= nearest_level)).astype(float)
+        ext_pct = np.maximum(0.0, close_pos - 1.0)
+
+        result[f"{prefix}_close_pos"] = close_pos
+        result[f"{prefix}_zone"] = zone
+        result[f"{prefix}_wick_rej_bull"] = wick_rej_bull
+        result[f"{prefix}_wick_rej_bear"] = wick_rej_bear
+        result[f"{prefix}_body_acc"] = body_acc
+        result[f"{prefix}_ext_pct"] = ext_pct
+
+    return result
+
+
 def analyze_reference_coverage(
     df_primary: pd.DataFrame, df_reference: pd.DataFrame
 ) -> dict:
@@ -1842,6 +2039,13 @@ if __name__ == "__main__":
     except ValueError:
         exit()
 
+    print("  [TOON] Preparing Fibonacci Structural Basis (1D→a, 1W→b, 1M→c)...")
+    df_1h = fib_structural_basis(
+        df_1h,
+        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
+        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
+    )
+
     # ── Step 1: Compute atr14 on 1H ONLY for labelling scaffold ──────────
     # atr14 is needed by add_target() to set barrier distances.
     # It is NEVER passed as a model input feature.
@@ -1875,48 +2079,7 @@ if __name__ == "__main__":
     # ── Step 5: Identify holographic feature columns ───────────────────────
     # Exclude: raw OHLCV, time, labelling scaffold, target and trade-plan cols.
     # atr14 is excluded here — it was labelling scaffolding only.
-    NON_FEATURE_COLS = {
-        "time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "atr14",  # labelling only
-        "basis_pct",
-        "basis_z_score",
-        "basis_vel_5",
-        "basis_vel_10",  # Thermodynamic state
-        "target",
-        "next_ret_pct",
-        "bars_to_target",
-        "entry_price_next_bar",
-        "target_distance",
-        "long_path_r",
-        "short_path_r",
-        "target_edge_r",
-        "best_path_r",
-        "long_mfe_atr",
-        "long_mae_atr",
-        "short_mfe_atr",
-        "short_mae_atr",
-        # raw higher-TF OHLCV from merge (not holographic)
-        "d_open",
-        "d_high",
-        "d_low",
-        "d_close",
-        "d_volume",
-        "w_open",
-        "w_high",
-        "w_low",
-        "w_close",
-        "w_volume",
-        "m_open",
-        "m_high",
-        "m_low",
-        "m_close",
-        "m_volume",
-    }
+    NON_FEATURE_COLS = set(NON_FEATURE_COLS_SET)
     all_holo_cols = [c for c in df_full.columns if c not in NON_FEATURE_COLS]
 
     # Sanitize: replace inf/nan

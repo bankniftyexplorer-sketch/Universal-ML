@@ -20,6 +20,8 @@ from universal_ml_engine import (
     _compute_atr14,
     merge_higher_tf,
     migrate_legacy_artifacts,
+    fib_structural_basis,
+    NON_FEATURE_COLS_SET,
     predict_next_bar,
     predict_trade_plan,
     resolve_artifact_path,
@@ -111,6 +113,12 @@ def main():
     except ValueError:
         return
 
+    df_1h = fib_structural_basis(
+        df_1h,
+        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
+        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
+    )
+
     df_1h_labelled = _compute_atr14(df_1h.copy())
 
     # ── 5. THE SURGICAL TRUNCATION (CONTEXT ISOLATION) ────────────────────
@@ -127,47 +135,7 @@ def main():
     )
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
 
-    NON_FEATURE_COLS = {
-        "time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "atr14",
-        "basis_pct",
-        "basis_z_score",
-        "basis_vel_5",
-        "basis_vel_10",
-        "target",
-        "next_ret_pct",
-        "bars_to_target",
-        "entry_price_next_bar",
-        "target_distance",
-        "long_path_r",
-        "short_path_r",
-        "target_edge_r",
-        "best_path_r",
-        "long_mfe_atr",
-        "long_mae_atr",
-        "short_mfe_atr",
-        "short_mae_atr",
-        "d_open",
-        "d_high",
-        "d_low",
-        "d_close",
-        "d_volume",
-        "w_open",
-        "w_high",
-        "w_low",
-        "w_close",
-        "w_volume",
-        "m_open",
-        "m_high",
-        "m_low",
-        "m_close",
-        "m_volume",
-    }
+    NON_FEATURE_COLS = set(NON_FEATURE_COLS_SET)
 
     all_holo_cols = [c for c in df_full.columns if c not in NON_FEATURE_COLS]
     state_cols = ["time", "close", "atr14"]

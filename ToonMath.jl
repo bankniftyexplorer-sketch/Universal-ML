@@ -169,19 +169,55 @@ function _dna!(out::Dict{String,Float64}, b, tf::String, w::Int, thermo)
         out[string(p, "_volume_bias")] = vb
 
         if thermo !== nothing
-            out[string(p, "_basis_pct")]  = thermo.basis_pct[k]
-            out[string(p, "_basis_z")]    = thermo.basis_z[k]
-            out[string(p, "_basis_v5")]   = thermo.basis_v5[k]
-            out[string(p, "_basis_v10")]  = thermo.basis_v10[k]
-            out[string(p, "_session_pos")]    = thermo.session_pos[k]
-            out[string(p, "_eod_momentum")]   = thermo.eod_momentum[k]
+            out[string(p, "_basis_pct")] = thermo.basis_pct[k]
+            out[string(p, "_basis_z")] = thermo.basis_z[k]
+            out[string(p, "_basis_v5")] = thermo.basis_v5[k]
+            out[string(p, "_basis_v10")] = thermo.basis_v10[k]
+            out[string(p, "_session_pos")] = thermo.session_pos[k]
+            out[string(p, "_eod_momentum")] = thermo.eod_momentum[k]
+            out[string(p, "_fib_a_close_pos")] = thermo.fib_a_close_pos[k]
+            out[string(p, "_fib_a_zone")] = thermo.fib_a_zone[k]
+            out[string(p, "_fib_a_wick_rej_bull")] = thermo.fib_a_wick_rej_bull[k]
+            out[string(p, "_fib_a_wick_rej_bear")] = thermo.fib_a_wick_rej_bear[k]
+            out[string(p, "_fib_a_body_acc")] = thermo.fib_a_body_acc[k]
+            out[string(p, "_fib_a_ext_pct")] = thermo.fib_a_ext_pct[k]
+            out[string(p, "_fib_b_close_pos")] = thermo.fib_b_close_pos[k]
+            out[string(p, "_fib_b_zone")] = thermo.fib_b_zone[k]
+            out[string(p, "_fib_b_wick_rej_bull")] = thermo.fib_b_wick_rej_bull[k]
+            out[string(p, "_fib_b_wick_rej_bear")] = thermo.fib_b_wick_rej_bear[k]
+            out[string(p, "_fib_b_body_acc")] = thermo.fib_b_body_acc[k]
+            out[string(p, "_fib_b_ext_pct")] = thermo.fib_b_ext_pct[k]
+            out[string(p, "_fib_c_close_pos")] = thermo.fib_c_close_pos[k]
+            out[string(p, "_fib_c_zone")] = thermo.fib_c_zone[k]
+            out[string(p, "_fib_c_wick_rej_bull")] = thermo.fib_c_wick_rej_bull[k]
+            out[string(p, "_fib_c_wick_rej_bear")] = thermo.fib_c_wick_rej_bear[k]
+            out[string(p, "_fib_c_body_acc")] = thermo.fib_c_body_acc[k]
+            out[string(p, "_fib_c_ext_pct")] = thermo.fib_c_ext_pct[k]
         else
-            out[string(p, "_basis_pct")]      = 0.0
-            out[string(p, "_basis_z")]        = 0.0
-            out[string(p, "_basis_v5")]       = 0.0
-            out[string(p, "_basis_v10")]      = 0.0
-            out[string(p, "_session_pos")]    = 0.0
-            out[string(p, "_eod_momentum")]   = 0.0
+            out[string(p, "_basis_pct")] = 0.0
+            out[string(p, "_basis_z")] = 0.0
+            out[string(p, "_basis_v5")] = 0.0
+            out[string(p, "_basis_v10")] = 0.0
+            out[string(p, "_session_pos")] = 0.0
+            out[string(p, "_eod_momentum")] = 0.0
+            out[string(p, "_fib_a_close_pos")] = 0.0
+            out[string(p, "_fib_a_zone")] = 0.0
+            out[string(p, "_fib_a_wick_rej_bull")] = 0.0
+            out[string(p, "_fib_a_wick_rej_bear")] = 0.0
+            out[string(p, "_fib_a_body_acc")] = 0.0
+            out[string(p, "_fib_a_ext_pct")] = 0.0
+            out[string(p, "_fib_b_close_pos")] = 0.0
+            out[string(p, "_fib_b_zone")] = 0.0
+            out[string(p, "_fib_b_wick_rej_bull")] = 0.0
+            out[string(p, "_fib_b_wick_rej_bear")] = 0.0
+            out[string(p, "_fib_b_body_acc")] = 0.0
+            out[string(p, "_fib_b_ext_pct")] = 0.0
+            out[string(p, "_fib_c_close_pos")] = 0.0
+            out[string(p, "_fib_c_zone")] = 0.0
+            out[string(p, "_fib_c_wick_rej_bull")] = 0.0
+            out[string(p, "_fib_c_wick_rej_bear")] = 0.0
+            out[string(p, "_fib_c_body_acc")] = 0.0
+            out[string(p, "_fib_c_ext_pct")] = 0.0
         end
     end
 end
@@ -399,12 +435,30 @@ function _process_tf!(
             if thermo !== nothing
                 slice_range = start_jl:stop_jl
                 thermo_slice = (
-                    basis_pct    = thermo.basis_pct[slice_range],
-                    basis_z      = thermo.basis_z[slice_range],
-                    basis_v5     = thermo.basis_v5[slice_range],
-                    basis_v10    = thermo.basis_v10[slice_range],
-                    session_pos  = thermo.session_pos[slice_range],
+                    basis_pct = thermo.basis_pct[slice_range],
+                    basis_z = thermo.basis_z[slice_range],
+                    basis_v5 = thermo.basis_v5[slice_range],
+                    basis_v10 = thermo.basis_v10[slice_range],
+                    session_pos = thermo.session_pos[slice_range],
                     eod_momentum = thermo.eod_momentum[slice_range],
+                    fib_a_close_pos = thermo.fib_a_close_pos[slice_range],
+                    fib_a_zone = thermo.fib_a_zone[slice_range],
+                    fib_a_wick_rej_bull = thermo.fib_a_wick_rej_bull[slice_range],
+                    fib_a_wick_rej_bear = thermo.fib_a_wick_rej_bear[slice_range],
+                    fib_a_body_acc = thermo.fib_a_body_acc[slice_range],
+                    fib_a_ext_pct = thermo.fib_a_ext_pct[slice_range],
+                    fib_b_close_pos = thermo.fib_b_close_pos[slice_range],
+                    fib_b_zone = thermo.fib_b_zone[slice_range],
+                    fib_b_wick_rej_bull = thermo.fib_b_wick_rej_bull[slice_range],
+                    fib_b_wick_rej_bear = thermo.fib_b_wick_rej_bear[slice_range],
+                    fib_b_body_acc = thermo.fib_b_body_acc[slice_range],
+                    fib_b_ext_pct = thermo.fib_b_ext_pct[slice_range],
+                    fib_c_close_pos = thermo.fib_c_close_pos[slice_range],
+                    fib_c_zone = thermo.fib_c_zone[slice_range],
+                    fib_c_wick_rej_bull = thermo.fib_c_wick_rej_bull[slice_range],
+                    fib_c_wick_rej_bear = thermo.fib_c_wick_rej_bear[slice_range],
+                    fib_c_body_acc = thermo.fib_c_body_acc[slice_range],
+                    fib_c_ext_pct = thermo.fib_c_ext_pct[slice_range],
                 )
             else
                 thermo_slice = nothing
@@ -760,6 +814,160 @@ end
 # ─────────────────────────────────────────────────────────────
 # PUBLIC API: add_target_loop
 # ─────────────────────────────────────────────────────────────
+
+"""
+    compute_hurst_series(closes; window_h=100, default_value=0.5)
+
+Compute the rolling Hurst-style rough-volatility series used by
+`backtest_engine.run_backtest()`.
+
+This mirrors the current Python implementation exactly:
+
+- the first `window_h` slots stay at `default_value`
+- each later slot uses the prior `window_h` closes
+- the result is clipped into `[0.0, 1.0]`
+"""
+function compute_hurst_series(
+    closes::AbstractVector{Float64};
+    window_h::Int = 100,
+    default_value::Float64 = 0.5,
+)::Vector{Float64}
+    src = closes isa Vector{Float64} ? closes : collect(Float64, closes)
+    n = length(src)
+    hurst = fill(default_value, n)
+
+    if window_h < 2 || n <= window_h
+        return hurst
+    end
+
+    diffs = Vector{Float64}(undef, window_h - 1)
+    log_window = log(Float64(window_h))
+
+    @inbounds for out_idx in (window_h + 1):n
+        start_idx = out_idx - window_h
+
+        diff_sum = 0.0
+        for k in 1:(window_h - 1)
+            val = src[start_idx + k] - src[start_idx + k - 1]
+            diffs[k] = val
+            diff_sum += val
+        end
+
+        diff_mean = diff_sum / Float64(window_h - 1)
+
+        var_sum = 0.0
+        for k in 1:(window_h - 1)
+            centered = diffs[k] - diff_mean
+            diffs[k] = centered
+            var_sum += centered * centered
+        end
+
+        s = sqrt(var_sum / Float64(window_h - 1))
+        if s > 0.0
+            z = 0.0
+            z_min = 0.0
+            z_max = 0.0
+
+            for k in 1:(window_h - 1)
+                z += diffs[k]
+                z_min = min(z_min, z)
+                z_max = max(z_max, z)
+            end
+
+            r = z_max - z_min
+            if r > 0.0
+                hurst[out_idx] = clamp(log(r / s) / log_window, 0.0, 1.0)
+            end
+        end
+    end
+
+    return hurst
+end
+
+"""
+    compute_backtest_bar_state(closes, probas, atrs, zscores, next_hours;
+                               window_h=100, default_hurst=0.5,
+                               conf_threshold=0.56, shock_z_abs=2.5,
+                               min_hurst=0.45, eod_gate_hour=14)
+
+Precompute the per-bar backtest state used by `backtest_engine.run_backtest()`.
+
+Skip-code contract:
+- `0`: tradable bar
+- `1`: no prediction
+- `2`: end-of-day gate
+- `3`: low confidence
+- `4`: invalid ATR
+- `5`: thermodynamic shock
+- `6`: low Hurst / anti-persistent noise
+"""
+function compute_backtest_bar_state(
+    closes::AbstractVector{Float64},
+    probas::AbstractVector{Float64},
+    atrs::AbstractVector{Float64},
+    zscores::AbstractVector{Float64},
+    next_hours::AbstractVector{Int64};
+    window_h::Int = 100,
+    default_hurst::Float64 = 0.5,
+    conf_threshold::Float64 = 0.56,
+    shock_z_abs::Float64 = 2.5,
+    min_hurst::Float64 = 0.45,
+    eod_gate_hour::Int = 14,
+)
+    to_f64_vec(v) = v isa Vector{Float64} ? v : collect(Float64, v)
+    to_i64_vec(v) = v isa Vector{Int64} ? v : collect(Int64, v)
+
+    src_closes = to_f64_vec(closes)
+    src_probas = to_f64_vec(probas)
+    src_atrs = to_f64_vec(atrs)
+    src_zscores = to_f64_vec(zscores)
+    src_next_hours = to_i64_vec(next_hours)
+
+    n = length(src_closes)
+    if length(src_probas) != n || length(src_atrs) != n || length(src_zscores) != n || length(src_next_hours) != n
+        throw(ArgumentError("compute_backtest_bar_state inputs must have identical lengths"))
+    end
+
+    hurst = compute_hurst_series(
+        src_closes;
+        window_h = window_h,
+        default_value = default_hurst,
+    )
+    confidence = fill(NaN, n)
+    direction_long = fill(false, n)
+    skip_code = fill(Int64(0), n)
+
+    @inbounds for i in 1:n
+        proba = src_probas[i]
+        if !isfinite(proba)
+            skip_code[i] = 1
+            continue
+        end
+
+        conf = max(proba, 1.0 - proba)
+        confidence[i] = conf
+        direction_long[i] = proba > 0.5
+
+        if src_next_hours[i] >= eod_gate_hour
+            skip_code[i] = 2
+        elseif conf < conf_threshold
+            skip_code[i] = 3
+        elseif !isfinite(src_atrs[i]) || src_atrs[i] <= 0.0
+            skip_code[i] = 4
+        elseif isfinite(src_zscores[i]) && abs(src_zscores[i]) > shock_z_abs
+            skip_code[i] = 5
+        elseif !isfinite(hurst[i]) || hurst[i] < min_hurst
+            skip_code[i] = 6
+        end
+    end
+
+    return (
+        hurst = hurst,
+        confidence = confidence,
+        direction_long = direction_long,
+        skip_code = skip_code,
+    )
+end
 
 """
     add_target_loop(opens, highs, lows, closes, atrs;
