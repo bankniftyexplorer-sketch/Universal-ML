@@ -54,6 +54,7 @@ NON_FEATURE_COLS_DAILY = {
     "close",
     "volume",
     "atr14",
+    "basis_pts",
     "basis_pct",
     "basis_z_score",
     "basis_vel_5",
