@@ -1,7 +1,7 @@
 [project]
 name = "universal-ml"
 version = "0.1.0"
-description = "Add your description here"
+description = "Geometry-driven multi-timeframe trading research and inference stack powered by Python and Julia."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

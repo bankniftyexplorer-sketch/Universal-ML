@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.pkl binary
+*.db binary
+
+*.sh text eol=lf
+*.py text eol=lf
+*.jl text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
