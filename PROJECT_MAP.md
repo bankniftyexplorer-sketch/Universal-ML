@@ -14,15 +14,18 @@ Read this first if you want to understand the system before opening the large en
 - Storage:
   - market data DB: `data_vault/ohlcv.db`
   - per-symbol artifacts: `<PROJECT_ROOT>/<SYMBOL>/`
+  - local accuracy baselines: `<PROJECT_ROOT>/.accuracy_baselines/<SYMBOL>.json`
 - Feature math lives in Julia kernels, called from Python.
 - LightGBM is the model layer.
 - Backtests and live inference reuse saved artifacts instead of rebuilding everything from scratch.
+- Saved-artifact accuracy can be checked without retraining via `accuracy_guardrail.py`.
 
 ## Repo layout
 
 | Path | Role | Read when |
 | --- | --- | --- |
 | `data_vault/vault_engine.py` | CSV ingestion, DB schema, macro timeframe generation, trade ledger | You care about data entering the system |
+| `vault_engine.py` | Root-level compatibility shim that re-exports `DataVault` | A root script imports `vault_engine` directly |
 | `inference_bridge.py` | Reads DB and returns timeframe-indexed pandas stacks | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer | You care about the daily core |
@@ -30,6 +33,7 @@ Read this first if you want to understand the system before opening the large en
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
 | `live_inference.py` | Fast `1H` signal path without retraining | You care about current live signal |
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
+| `accuracy_guardrail.py` | Rebuilds model-ready frames, replays saved OOS maps, compares against a local baseline | You care about proving an update did or did not change saved-artifact accuracy |
 | `holographic_engine.py` | Python reference feature logic and feature-selection pipeline | You care about feature families or selection |
 | `julia_bridge.py` | Python-to-Julia adapter | You care about bridge contracts or array prep |
 | `ToonMath.jl` | Fast feature extraction and target-generation kernels | You care about core math/performance |
@@ -41,7 +45,7 @@ Read this first if you want to understand the system before opening the large en
 
 ### `1H` intraday lane
 
-1. `vault_engine.py` ingests TradingView CSV logs into `market_dna`.
+1. `data_vault/vault_engine.py` ingests TradingView CSV logs into `market_dna`.
 2. `inference_bridge.py` fetches `FUT` and `SPOT` stacks by timeframe.
 3. `universal_ml_engine.prepare_intraday_thermodynamics()` builds the shared intraday state:
    - `FUT 1H` is the tradable timeline
@@ -56,10 +60,11 @@ Read this first if you want to understand the system before opening the large en
 9. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation.
 10. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme.
 11. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reload the saved artifacts and reuse the same prep contract.
+12. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map without retraining.
 
 ### `1D` daily lane
 
-1. `vault_engine.py` ingests raw bars and also generates `1W`, `1M`, `3M`, `6M`, `12M` macro layers from `1D`.
+1. `data_vault/vault_engine.py` ingests raw bars and also generates `1W`, `1M`, `3M`, `6M`, `12M` macro layers from `1D`.
 2. `daily_ml_engine.py` chooses primary `1D` bars:
    - prefer `FUT 1D`
    - fallback to `SPOT 1D`
@@ -74,6 +79,7 @@ Read this first if you want to understand the system before opening the large en
 9. `feature_selection_pipeline()` plus `walk_forward_daily()` validate and train the final `1D` model.
 10. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme.
 11. `daily_backtest_engine.py` reconstructs the feature space and replays the saved `1D` model.
+12. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map without retraining.
 
 ## Data contracts
 
@@ -118,9 +124,21 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1D_ml_report.png`
 - `{symbol}_1D_backtest_report.png`
 
+### Local verification baselines
+
+- `.accuracy_baselines/{SYMBOL}.json`
+- local only; intentionally not committed
+- stores:
+  - saved-artifact hashes and mtimes
+  - split-level accuracy metrics
+  - OOS coverage
+  - edge over baseline
+  - enough identity data for `compare` to report `SAME RUN` vs `DIFFERENT RUN`
+
 ## Module dependencies
 
-- `vault_engine.py` writes the database.
+- `data_vault/vault_engine.py` writes the database.
+- root scripts may import `vault_engine.py`, which is a compatibility shim over `data_vault/vault_engine.py`.
 - `inference_bridge.py` reads the database.
 - `universal_ml_engine.py` and `daily_ml_engine.py` are the training roots.
 - `julia_bridge.py` is the adapter into `ToonMath.jl`.
@@ -128,12 +146,14 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `backtest_engine.py` and `daily_backtest_engine.py` depend on saved model artifacts.
 - `live_inference.py` depends on saved `1H` artifacts and the latest DB state.
 - `meta_strategy_selector.py` depends on the same reconstructed feature space as the `1H` lane.
+- `accuracy_guardrail.py` depends on the same DB + feature-prep contracts as the training roots, but does not retrain models.
 
 ## Fast read order for another AI
 
 If you need:
 
 - operating commands: read `LAUNCH_INSTRUCTIONS.md`
+- saved-artifact accuracy verification: read `accuracy_guardrail.py`, then `LAUNCH_INSTRUCTIONS.md`
 - architecture: read this file
 - DB and ingestion: read `data_vault/vault_engine.py`, then `inference_bridge.py`
 - `1H` training behavior: read `universal_ml_engine.py`
@@ -150,6 +170,7 @@ If you need:
 - `shadow_brain.py` unless you are using the optional trade-history veto layer
 - `Manifest.toml` unless you are debugging Julia package resolution
 - generated symbol folders unless you need model outputs
+- `.accuracy_baselines/` unless you are auditing drift against a saved baseline
 
 ## Current design truths
 
@@ -158,3 +179,7 @@ If you need:
 - The DB is the source of truth for market history.
 - Julia does the heavy numerical work; Python orchestrates data flow, model training, reporting, and file management.
 - There is no formal unit-test suite; confidence comes from walk-forward validation, saved OOS probability maps, and backtest reports.
+- `accuracy_guardrail.py` is the machine-facing safety layer around the saved artifacts and reports.
+- `compare` can tell you two different truths:
+  - `SAME RUN`: the tracked artifact hashes match the captured baseline
+  - `DIFFERENT RUN`: the artifacts have changed, even if the metrics are still acceptable

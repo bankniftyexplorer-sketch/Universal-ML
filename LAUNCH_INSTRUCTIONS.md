@@ -7,6 +7,11 @@ This project has two active model lanes:
 - `1H` intraday model
 - `1D` daily model
 
+Current operational safety layer:
+
+- `accuracy_guardrail.py` can validate saved-artifact accuracy without retraining
+- `vault_engine.py` at the repo root is an import-compatibility shim, not the canonical ingestion entrypoint
+
 The database lives at:
 
 - `/home/km/Universal-ML/data_vault/ohlcv.db`
@@ -64,6 +69,8 @@ Important:
 - Only ingest fully closed bars.
 - Do not ingest partial `1H` candles if you want clean predictions.
 - Do not ingest partial daily candles if you want clean `1D` predictions.
+- Use `data_vault/vault_engine.py` for ingestion.
+- The root-level `vault_engine.py` exists only to keep older imports stable in runtime scripts.
 
 ---
 
@@ -185,15 +192,54 @@ Later, compare the current repo state against that baseline:
 python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
+Lane-specific examples:
+
+```bash
+python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1H
+python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1H
+
+python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1D
+python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1D
+```
+
 What this checks:
 
 - rebuilds the model-ready `1H` and `1D` frames from the database
 - replays the saved OOS probability maps against the real target series
 - fails if accuracy, high-confidence accuracy, edge over baseline, or OOS
   coverage regresses
+- compares tracked artifact hashes for:
+  - model
+  - features
+  - OOS probability map
+  - trade-plan models
+  - ML report
+  - backtest report
 
 This is the safest first check before trusting refactors, optimizations, or
 runtime changes.
+
+Outputs to understand:
+
+- `SAME RUN`:
+  - the tracked artifact hashes match the captured baseline
+- `DIFFERENT RUN`:
+  - one or more tracked artifacts changed since the baseline was captured
+- `PASS`:
+  - the current state did not regress the guarded metrics versus the baseline
+- `FAIL`:
+  - one or more guarded metrics regressed
+
+Where the baseline is stored:
+
+- `.accuracy_baselines/<SYMBOL>.json`
+- local only, intentionally ignored by git
+
+Important limitation:
+
+- the guardrail compares the current artifact + current DB state to a saved baseline
+- it is a regression checker, not a historical time machine
+- if the DB changed after an old PNG was generated, the guardrail may not recreate that old historical moment exactly
 
 ---
 
@@ -211,6 +257,7 @@ python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 ### If you only want the latest `1H` signal during the day
@@ -270,6 +317,7 @@ For retraining:
   - optionally run `daily_backtest_engine.py`
   - run `universal_ml_engine.py`
   - optionally run `backtest_engine.py`
+  - run `accuracy_guardrail.py compare` if you want a strict saved-artifact drift check
 
 ---
 
