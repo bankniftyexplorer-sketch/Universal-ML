@@ -462,7 +462,7 @@ def phase1_ranking(
                max_depth=PHASE1_MAX_DEPTH, min_child_samples=30,
                subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
                reg_alpha=0.1, reg_lambda=0.1, random_state=42,
-               n_jobs=4, verbose=-1, objective='binary')
+               n_jobs=4, verbose=-1, objective='regression', metric='mae')
 
     imp_sum = np.zeros(len(valid))
     folds_ok = 0
@@ -472,13 +472,13 @@ def phase1_ranking(
         Yt = clean[target_col].iloc[:te]
         if len(Yt.unique()) < 2:
             continue
-        m = lgb.LGBMClassifier(**cfg)
+        m = lgb.LGBMRegressor(**cfg)
         try:
             m.fit(Xt, Yt)
             imp_sum += m.feature_importances_
             folds_ok += 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [HOLO] Phase 1 Fold {f} failed with exception: {e}")
 
     if folds_ok == 0:
         return valid
