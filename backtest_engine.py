@@ -30,6 +30,7 @@ from universal_ml_engine import (
 from julia_bridge import (
     compute_backtest_bar_state_fast,
     holographic_feature_engine_fast as holographic_feature_engine,
+    smc_feature_engine_fast,
 )
 
 EOD_GATE_HOUR = 14  # IST. Set to 24 for 24/7 crypto.
@@ -636,6 +637,11 @@ def main():
         df_1w=df_1w,
         df_1m=df_1m,
     )
+
+    # Step 2b: SMC institutional intent features
+    smc_df = smc_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
 
     # Step 3: ASOF-merge for temporal alignment
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)

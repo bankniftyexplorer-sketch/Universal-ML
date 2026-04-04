@@ -28,17 +28,26 @@ From the project root:
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
+uv sync --locked
+uv run python -V
+uv run python -c "import juliacall"
+uv run ruff --version
+julia --version
 ```
 
-If the environment is missing:
+Optional interactive shell activation:
 
 ```bash
-cd /home/km/Universal-ML
-python3 -m venv mlenv
-source mlenv/bin/activate
-pip install -r requirements.txt
+source .venv/bin/activate
 ```
+
+Environment truths:
+
+- the repo is managed with `uv`
+- the active environment is `.venv`
+- `pyproject.toml` and `uv.lock` are the authoritative Python environment source
+- `requirements.txt` is a legacy fallback mirror, not the standard setup path
+- `juliacall` is required for `julia_bridge.py`
 
 ---
 
@@ -51,9 +60,8 @@ Put new TradingView CSV exports into:
 Then ingest them:
 
 ```bash
-cd /home/km/Universal-ML/data_vault
-source ../mlenv/bin/activate
-python vault_engine.py
+cd /home/km/Universal-ML
+uv run python data_vault/vault_engine.py
 ```
 
 What this does:
@@ -80,14 +88,13 @@ Train the `1D` model:
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
-python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Run the `1D` backtest report:
 
 ```bash
-python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Main `1D` output files for `NIFTY`:
@@ -112,14 +119,13 @@ Train the `1H` model:
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
-python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Run the standalone `1H` backtest report:
 
 ```bash
-python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Main `1H` output files for `NIFTY`:
@@ -144,8 +150,7 @@ If the model is already trained and the database is up to date:
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
-python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Use this when:
@@ -168,8 +173,7 @@ For `1D`, the active path is:
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
-python meta_strategy_selector.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python meta_strategy_selector.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Use this only if you want the strategy-comparison verdict layer.
@@ -182,24 +186,23 @@ Capture the current saved-artifact baseline:
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
-python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Later, compare the current repo state against that baseline:
 
 ```bash
-python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Lane-specific examples:
 
 ```bash
-python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1H
-python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1H
+uv run python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1H
+uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1H
 
-python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1D
-python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1D
+uv run python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1D
+uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/ --lane 1D
 ```
 
 What this checks:
@@ -248,27 +251,21 @@ Important limitation:
 ### If you want both `1H` and `1D` up to date
 
 ```bash
-cd /home/km/Universal-ML/data_vault
-source ../mlenv/bin/activate
-python vault_engine.py
-
 cd /home/km/Universal-ML
-python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python data_vault/vault_engine.py
+uv run python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 ### If you only want the latest `1H` signal during the day
 
 ```bash
-cd /home/km/Universal-ML/data_vault
-source ../mlenv/bin/activate
-python vault_engine.py
-
 cd /home/km/Universal-ML
-python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python data_vault/vault_engine.py
+uv run python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 ---

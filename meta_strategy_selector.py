@@ -26,7 +26,10 @@ from universal_ml_engine import (
     LIVE_CONFIDENCE_THRESHOLD,
     BARRIER_HORIZON_BARS,
 )
-from julia_bridge import holographic_feature_engine_fast as holographic_feature_engine
+from julia_bridge import (
+    holographic_feature_engine_fast as holographic_feature_engine,
+    smc_feature_engine_fast,
+)
 from holographic_engine import feature_selection_pipeline
 from backtest_engine import run_backtest, calculate_metrics
 
@@ -158,12 +161,19 @@ def run_strategy_zoo(
             ume.BARRIER_ATR_MULT = original_atr_mult
 
         df_copy = df_copy.dropna(subset=["target"]).copy()
+        if "target_edge_r" in df_copy.columns:
+            edge_r = (
+                df_copy["target_edge_r"]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+            )
+            df_copy = df_copy.loc[edge_r >= min_edge_r].copy()
         if df_copy.empty:
             print(f"  [Meta] [Zoo] {key} produced no resolved labels.")
             zoo_results[key] = {"oos_proba_map": {}, "feature_cols": [], "df": df_copy}
             continue
 
-        df_copy["target"] = df_copy["target"].astype(int)
+        df_copy["target"] = df_copy["target"].astype(float)
         all_holo_cols = [c for c in df_copy.columns if c not in NON_FEATURE_COLS]
 
         if not all_holo_cols:
@@ -604,6 +614,9 @@ if __name__ == "__main__":
         df_1w=df_1w.copy(),
         df_1m=df_1m.copy(),
     )
+    smc_df = smc_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
     df_full = merge_higher_tf(df_full.copy(), df_1d.copy(), df_1w.copy(), df_1m.copy())
     if "atr14" not in df_full.columns:
         df_full = _compute_atr14(df_full.copy())

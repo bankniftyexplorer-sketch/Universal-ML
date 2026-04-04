@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from backtest_engine import calculate_metrics, generate_report, run_backtest
-from julia_bridge import holographic_feature_engine_daily
+from julia_bridge import holographic_feature_engine_daily, smc_feature_engine_daily
 from universal_ml_engine import (
     _compute_atr14,
     fib_structural_basis,
@@ -150,6 +150,10 @@ def main() -> None:
 
     df_1d_labelled = _compute_atr14(df_1d.copy())
     df_full = holographic_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_3m)
+
+    smc_df = smc_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
 
     from daily_ml_engine import add_daily_confluence, inject_macro_regime
 

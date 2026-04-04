@@ -22,6 +22,7 @@ import matplotlib.gridspec as gridspec
 
 from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
+    smc_feature_engine_fast,
     add_target_fast as add_target,
 )
 from holographic_engine import (
@@ -1359,13 +1360,16 @@ def save_report(
 
         # Get dynamic symbol from pred_info or default to BANKNIFTY
         symbol_display = pred_info.get("symbol", "BANKNIFTY").upper()
+        forecast_label = pred_info.get(
+            "forecast_label", "1H FORECAST (EXECUTION-ALIGNED)"
+        )
         note_line = (
             f"  Filter Note : {pred_info['note']}\n" if pred_info.get("note") else ""
         )
 
         report_text = (
             f"======================================================================\n"
-            f"  {symbol_display} 1H FORECAST (EXECUTION-ALIGNED)\n"
+            f"  {symbol_display} {forecast_label}\n"
             f"======================================================================\n"
             f"  Bar time    : {pred_info['time']}\n"
             f"  Direction   : {pred_info['dir']}\n"
@@ -2062,6 +2066,13 @@ if __name__ == "__main__":
         df_1w=df_1w,
         df_1m=df_1m,
     )
+
+    # ── Step 2b: SMC institutional intent engine (42 features) ────────────
+    print("  [TOON v5.2] Building SMC Feature Engine (42 institutional signals)...")
+    smc_df = smc_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
+    print(f"  [TOON v5.2] SMC features injected: {len(smc_df.columns)} columns")
 
     # ── Step 3: ASOF-merge higher-TF timestamps for temporal alignment ────
     # merge_higher_tf now only brings in raw OHLCV columns with the look-ahead

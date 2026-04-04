@@ -1263,4 +1263,763 @@ function compute_holographic_features_daily(
     return result
 end
 
+
+# ─────────────────────────────────────────────────────────────
+# SMC TOKEN 1 / TOKEN 2 FEATURES
+# ─────────────────────────────────────────────────────────────
+
+struct FVGEntry
+    bar_idx::Int
+    top::Float64
+    bottom::Float64
+    direction::Float64
+end
+
+@inline function _smc_input_length(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    volumes::Vector{Float64},
+    atrs::Vector{Float64},
+)::Int
+    n = length(opens)
+    if length(highs) != n || length(lows) != n || length(closes) != n ||
+       length(volumes) != n || length(atrs) != n
+        throw(ArgumentError("compute_smc_features inputs must have identical lengths"))
+    end
+    return n
+end
+
+function _compute_smc_core(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    volumes::Vector{Float64},
+    atrs::Vector{Float64};
+    swing_lookback::Int = 10,
+    structure_window::Int = 40,
+    fvg_max_age::Int = 50,
+    ob_max_age::Int = 50,
+    ob_decay_rate::Float64 = 0.02,
+    disp_body_threshold::Float64 = 1.5,
+    amd_accum_window::Int = 20,
+    indu_threshold_atr::Float64 = 0.5,
+    warmup::Int = 50,
+    include_liquidity::Bool = true,
+    include_ob::Bool = true,
+    include_fvg::Bool = true,
+    include_indu::Bool = true,
+)
+    _ = swing_lookback
+    _ = amd_accum_window
+
+    n = _smc_input_length(opens, highs, lows, closes, volumes, atrs)
+
+    nearest_ssl_dist = fill(99.0, n)
+    nearest_bsl_dist = fill(99.0, n)
+    ob_nearest_dist = fill(99.0, n)
+    fvg_nearest_dist = fill(99.0, n)
+
+    sweep_bull_mag = fill(0.0, n)
+    sweep_bear_mag = fill(0.0, n)
+    pool_density = fill(0.0, n)
+    ob_quality_score = fill(0.0, n)
+    ob_direction = fill(0.0, n)
+    ob_age_bars = fill(0.0, n)
+    fvg_direction = fill(0.0, n)
+    fvg_fill_pct = fill(0.5, n)
+    fvg_count_active = fill(0.0, n)
+    fvg_imbalance_ratio = fill(0.0, n)
+    disp_magnitude = fill(0.0, n)
+    disp_body_ratio = fill(0.0, n)
+    disp_volume_ratio = fill(0.0, n)
+    disp_confirmed = fill(0.0, n)
+    structure_trend_score = fill(0.0, n)
+    choch_bull_signal = fill(0.0, n)
+    choch_bear_signal = fill(0.0, n)
+    mss_confirmed = fill(0.0, n)
+    amd_phase = fill(0.0, n)
+    amd_duration = fill(0.0, n)
+    amd_range_pct = fill(0.0, n)
+    amd_volume_profile = fill(0.5, n)
+    indu_confirmed = fill(0.0, n)
+    indu_direction = fill(0.0, n)
+    indu_magnitude = fill(0.0, n)
+    indu_age_bars = fill(0.0, n)
+
+    swing_high_indices = Int[]
+    swing_high_prices = Float64[]
+    swing_low_indices = Int[]
+    swing_low_prices = Float64[]
+
+    structure_events = Float64[]
+    last_confirmed_swing_high = NaN
+    last_confirmed_swing_low = NaN
+    prev_swing_high = NaN
+    prev_swing_low = NaN
+    consecutive_bearish_structure = 0
+    consecutive_bullish_structure = 0
+
+    active_fvgs = FVGEntry[]
+
+    best_ob_idx = 0
+    best_ob_midpoint = NaN
+    best_ob_direction = 0.0
+    best_ob_quality = 0.0
+    best_ob_disp_confirmed = false
+
+    amd_current_state = 0
+    amd_state_start_bar = 1
+    amd_state_high = -Inf
+    amd_state_low = Inf
+    amd_state_vol_sum = 0.0
+    amd_state_bar_count = 0
+
+    last_indu_bar = 0
+    last_indu_dir = 0.0
+    last_indu_mag = 0.0
+
+    @inbounds for i in 2:n
+        curr_atr = atrs[i]
+        if !isfinite(curr_atr) || curr_atr <= 0.0
+            continue
+        end
+        prev_atr = (isfinite(atrs[i - 1]) && atrs[i - 1] > 0.0) ? atrs[i - 1] : curr_atr
+        ready = i > warmup
+
+        if i >= 4
+            k = i - 2
+            prominence_threshold = 0.3 * prev_atr
+
+            if highs[k] > highs[k - 1] && highs[k] > highs[k + 1]
+                left_prom = highs[k] - highs[k - 1]
+                right_prom = highs[k] - highs[k + 1]
+                if min(left_prom, right_prom) >= prominence_threshold
+                    push!(swing_high_indices, k)
+                    push!(swing_high_prices, highs[k])
+
+                    if isfinite(last_confirmed_swing_high)
+                        prev_swing_high = last_confirmed_swing_high
+                        if highs[k] > last_confirmed_swing_high
+                            push!(structure_events, 1.0)
+                            consecutive_bullish_structure += 1
+                            consecutive_bearish_structure = 0
+                        else
+                            push!(structure_events, -0.5)
+                            consecutive_bearish_structure += 1
+                            consecutive_bullish_structure = 0
+                        end
+                    end
+                    last_confirmed_swing_high = highs[k]
+                end
+            end
+
+            if lows[k] < lows[k - 1] && lows[k] < lows[k + 1]
+                left_prom = lows[k - 1] - lows[k]
+                right_prom = lows[k + 1] - lows[k]
+                if min(left_prom, right_prom) >= prominence_threshold
+                    push!(swing_low_indices, k)
+                    push!(swing_low_prices, lows[k])
+
+                    if isfinite(last_confirmed_swing_low)
+                        prev_swing_low = last_confirmed_swing_low
+                        if lows[k] < last_confirmed_swing_low
+                            push!(structure_events, -1.0)
+                            consecutive_bearish_structure += 1
+                            consecutive_bullish_structure = 0
+                        else
+                            push!(structure_events, 0.5)
+                            consecutive_bullish_structure += 1
+                            consecutive_bearish_structure = 0
+                        end
+                    end
+                    last_confirmed_swing_low = lows[k]
+                end
+            end
+        end
+
+        if ready
+            body_i = abs(closes[i - 1] - opens[i - 1])
+            range_i = highs[i - 1] - lows[i - 1]
+
+            body_sum = 0.0
+            vol_sum = 0.0
+            count = 0
+            for j in max(1, i - 21):(i - 2)
+                body_sum += abs(closes[j] - opens[j])
+                vol_sum += volumes[j]
+                count += 1
+            end
+            avg_body = count > 0 ? body_sum / count : body_i
+            avg_vol = count > 0 ? vol_sum / count : volumes[i - 1]
+
+            disp_magnitude[i] = range_i / curr_atr
+            disp_body_ratio[i] = body_i / (avg_body + 1e-9)
+            disp_volume_ratio[i] = volumes[i - 1] / (avg_vol + 1e-9)
+            disp_confirmed[i] = (disp_body_ratio[i] > disp_body_threshold &&
+                                 disp_magnitude[i] > 1.5) ? 1.0 : 0.0
+        end
+
+        if include_liquidity && ready
+            if !isempty(swing_low_prices)
+                nearest_sl_price = swing_low_prices[end]
+                nearest_sl_dist_val = abs(closes[i - 1] - nearest_sl_price) / curr_atr
+                nearest_ssl_dist[i] = min(nearest_sl_dist_val, 99.0)
+
+                sweep_depth = nearest_sl_price - lows[i - 1]
+                if sweep_depth > 0.0
+                    sweep_bull_mag[i] = sweep_depth / curr_atr
+                end
+            end
+
+            if !isempty(swing_high_prices)
+                nearest_sh_price = swing_high_prices[end]
+                nearest_bsl_dist_val = abs(nearest_sh_price - closes[i - 1]) / curr_atr
+                nearest_bsl_dist[i] = min(nearest_bsl_dist_val, 99.0)
+
+                sweep_depth = highs[i - 1] - nearest_sh_price
+                if sweep_depth > 0.0
+                    sweep_bear_mag[i] = sweep_depth / curr_atr
+                end
+            end
+
+            density = 0.0
+            radius = 5.0 * curr_atr
+            c_prev = closes[i - 1]
+            for sp in swing_high_prices
+                if abs(sp - c_prev) <= radius
+                    density += 1.0
+                end
+            end
+            for sp in swing_low_prices
+                if abs(sp - c_prev) <= radius
+                    density += 1.0
+                end
+            end
+            pool_density[i] = density
+        end
+
+        if include_ob && ready
+            found_ob = false
+            for k in (i - 2):-1:max(1, i - ob_max_age)
+                if k + 1 > n
+                    continue
+                end
+                if disp_confirmed[k + 1] == 1.0
+                    dir_k = closes[k] >= opens[k] ? 1.0 : -1.0
+                    dir_k1 = closes[k + 1] >= opens[k + 1] ? 1.0 : -1.0
+
+                    if dir_k != dir_k1
+                        age = i - 1 - k
+                        body_ratio_k = abs(closes[k] - opens[k]) / (curr_atr + 1e-9)
+                        quality = disp_body_ratio[k + 1] * body_ratio_k * exp(-ob_decay_rate * age)
+
+                        ob_quality_score[i] = quality
+                        ob_direction[i] = -dir_k
+                        best_ob_midpoint = (opens[k] + closes[k]) / 2.0
+                        ob_nearest_dist[i] = abs(closes[i - 1] - best_ob_midpoint) / curr_atr
+                        ob_nearest_dist[i] = min(ob_nearest_dist[i], 99.0)
+                        ob_age_bars[i] = Float64(age)
+
+                        best_ob_idx = k
+                        best_ob_direction = -dir_k
+                        best_ob_quality = quality
+                        best_ob_disp_confirmed = true
+
+                        found_ob = true
+                        break
+                    end
+                end
+            end
+            if !found_ob
+                best_ob_idx = 0
+                best_ob_midpoint = NaN
+                best_ob_direction = 0.0
+                best_ob_quality = 0.0
+                best_ob_disp_confirmed = false
+            end
+        end
+
+        if include_fvg
+            if i >= 4
+                if lows[i - 1] > highs[i - 3]
+                    push!(active_fvgs, FVGEntry(i - 2, lows[i - 1], highs[i - 3], 1.0))
+                end
+                if highs[i - 1] < lows[i - 3]
+                    push!(active_fvgs, FVGEntry(i - 2, lows[i - 3], highs[i - 1], -1.0))
+                end
+            end
+
+            j = 1
+            while j <= length(active_fvgs)
+                fvg = active_fvgs[j]
+                age = i - fvg.bar_idx
+                if age > fvg_max_age
+                    deleteat!(active_fvgs, j)
+                    continue
+                end
+
+                gap_size = fvg.top - fvg.bottom
+                if gap_size > 0.0
+                    if fvg.direction > 0.0
+                        if lows[i - 1] <= fvg.top
+                            filled_depth = fvg.top - max(lows[i - 1], fvg.bottom)
+                            _ = filled_depth
+                        end
+                    else
+                        if highs[i - 1] >= fvg.bottom
+                            filled_depth = min(highs[i - 1], fvg.top) - fvg.bottom
+                            _ = filled_depth
+                        end
+                    end
+                end
+                j += 1
+            end
+
+            if ready && !isempty(active_fvgs)
+                nearest_dist = 99.0
+                nearest_idx = 0
+                bull_count = 0
+                bear_count = 0
+
+                for (idx, fvg) in enumerate(active_fvgs)
+                    gap_mid = (fvg.top + fvg.bottom) / 2.0
+                    dist = abs(closes[i - 1] - gap_mid) / curr_atr
+                    if dist < nearest_dist
+                        nearest_dist = dist
+                        nearest_idx = idx
+                    end
+                    if fvg.direction > 0.0
+                        bull_count += 1
+                    else
+                        bear_count += 1
+                    end
+                end
+
+                fvg_nearest_dist[i] = min(nearest_dist, 99.0)
+                fvg_count_active[i] = Float64(length(active_fvgs))
+                total_fvg = bull_count + bear_count
+                fvg_imbalance_ratio[i] = Float64(bull_count - bear_count) / Float64(total_fvg + 1)
+
+                if nearest_idx > 0
+                    nfvg = active_fvgs[nearest_idx]
+                    fvg_direction[i] = nfvg.direction
+
+                    gap_size = nfvg.top - nfvg.bottom
+                    if gap_size > 0.0
+                        max_fill = 0.0
+                        for j in nfvg.bar_idx:(i - 1)
+                            if nfvg.direction > 0.0
+                                fill = max(0.0, nfvg.top - max(lows[j], nfvg.bottom))
+                            else
+                                fill = max(0.0, min(highs[j], nfvg.top) - nfvg.bottom)
+                            end
+                            max_fill = max(max_fill, fill)
+                        end
+                        fvg_fill_pct[i] = clamp(max_fill / gap_size, 0.0, 1.0)
+                    end
+                end
+            end
+        end
+
+        if ready
+            n_events = length(structure_events)
+            window_start = max(1, n_events - structure_window + 1)
+
+            bullish_count = 0.0
+            bearish_count = 0.0
+            for ev_idx in window_start:n_events
+                ev = structure_events[ev_idx]
+                if ev > 0.0
+                    bullish_count += 1.0
+                elseif ev < 0.0
+                    bearish_count += 1.0
+                end
+            end
+            total = bullish_count + bearish_count
+            if total > 0.0
+                structure_trend_score[i] = clamp((bullish_count - bearish_count) / total, -1.0, 1.0)
+            end
+
+            if !isempty(structure_events) && structure_events[end] == 1.0
+                if consecutive_bullish_structure == 1 && consecutive_bearish_structure == 0
+                    if n_events >= 3
+                        prev_bear = 0
+                        for check_idx in (n_events - 1):-1:max(1, n_events - 5)
+                            if structure_events[check_idx] < 0.0
+                                prev_bear += 1
+                            else
+                                break
+                            end
+                        end
+                        if prev_bear >= 2
+                            choch_bull_signal[i] = 1.0
+                        end
+                    end
+                end
+            end
+
+            if !isempty(structure_events) && structure_events[end] == -1.0
+                if n_events >= 3
+                    prev_bull = 0
+                    for check_idx in (n_events - 1):-1:max(1, n_events - 5)
+                        if structure_events[check_idx] > 0.0
+                            prev_bull += 1
+                        else
+                            break
+                        end
+                    end
+                    if prev_bull >= 2
+                        choch_bear_signal[i] = 1.0
+                    end
+                end
+            end
+
+            if choch_bull_signal[i] == 1.0 && disp_confirmed[i] == 1.0
+                if isfinite(last_confirmed_swing_high) && closes[i - 1] > last_confirmed_swing_high
+                    mss_confirmed[i] = 1.0
+                end
+            elseif choch_bear_signal[i] == 1.0 && disp_confirmed[i] == 1.0
+                if isfinite(last_confirmed_swing_low) && closes[i - 1] < last_confirmed_swing_low
+                    mss_confirmed[i] = 1.0
+                end
+            end
+        end
+
+        if ready
+            amd_state_bar_count += 1
+            amd_state_high = max(amd_state_high, highs[i - 1])
+            amd_state_low = min(amd_state_low, lows[i - 1])
+            amd_state_vol_sum += volumes[i - 1]
+
+            if amd_current_state == 0
+                amd_current_state = 1
+                amd_state_start_bar = i
+                amd_state_high = highs[i - 1]
+                amd_state_low = lows[i - 1]
+                amd_state_vol_sum = volumes[i - 1]
+                amd_state_bar_count = 1
+            end
+
+            transitioned = false
+
+            if amd_current_state == 1
+                if sweep_bull_mag[i] > 0.5 || sweep_bear_mag[i] > 0.5
+                    amd_current_state = 2
+                    transitioned = true
+                end
+            elseif amd_current_state == 2
+                if disp_confirmed[i] == 1.0
+                    amd_current_state = 3
+                    transitioned = true
+                end
+            elseif amd_current_state == 3
+                state_range = amd_state_high - amd_state_low
+                avg_state_vol = amd_state_vol_sum / max(amd_state_bar_count, 1)
+
+                vol_sum_50 = 0.0
+                vol_count_50 = 0
+                for j in max(1, i - 50):(i - 1)
+                    vol_sum_50 += volumes[j]
+                    vol_count_50 += 1
+                end
+                avg_vol_50 = vol_count_50 > 0 ? vol_sum_50 / vol_count_50 : avg_state_vol
+
+                if amd_state_bar_count >= 10 &&
+                   state_range < 0.5 * curr_atr &&
+                   avg_state_vol < 0.6 * avg_vol_50
+                    amd_current_state = 1
+                    transitioned = true
+                end
+            end
+
+            if transitioned
+                amd_state_start_bar = i
+                amd_state_high = highs[i - 1]
+                amd_state_low = lows[i - 1]
+                amd_state_vol_sum = volumes[i - 1]
+                amd_state_bar_count = 1
+            end
+
+            amd_phase[i] = amd_current_state == 1 ? 0.33 :
+                           amd_current_state == 2 ? 0.67 :
+                           amd_current_state == 3 ? 1.0 : 0.0
+
+            amd_duration[i] = clamp(Float64(amd_state_bar_count) / 50.0, 0.0, 1.0)
+            amd_range_pct[i] = (amd_state_high - amd_state_low) / curr_atr
+
+            avg_state_vol = amd_state_vol_sum / max(amd_state_bar_count, 1)
+            vol_sum_50 = 0.0
+            vol_count_50 = 0
+            for j in max(1, i - 50):(i - 1)
+                vol_sum_50 += volumes[j]
+                vol_count_50 += 1
+            end
+            avg_vol_50 = vol_count_50 > 0 ? vol_sum_50 / vol_count_50 : avg_state_vol
+            amd_volume_profile[i] = avg_state_vol / (avg_vol_50 + 1e-9)
+        end
+
+        if include_indu && i > warmup + 1
+            if !isempty(swing_low_prices)
+                nearest_sl = swing_low_prices[end]
+                break_depth = nearest_sl - lows[i - 2]
+                if break_depth > 0.0 && break_depth < indu_threshold_atr * curr_atr
+                    if closes[i - 1] > nearest_sl
+                        indu_confirmed[i] = 1.0
+                        indu_direction[i] = 1.0
+                        indu_magnitude[i] = break_depth / curr_atr
+                        last_indu_bar = i
+                        last_indu_dir = 1.0
+                        last_indu_mag = indu_magnitude[i]
+                    end
+                end
+            end
+
+            if !isempty(swing_high_prices)
+                nearest_sh = swing_high_prices[end]
+                break_depth = highs[i - 2] - nearest_sh
+                if break_depth > 0.0 && break_depth < indu_threshold_atr * curr_atr
+                    if closes[i - 1] < nearest_sh
+                        indu_confirmed[i] = 1.0
+                        indu_direction[i] = -1.0
+                        indu_magnitude[i] = break_depth / curr_atr
+                        last_indu_bar = i
+                        last_indu_dir = -1.0
+                        last_indu_mag = indu_magnitude[i]
+                    end
+                end
+            end
+
+            if last_indu_bar > 0 && i > last_indu_bar
+                indu_age_bars[i] = clamp(Float64(i - last_indu_bar) / 20.0, 0.0, 1.0)
+                if indu_confirmed[i] == 0.0
+                    indu_direction[i] = last_indu_dir
+                    indu_magnitude[i] = last_indu_mag * exp(-0.05 * (i - last_indu_bar))
+                end
+            end
+        end
+    end
+
+    return (
+        sweep_bull_mag = sweep_bull_mag,
+        sweep_bear_mag = sweep_bear_mag,
+        nearest_ssl_dist = nearest_ssl_dist,
+        nearest_bsl_dist = nearest_bsl_dist,
+        pool_density = pool_density,
+        ob_quality_score = ob_quality_score,
+        ob_direction = ob_direction,
+        ob_nearest_dist = ob_nearest_dist,
+        ob_age_bars = ob_age_bars,
+        fvg_nearest_dist = fvg_nearest_dist,
+        fvg_direction = fvg_direction,
+        fvg_fill_pct = fvg_fill_pct,
+        fvg_count_active = fvg_count_active,
+        fvg_imbalance_ratio = fvg_imbalance_ratio,
+        disp_magnitude = disp_magnitude,
+        disp_body_ratio = disp_body_ratio,
+        disp_volume_ratio = disp_volume_ratio,
+        disp_confirmed = disp_confirmed,
+        structure_trend_score = structure_trend_score,
+        choch_bull_signal = choch_bull_signal,
+        choch_bear_signal = choch_bear_signal,
+        mss_confirmed = mss_confirmed,
+        amd_phase = amd_phase,
+        amd_duration = amd_duration,
+        amd_range_pct = amd_range_pct,
+        amd_volume_profile = amd_volume_profile,
+        indu_confirmed = indu_confirmed,
+        indu_direction = indu_direction,
+        indu_magnitude = indu_magnitude,
+        indu_age_bars = indu_age_bars,
+    )
+end
+
+function compute_smc_features(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+    volumes::AbstractVector{Float64},
+    atrs::AbstractVector{Float64};
+    swing_lookback::Int = 10,
+    structure_window::Int = 40,
+    fvg_max_age::Int = 50,
+    ob_max_age::Int = 50,
+    ob_decay_rate::Float64 = 0.02,
+    disp_body_threshold::Float64 = 1.5,
+    amd_accum_window::Int = 20,
+    indu_threshold_atr::Float64 = 0.5,
+    warmup::Int = 50,
+)::Dict{String, Vector{Float64}}
+    return compute_smc_features(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+        collect(Float64, volumes),
+        collect(Float64, atrs);
+        swing_lookback = swing_lookback,
+        structure_window = structure_window,
+        fvg_max_age = fvg_max_age,
+        ob_max_age = ob_max_age,
+        ob_decay_rate = ob_decay_rate,
+        disp_body_threshold = disp_body_threshold,
+        amd_accum_window = amd_accum_window,
+        indu_threshold_atr = indu_threshold_atr,
+        warmup = warmup,
+    )
+end
+
+"""
+    compute_smc_features(opens, highs, lows, closes, volumes, atrs; ...) -> Dict{String, Vector{Float64}}
+
+Compute the 30 Token 1 / Token 2 SMC feature columns defined in the repo spec.
+The returned keys intentionally omit the Python-side `smc_` prefix.
+"""
+function compute_smc_features(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    volumes::Vector{Float64},
+    atrs::Vector{Float64};
+    swing_lookback::Int = 10,
+    structure_window::Int = 40,
+    fvg_max_age::Int = 50,
+    ob_max_age::Int = 50,
+    ob_decay_rate::Float64 = 0.02,
+    disp_body_threshold::Float64 = 1.5,
+    amd_accum_window::Int = 20,
+    indu_threshold_atr::Float64 = 0.5,
+    warmup::Int = 50,
+)::Dict{String, Vector{Float64}}
+    cols = _compute_smc_core(
+        opens,
+        highs,
+        lows,
+        closes,
+        volumes,
+        atrs;
+        swing_lookback = swing_lookback,
+        structure_window = structure_window,
+        fvg_max_age = fvg_max_age,
+        ob_max_age = ob_max_age,
+        ob_decay_rate = ob_decay_rate,
+        disp_body_threshold = disp_body_threshold,
+        amd_accum_window = amd_accum_window,
+        indu_threshold_atr = indu_threshold_atr,
+        warmup = warmup,
+        include_liquidity = true,
+        include_ob = true,
+        include_fvg = true,
+        include_indu = true,
+    )
+
+    return Dict{String, Vector{Float64}}(
+        "sweep_bull_mag" => cols.sweep_bull_mag,
+        "sweep_bear_mag" => cols.sweep_bear_mag,
+        "nearest_ssl_dist" => cols.nearest_ssl_dist,
+        "nearest_bsl_dist" => cols.nearest_bsl_dist,
+        "pool_density" => cols.pool_density,
+        "ob_quality_score" => cols.ob_quality_score,
+        "ob_direction" => cols.ob_direction,
+        "ob_nearest_dist" => cols.ob_nearest_dist,
+        "ob_age_bars" => cols.ob_age_bars,
+        "fvg_nearest_dist" => cols.fvg_nearest_dist,
+        "fvg_direction" => cols.fvg_direction,
+        "fvg_fill_pct" => cols.fvg_fill_pct,
+        "fvg_count_active" => cols.fvg_count_active,
+        "fvg_imbalance_ratio" => cols.fvg_imbalance_ratio,
+        "disp_magnitude" => cols.disp_magnitude,
+        "disp_body_ratio" => cols.disp_body_ratio,
+        "disp_volume_ratio" => cols.disp_volume_ratio,
+        "disp_confirmed" => cols.disp_confirmed,
+        "structure_trend_score" => cols.structure_trend_score,
+        "choch_bull_signal" => cols.choch_bull_signal,
+        "choch_bear_signal" => cols.choch_bear_signal,
+        "mss_confirmed" => cols.mss_confirmed,
+        "amd_phase" => cols.amd_phase,
+        "amd_duration" => cols.amd_duration,
+        "amd_range_pct" => cols.amd_range_pct,
+        "amd_volume_profile" => cols.amd_volume_profile,
+        "indu_confirmed" => cols.indu_confirmed,
+        "indu_direction" => cols.indu_direction,
+        "indu_magnitude" => cols.indu_magnitude,
+        "indu_age_bars" => cols.indu_age_bars,
+    )
+end
+
+function compute_smc_htf_features(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+    volumes::AbstractVector{Float64},
+    atrs::AbstractVector{Float64};
+    swing_lookback::Int = 10,
+    structure_window::Int = 40,
+    amd_accum_window::Int = 20,
+    warmup::Int = 50,
+)::Dict{String, Vector{Float64}}
+    return compute_smc_htf_features(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+        collect(Float64, volumes),
+        collect(Float64, atrs);
+        swing_lookback = swing_lookback,
+        structure_window = structure_window,
+        amd_accum_window = amd_accum_window,
+        warmup = warmup,
+    )
+end
+
+"""
+    compute_smc_htf_features(opens, highs, lows, closes, volumes, atrs; ...) -> Dict{String, Vector{Float64}}
+
+Reduced higher-timeframe SMC projection that only returns structure and AMD state.
+"""
+function compute_smc_htf_features(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    volumes::Vector{Float64},
+    atrs::Vector{Float64};
+    swing_lookback::Int = 10,
+    structure_window::Int = 40,
+    amd_accum_window::Int = 20,
+    warmup::Int = 50,
+)::Dict{String, Vector{Float64}}
+    cols = _compute_smc_core(
+        opens,
+        highs,
+        lows,
+        closes,
+        volumes,
+        atrs;
+        swing_lookback = swing_lookback,
+        structure_window = structure_window,
+        fvg_max_age = 50,
+        ob_max_age = 50,
+        ob_decay_rate = 0.02,
+        disp_body_threshold = 1.5,
+        amd_accum_window = amd_accum_window,
+        indu_threshold_atr = 0.5,
+        warmup = warmup,
+        include_liquidity = false,
+        include_ob = false,
+        include_fvg = false,
+        include_indu = false,
+    )
+
+    return Dict{String, Vector{Float64}}(
+        "structure_trend_score" => cols.structure_trend_score,
+        "amd_phase" => cols.amd_phase,
+    )
+end
+
 end  # module ToonMath

@@ -1,7 +1,8 @@
 # Universal-ML
 
 Universal-ML is a research and production trading system that predicts market
-direction from OHLCV data using geometry-only holographic features.
+direction from OHLCV data using holographic geometry and SMC
+institutional-intent features.
 
 The active model lanes are:
 
@@ -17,34 +18,34 @@ artifact management.
 
 ```bash
 cd /home/km/Universal-ML
-source mlenv/bin/activate
+uv sync --locked
 ```
 
 Train the active daily lane:
 
 ```bash
-python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Train the active intraday lane:
 
 ```bash
-python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Fast live intraday inference without retraining:
 
 ```bash
-python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 Accuracy guardrail before and after any sensitive change:
 
 ```bash
-python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
-python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
+uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
 ## Read Order
@@ -72,7 +73,7 @@ If you are new to the repo, read these in order:
 
 1. Ingest closed TradingView CSV exports into `data_vault/ohlcv.db`.
 2. Build timeframe-aligned market stacks from the database.
-3. Extract holographic features with Julia kernels.
+3. Extract holographic and SMC features with Julia kernels.
 4. Create forward targets from trade-simulation logic.
 5. Run walk-forward validation and train final LightGBM models.
 6. Save model, feature list, OOS probability map, trade-plan models, and
@@ -90,7 +91,9 @@ If you are new to the repo, read these in order:
 
 ## Environment
 
-- Python dependencies: [requirements.txt](requirements.txt)
+- Python environment: [pyproject.toml](pyproject.toml), [uv.lock](uv.lock), `.python-version`, UV-managed `.venv`
+- Runtime Julia bridge dependency: `juliacall` (declared in Python project metadata)
+- Legacy fallback dependency mirror: [requirements.txt](requirements.txt)
 - Julia environment: [Project.toml](Project.toml), [Manifest.toml](Manifest.toml)
 - Baseline CPU-only target: Intel i7-4770 class hardware with 16 GB RAM
 

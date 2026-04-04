@@ -105,11 +105,16 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.venv/
 env/
 venv/
 mlenv/
 .env
 .accuracy_baselines/
+
+# --- LOCAL SCRATCH / AGENT VERIFICATION ---
+verification/
+patch_*.py
 
 # --- IDEs & OS ---
 .vscode/

@@ -41,7 +41,12 @@ from daily_ml_engine import (
     compute_macro_regime,
     holographic_feature_engine_daily,
 )
-from julia_bridge import add_target_fast, holographic_feature_engine_fast
+from julia_bridge import (
+    add_target_fast,
+    holographic_feature_engine_fast,
+    smc_feature_engine_daily,
+    smc_feature_engine_fast,
+)
 from universal_ml_engine import (
     BARRIER_ATR_MULT,
     BARRIER_HORIZON_BARS,
@@ -291,6 +296,9 @@ def _build_1h_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     )
     df_1h_labelled = _compute_atr14(df_1h.copy())
     df_full = holographic_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    smc_df = smc_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
     df_full = add_target_fast(
         df_full,
@@ -346,6 +354,9 @@ def _build_1d_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     )
     df_1d_labelled = _compute_atr14(df_1d.copy())
     df_full = holographic_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_3m)
+    smc_df = smc_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
     df_full = _inject_macro_regime(df_full, df_6m, "6m")
     df_full = _inject_macro_regime(df_full, df_12m, "12m")
     df_full = add_daily_confluence(df_full)
@@ -452,6 +463,15 @@ def capture_baseline(args: argparse.Namespace) -> int:
         "captured_at_utc": _utc_now(),
         "lanes": {},
     }
+    if baseline_path.exists():
+        try:
+            existing_snapshot = json.loads(baseline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_snapshot = {}
+        existing_lanes = existing_snapshot.get("lanes", {})
+        if isinstance(existing_lanes, dict):
+            snapshot["lanes"].update(existing_lanes)
+
     for lane in _lane_list(args.lane):
         print(f"[capture] rebuilding {lane} guardrail snapshot for {args.symbol.upper()}...")
         lane_snapshot = _capture_lane_snapshot(args.outdir, args.symbol.upper(), lane)

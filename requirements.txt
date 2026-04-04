@@ -1,4 +1,7 @@
+# Legacy fallback mirror of core runtime dependencies.
+# Primary Python environment source of truth: pyproject.toml + uv.lock.
 joblib==1.5.3
+juliacall==0.9.31
 lightgbm==4.6.0
 matplotlib==3.10.8
 numpy==2.4.3

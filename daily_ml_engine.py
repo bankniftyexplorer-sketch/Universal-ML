@@ -22,7 +22,11 @@ import numpy as np
 import pandas as pd
 
 from holographic_engine import feature_selection_pipeline
-from julia_bridge import add_target_fast, holographic_feature_engine_daily
+from julia_bridge import (
+    add_target_fast,
+    holographic_feature_engine_daily,
+    smc_feature_engine_daily,
+)
 from universal_ml_engine import (
     LIVE_CONFIDENCE_THRESHOLD,
     MODEL_N_JOBS,
@@ -487,6 +491,13 @@ def main() -> None:
     df_1d_labelled = _compute_atr14(df_1d.copy())
     df_full = holographic_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_3m)
 
+    # ── SMC institutional intent engine (42 features, 1D lane) ────────────
+    print("  [TOON DAILY] Layer 1b: SMC Feature Engine (42 institutional signals)...")
+    smc_df = smc_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
+    print(f"  [TOON DAILY] SMC features injected: {len(smc_df.columns)} columns")
+
     print("  [TOON DAILY] Layer 2: Injecting macro regime overlays (6M/12M)...")
     df_full = inject_macro_regime(df_full, df_6m, "6m")
     df_full = inject_macro_regime(df_full, df_12m, "12m")
@@ -689,6 +700,7 @@ def main() -> None:
 
     pred_info = {
         "symbol": symbol,
+        "forecast_label": "DAILY FORECAST",
         "time": str(last_row["time"]),
         "dir": pred["direction"],
         "conf": f"{pred['confidence'] * 100:.1f}%",

@@ -27,7 +27,10 @@ from universal_ml_engine import (
     resolve_artifact_path,
     LIVE_CONFIDENCE_THRESHOLD,
 )
-from julia_bridge import holographic_feature_engine_fast as holographic_feature_engine
+from julia_bridge import (
+    holographic_feature_engine_fast as holographic_feature_engine,
+    smc_feature_engine_fast,
+)
 from shadow_brain import ShadowBrain
 import sys
 
@@ -133,6 +136,9 @@ def main():
         df_1w=df_1w,
         df_1m=df_1m,
     )
+    smc_df = smc_feature_engine_fast(df_1h_tail, df_1d, df_1w, df_1m)
+    for col in smc_df.columns:
+        df_full[col] = smc_df[col].values
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
 
     NON_FEATURE_COLS = set(NON_FEATURE_COLS_SET)

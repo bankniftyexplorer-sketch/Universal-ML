@@ -68,6 +68,36 @@ def _to_i64(arr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.int64)
 
 
+def _compute_atr14_array(
+    highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14
+) -> np.ndarray:
+    """Compute ATR14 from raw numpy arrays (for HTF SMC projection).
+
+    Uses Wilder smoothing, identical to universal_ml_engine._compute_atr14
+    but operates on numpy arrays rather than DataFrames.
+    """
+    n = len(highs)
+    atr = np.full(n, np.nan, dtype=np.float64)
+    if n < period + 1:
+        return np.where(np.isfinite(atr), atr, 1.0)
+    tr = np.maximum(
+        highs[1:] - lows[1:],
+        np.maximum(
+            np.abs(highs[1:] - closes[:-1]),
+            np.abs(lows[1:] - closes[:-1]),
+        ),
+    )
+    atr[period] = np.mean(tr[:period])
+    for i in range(period, len(tr)):
+        atr[i + 1] = (atr[i] * (period - 1) + tr[i]) / period
+    first_valid = np.argmax(np.isfinite(atr))
+    if np.isfinite(atr[first_valid]):
+        atr[:first_valid] = atr[first_valid]
+    else:
+        atr[:] = 1.0
+    return atr
+
+
 def _times_to_ns(series: pd.Series) -> np.ndarray:
     """
     Convert a pandas datetime Series to int64 Unix nanoseconds (sorted ascending).
@@ -374,6 +404,213 @@ def holographic_feature_engine_daily(
     feat_df = _jl_dict_to_df(jl_result, df_1d.index)
     new_cols = [c for c in feat_df.columns if c not in df_1d.columns]
     return pd.concat([df_1d, feat_df[new_cols]], axis=1)
+
+
+# ─────────────────────────────────────────────────────────────
+# PUBLIC API: SMC institutional intent features
+# ─────────────────────────────────────────────────────────────
+
+
+def smc_feature_engine_fast(
+    df_1h: pd.DataFrame,
+    df_1d: pd.DataFrame | None = None,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Compute 42 SMC institutional intent features for the 1H lane.
+
+    Layer 1: 30 primary features via ToonMath.compute_smc_features on 1H
+    Layer 2: 6 HTF projection features (structure_trend + amd_phase from 1D/1W/1M)
+    Layer 3: 6 confluence features (cross-TF interactions)
+
+    Parameters
+    ----------
+    df_1h : pd.DataFrame — must contain OHLCV + atr14 columns
+    df_1d, df_1w, df_1m : higher-TF DataFrames (optional)
+
+    Returns
+    -------
+    pd.DataFrame — 42 columns indexed same as df_1h, all column names prefixed 'smc_'
+    """
+    jl, TM = _init_julia()
+
+    o = _to_f64(df_1h["open"].to_numpy())
+    h = _to_f64(df_1h["high"].to_numpy())
+    lo = _to_f64(df_1h["low"].to_numpy())
+    c = _to_f64(df_1h["close"].to_numpy())
+    v = _to_f64(df_1h["volume"].to_numpy())
+    a = _to_f64(df_1h["atr14"].to_numpy())
+
+    jl_result = TM.compute_smc_features(o, h, lo, c, v, a)
+    smc_cols = {
+        f"smc_{str(k)}": np.array(jl_result[k], dtype=np.float64) for k in jl_result
+    }
+    result = pd.DataFrame(smc_cols, index=df_1h.index)
+
+    htf_pairs = [
+        (df_1d, "htf1"),
+        (df_1w, "htf2"),
+        (df_1m, "htf3"),
+    ]
+    base_times_ns = _times_to_ns(df_1h["time"])
+
+    for htf_df, htf_label in htf_pairs:
+        if htf_df is None or len(htf_df) < 3:
+            result[f"smc_{htf_label}_structure_trend_score"] = 0.0
+            result[f"smc_{htf_label}_amd_phase"] = 0.0
+            continue
+
+        src = htf_df.sort_values("time").reset_index(drop=True)
+        ho = _to_f64(src["open"].to_numpy())
+        hh = _to_f64(src["high"].to_numpy())
+        hl = _to_f64(src["low"].to_numpy())
+        hc = _to_f64(src["close"].to_numpy())
+        hv = _to_f64(src["volume"].to_numpy())
+        ha = _to_f64(_compute_atr14_array(hh, hl, hc))
+
+        htf_jl = TM.compute_smc_htf_features(ho, hh, hl, hc, hv, ha)
+
+        htf_times_ns = _times_to_ns(src["time"])
+        idx_map = np.searchsorted(htf_times_ns, base_times_ns, side="right") - 1
+        idx_map = np.clip(idx_map, 0, len(src) - 1)
+
+        for feat_name in ["structure_trend_score", "amd_phase"]:
+            htf_vals = np.array(htf_jl[feat_name], dtype=np.float64)
+            result[f"smc_{htf_label}_{feat_name}"] = htf_vals[idx_map]
+
+    result["smc_sweep_disp_sync"] = (
+        (
+            (result["smc_sweep_bull_mag"] > 0)
+            | (result["smc_sweep_bear_mag"] > 0)
+        ).astype(float)
+        * result["smc_disp_confirmed"]
+    )
+    result["smc_ob_fvg_confluence"] = np.where(
+        result["smc_fvg_count_active"] > 0,
+        result["smc_ob_quality_score"] * (1.0 - result["smc_fvg_fill_pct"]),
+        0.0,
+    )
+    result["smc_phase_weighted_trend"] = (
+        result["smc_amd_phase"] * result["smc_structure_trend_score"]
+    )
+    result["smc_full_entry_signal"] = (
+        result["smc_indu_confirmed"] * result["smc_mss_confirmed"]
+    )
+    result["smc_htf_trend_alignment"] = np.sign(
+        result["smc_structure_trend_score"]
+    ) * np.sign(
+        result.get(
+            "smc_htf1_structure_trend_score",
+            result.get("smc_htf1_structure_trend", 0.0),
+        )
+    )
+    result["smc_htf_phase_cascade"] = (
+        result["smc_amd_phase"] * result.get("smc_htf1_amd_phase", 0.0)
+    )
+
+    return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def smc_feature_engine_daily(
+    df_1d: pd.DataFrame,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+    df_6m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Compute 42 SMC institutional intent features for the 1D lane.
+
+    Same architecture as smc_feature_engine_fast but:
+    - Primary TF = 1D
+    - HTF1 = 1W (5x), HTF2 = 1M (4x), HTF3 = 6M (6x)
+
+    Parameters
+    ----------
+    df_1d : pd.DataFrame — must contain OHLCV + atr14 columns
+    df_1w, df_1m, df_6m : higher-TF DataFrames (optional)
+
+    Returns
+    -------
+    pd.DataFrame — 42 columns, all prefixed 'smc_'
+    """
+    jl, TM = _init_julia()
+
+    o = _to_f64(df_1d["open"].to_numpy())
+    h = _to_f64(df_1d["high"].to_numpy())
+    lo = _to_f64(df_1d["low"].to_numpy())
+    c = _to_f64(df_1d["close"].to_numpy())
+    v = _to_f64(df_1d["volume"].to_numpy())
+    a = _to_f64(df_1d["atr14"].to_numpy())
+
+    jl_result = TM.compute_smc_features(o, h, lo, c, v, a)
+    smc_cols = {
+        f"smc_{str(k)}": np.array(jl_result[k], dtype=np.float64) for k in jl_result
+    }
+    result = pd.DataFrame(smc_cols, index=df_1d.index)
+
+    htf_pairs = [
+        (df_1w, "htf1"),
+        (df_1m, "htf2"),
+        (df_6m, "htf3"),
+    ]
+    base_times_ns = _times_to_ns(df_1d["time"])
+
+    for htf_df, htf_label in htf_pairs:
+        if htf_df is None or len(htf_df) < 3:
+            result[f"smc_{htf_label}_structure_trend_score"] = 0.0
+            result[f"smc_{htf_label}_amd_phase"] = 0.0
+            continue
+
+        src = htf_df.sort_values("time").reset_index(drop=True)
+        ho = _to_f64(src["open"].to_numpy())
+        hh = _to_f64(src["high"].to_numpy())
+        hl = _to_f64(src["low"].to_numpy())
+        hc = _to_f64(src["close"].to_numpy())
+        hv = _to_f64(src["volume"].to_numpy())
+        ha = _to_f64(_compute_atr14_array(hh, hl, hc))
+
+        htf_jl = TM.compute_smc_htf_features(ho, hh, hl, hc, hv, ha)
+
+        htf_times_ns = _times_to_ns(src["time"])
+        idx_map = np.searchsorted(htf_times_ns, base_times_ns, side="right") - 1
+        idx_map = np.clip(idx_map, 0, len(src) - 1)
+
+        for feat_name in ["structure_trend_score", "amd_phase"]:
+            htf_vals = np.array(htf_jl[feat_name], dtype=np.float64)
+            result[f"smc_{htf_label}_{feat_name}"] = htf_vals[idx_map]
+
+    result["smc_sweep_disp_sync"] = (
+        (
+            (result["smc_sweep_bull_mag"] > 0)
+            | (result["smc_sweep_bear_mag"] > 0)
+        ).astype(float)
+        * result["smc_disp_confirmed"]
+    )
+    result["smc_ob_fvg_confluence"] = np.where(
+        result["smc_fvg_count_active"] > 0,
+        result["smc_ob_quality_score"] * (1.0 - result["smc_fvg_fill_pct"]),
+        0.0,
+    )
+    result["smc_phase_weighted_trend"] = (
+        result["smc_amd_phase"] * result["smc_structure_trend_score"]
+    )
+    result["smc_full_entry_signal"] = (
+        result["smc_indu_confirmed"] * result["smc_mss_confirmed"]
+    )
+    result["smc_htf_trend_alignment"] = np.sign(
+        result["smc_structure_trend_score"]
+    ) * np.sign(
+        result.get(
+            "smc_htf1_structure_trend_score",
+            result.get("smc_htf1_structure_trend", 0.0),
+        )
+    )
+    result["smc_htf_phase_cascade"] = (
+        result["smc_amd_phase"] * result.get("smc_htf1_amd_phase", 0.0)
+    )
+
+    return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
 # ─────────────────────────────────────────────────────────────
