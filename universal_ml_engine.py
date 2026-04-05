@@ -25,6 +25,7 @@ from julia_bridge import (
     smc_feature_engine_fast,
     add_target_fast as add_target,
 )
+from data_vault.symbol_identity import extract_symbol_payload, parse_symbol_payload
 from holographic_engine import (
     feature_selection_pipeline,
 )
@@ -214,11 +215,13 @@ def _extract_symbol_and_timeframe(
     symbol_str = symbol_guess
     tf_str = tf_guess
     try:
-        symbol_extracted = message_series.str.extract(
-            r"SYMBOL:\s*([^,]+)", expand=False
-        ).dropna()
-        if not symbol_extracted.empty:
-            symbol_str = str(symbol_extracted.iloc[-1]).strip()
+        symbol_payloads = message_series.apply(extract_symbol_payload).dropna()
+        if not symbol_payloads.empty:
+            symbol_payload = str(symbol_payloads.iloc[-1]).strip()
+            try:
+                symbol_str = parse_symbol_payload(symbol_payload).pair_symbol
+            except ValueError:
+                symbol_str = symbol_payload
 
         tf_extracted = message_series.str.extract(
             r"TIME FRAME:\s*([A-Za-z0-9_]+)", expand=False
@@ -1821,21 +1824,51 @@ def prepare_intraday_thermodynamics(
     if spot_1h is not None:
         coverage = analyze_reference_coverage(df_1h, spot_1h)
         if coverage["missing_reference_count"] > 0:
-            if logger is not None:
-                logger("\n" + "=" * 70)
-                logger("  [!] FATAL ERROR: REFERENCE COVERAGE VIOLATION")
-                logger("=" * 70)
-                logger(
-                    f"  SPOT support is missing for {coverage['missing_reference_count']} tradable 1H FUT bars in {label}."
-                )
-                logger(
-                    f"  Sample missing timestamps: {coverage['missing_reference_sample']}"
-                )
-                logger(
-                    "  Thermodynamic state cannot be trusted on the execution timeline."
-                )
-                logger("  System locked to protect capital.")
-            raise ValueError(f"Missing 1H SPOT coverage for {label}.")
+            overlap_start = max(df_1h["time"].min(), spot_1h["time"].min())
+            overlap_end = min(df_1h["time"].max(), spot_1h["time"].max())
+            trimmed_1h = df_1h[
+                (df_1h["time"] >= overlap_start) & (df_1h["time"] <= overlap_end)
+            ].reset_index(drop=True)
+            trimmed_spot_1h = spot_1h[
+                (spot_1h["time"] >= overlap_start) & (spot_1h["time"] <= overlap_end)
+            ].reset_index(drop=True)
+            trimmed_coverage = (
+                analyze_reference_coverage(trimmed_1h, trimmed_spot_1h)
+                if not trimmed_1h.empty and not trimmed_spot_1h.empty
+                else coverage
+            )
+
+            if (
+                not trimmed_1h.empty
+                and trimmed_coverage["missing_reference_count"] == 0
+            ):
+                dropped_bars = len(df_1h) - len(trimmed_1h)
+                if logger is not None:
+                    logger(
+                        f"  [PAIR] Trimmed {dropped_bars} unsupported 1H FUT bars in {label} to the shared SPOT/FUT overlap window."
+                    )
+                    logger(
+                        f"  [PAIR] Overlap window: {overlap_start} -> {overlap_end}"
+                    )
+                df_1h = trimmed_1h
+                spot_1h = trimmed_spot_1h
+                coverage = trimmed_coverage
+            else:
+                if logger is not None:
+                    logger("\n" + "=" * 70)
+                    logger("  [!] FATAL ERROR: REFERENCE COVERAGE VIOLATION")
+                    logger("=" * 70)
+                    logger(
+                        f"  SPOT support is missing for {coverage['missing_reference_count']} tradable 1H FUT bars in {label}."
+                    )
+                    logger(
+                        f"  Sample missing timestamps: {coverage['missing_reference_sample']}"
+                    )
+                    logger(
+                        "  Thermodynamic state cannot be trusted on the execution timeline."
+                    )
+                    logger("  System locked to protect capital.")
+                raise ValueError(f"Missing 1H SPOT coverage for {label}.")
 
         if logger is not None:
             extra_count = coverage["extra_reference_count"]

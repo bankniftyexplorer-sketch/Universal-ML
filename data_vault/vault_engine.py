@@ -1,15 +1,65 @@
-import os
 import glob
-import sqlite3
+import os
 import re
-import pandas as pd
+import sqlite3
+
 import numpy as np
+import pandas as pd
+
+try:
+    from symbol_identity import extract_symbol_payload, parse_symbol_payload
+except ImportError:
+    from data_vault.symbol_identity import (
+        extract_symbol_payload,
+        parse_symbol_payload,
+    )
+
+NUMERIC_TOKEN_PATTERN = r"([-+\d,\.]+|NA)"
+REALIZED_VOL_ANNUALIZATION = {"1H": 1512.0, "1D": 252.0, "1W": 52.0}
+UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
+RAW_LOG_LINE_RE = re.compile(
+    r"^\s*\[?(?P<timestamp>.+?)\]?\s*:\s*(?P<message>SYMBOL:.*)$"
+)
+MARKET_DNA_COLUMNS = (
+    "base_symbol",
+    "pair_symbol",
+    "asset_class",
+    "source_exchange",
+    "source_symbol",
+    "symbol_payload_json",
+    "contract_kind",
+    "quote_asset",
+    "expiry_code",
+    "timeframe",
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "is_synthetic_vol",
+    "realized_volatility",
+)
+MARKET_DNA_PRIMARY_KEY = (
+    "source_exchange",
+    "source_symbol",
+    "asset_class",
+    "timeframe",
+    "timestamp",
+)
 
 class DataVault:
     def __init__(self, db_path='ohlcv.db', inbox_path='inbox'):
         """Initializes the Data Vault, ensuring paths and database schemas exist."""
-        self.db_path = db_path
-        self.inbox_path = inbox_path
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.db_path = (
+            db_path if os.path.isabs(db_path) else os.path.join(base_dir, db_path)
+        )
+        self.inbox_path = (
+            inbox_path
+            if os.path.isabs(inbox_path)
+            else os.path.join(base_dir, inbox_path)
+        )
         self.conn = sqlite3.connect(self.db_path)
         
         # Ensure inbox exists
@@ -19,12 +69,11 @@ class DataVault:
         self._build_schema()
         
         # Pre-compile regex for maximum CPU efficiency on i7
-        self.re_symbol = re.compile(r'SYMBOL:\s*([^,]+)')
-        self.re_open = re.compile(r'OPEN:\s*([\d,\.]+)')
-        self.re_high = re.compile(r'HIGH:\s*([\d,\.]+)')
-        self.re_low = re.compile(r'LOW:\s*([\d,\.]+)')
-        self.re_close = re.compile(r'CLOSE:\s*([\d,\.]+)')
-        self.re_vol = re.compile(r'VOLUME:\s*([\d,\.]+)')
+        self.re_open = re.compile(rf'OPEN:\s*{NUMERIC_TOKEN_PATTERN}')
+        self.re_high = re.compile(rf'HIGH:\s*{NUMERIC_TOKEN_PATTERN}')
+        self.re_low = re.compile(rf'LOW:\s*{NUMERIC_TOKEN_PATTERN}')
+        self.re_close = re.compile(rf'CLOSE:\s*{NUMERIC_TOKEN_PATTERN}')
+        self.re_vol = re.compile(rf'VOLUME:\s*{NUMERIC_TOKEN_PATTERN}')
         self.re_tf = re.compile(r'TIME FRAME:\s*([^,]+)')
         
         # The Universal Timeframe Rosetta Stone
@@ -34,13 +83,41 @@ class DataVault:
             "1D": "1D", "D": "1D", "1W": "1W", "W": "1W", "1M": "1M", "M": "1M"
         }
 
-    def _build_schema(self):
-        """Constructs the normalized SQLite relational matrix."""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS market_dna (
+    def _market_dna_exists(self, cursor: sqlite3.Cursor) -> bool:
+        row = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'market_dna'"
+        ).fetchone()
+        return row is not None
+
+    def _market_dna_table_info(self, cursor: sqlite3.Cursor) -> list[tuple]:
+        return cursor.execute("PRAGMA table_info(market_dna)").fetchall()
+
+    def _market_dna_columns(self, cursor: sqlite3.Cursor) -> set[str]:
+        return {row[1] for row in self._market_dna_table_info(cursor)}
+
+    def _market_dna_pk_columns(self, cursor: sqlite3.Cursor) -> tuple[str, ...]:
+        pk_rows = [
+            (row[5], row[1])
+            for row in self._market_dna_table_info(cursor)
+            if row[5] > 0
+        ]
+        return tuple(name for _, name in sorted(pk_rows))
+
+    def _create_market_dna_table(
+        self, cursor: sqlite3.Cursor, table_name: str = "market_dna"
+    ) -> None:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
                 base_symbol TEXT,
+                pair_symbol TEXT,
                 asset_class TEXT,
+                source_exchange TEXT,
+                source_symbol TEXT,
+                symbol_payload_json TEXT,
+                contract_kind TEXT,
+                quote_asset TEXT,
+                expiry_code TEXT,
                 timeframe TEXT,
                 timestamp DATETIME,
                 open REAL,
@@ -49,7 +126,65 @@ class DataVault:
                 close REAL,
                 volume REAL,
                 is_synthetic_vol BOOLEAN,
-                PRIMARY KEY (base_symbol, asset_class, timeframe, timestamp)
+                realized_volatility REAL,
+                PRIMARY KEY (
+                    source_exchange, source_symbol, asset_class, timeframe, timestamp
+                )
+            )
+            """
+        )
+
+    def _rebuild_market_dna_table(self, cursor: sqlite3.Cursor) -> None:
+        legacy_table = "market_dna_legacy_migration"
+        cursor.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+        cursor.execute(f"ALTER TABLE market_dna RENAME TO {legacy_table}")
+        self._create_market_dna_table(cursor, "market_dna")
+
+        legacy_columns = {
+            row[1]
+            for row in cursor.execute(f"PRAGMA table_info({legacy_table})").fetchall()
+        }
+        copy_columns = [col for col in MARKET_DNA_COLUMNS if col in legacy_columns]
+        column_csv = ", ".join(copy_columns)
+        cursor.execute(
+            f"""
+            INSERT INTO market_dna ({column_csv})
+            SELECT {column_csv}
+            FROM {legacy_table}
+            """
+        )
+        cursor.execute(f"DROP TABLE {legacy_table}")
+
+    def _build_schema(self):
+        """Constructs the normalized SQLite relational matrix."""
+        cursor = self.conn.cursor()
+        if not self._market_dna_exists(cursor):
+            self._create_market_dna_table(cursor)
+        else:
+            existing_cols = self._market_dna_columns(cursor)
+            pk_cols = self._market_dna_pk_columns(cursor)
+            needs_rebuild = (
+                not set(MARKET_DNA_COLUMNS).issubset(existing_cols)
+                or pk_cols != MARKET_DNA_PRIMARY_KEY
+            )
+            if needs_rebuild:
+                self._rebuild_market_dna_table(cursor)
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_ml_inference
+            ON market_dna (base_symbol, asset_class, timestamp)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_pair_inference
+            ON market_dna (pair_symbol, asset_class, timestamp)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_source_identity
+            ON market_dna (source_exchange, source_symbol, asset_class, timestamp)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_pair_source_identity
+            ON market_dna (
+                pair_symbol, asset_class, source_exchange, source_symbol, timestamp
             )
         ''')
         cursor.execute('''
@@ -88,7 +223,8 @@ class DataVault:
 
     def log_bulk_trades(self, trade_list):
         """Ultra-fast bulk seeding of the performance ledger."""
-        if not trade_list: return
+        if not trade_list:
+            return
         cursor = self.conn.cursor()
         data_tuples = [(
             t.get('timestamp'),
@@ -114,7 +250,7 @@ class DataVault:
             SELECT p.*, m.open, m.high, m.low, m.close, m.volume
             FROM performance_ledger p
             LEFT JOIN market_dna m 
-              ON p.base_symbol = m.base_symbol 
+              ON p.base_symbol = COALESCE(m.pair_symbol, m.base_symbol)
               AND datetime(p.timestamp) = datetime(m.timestamp)
               AND m.timeframe = '1H'
               AND m.asset_class = 'FUT'
@@ -125,36 +261,191 @@ class DataVault:
         return pd.read_sql_query(query, self.conn, params=(base_symbol,))
 
     def _parse_ticker_dna(self, raw_ticker):
-        """Assumes TradingView convention: '!' or '1!' suffix = futures. Non-TV tickers ending in '!' will be misclassified."""
-        raw_ticker = raw_ticker.strip()
-        
-        # Refined Regex: Matches an optional '1' followed by '!' at the VERY end
-        # This prevents stripping '50' from 'NIFTY50!'
-        cleaned_ticker = re.sub(r'1?!$', '', raw_ticker) 
-        
-        asset_class = 'FUT' if cleaned_ticker != raw_ticker else 'SPOT'
-        return cleaned_ticker, asset_class
+        """Parses one symbol payload into the normalized exchange-aware identity."""
+        identity = parse_symbol_payload(raw_ticker)
+        return (
+            identity.base_symbol,
+            identity.pair_symbol,
+            identity.asset_class,
+            identity.source_exchange,
+            identity.source_symbol,
+            identity.symbol_payload_json,
+            identity.contract_kind,
+            identity.quote_asset,
+            identity.expiry_code,
+        )
 
     def _extract_message_data(self, message):
-        """The brutal string parser. Hunts and extracts values, stripping commas."""
+        """Extracts the full symbol payload and the numeric bar fields."""
+        message = str(message)
+        base_symbol = None
+        pair_symbol = None
+        asset_class = None
+        source_exchange = None
+        source_symbol = None
+        symbol_payload_json = None
+        contract_kind = None
+        quote_asset = None
+        expiry_code = None
+        timeframe = None
+
+        symbol_payload = extract_symbol_payload(message)
+        if symbol_payload is not None:
+            (
+                base_symbol,
+                pair_symbol,
+                asset_class,
+                source_exchange,
+                source_symbol,
+                symbol_payload_json,
+                contract_kind,
+                quote_asset,
+                expiry_code,
+            ) = self._parse_ticker_dna(symbol_payload)
+
         try:
-            symbol_raw = self.re_symbol.search(message).group(1).strip()
-            base_symbol, asset_class = self._parse_ticker_dna(symbol_raw)
-            
-            tf_raw = self.re_tf.search(message).group(1).strip().strip('"')
-            timeframe = self.tf_map.get(tf_raw, tf_raw) # Default to raw if not in map
-            
-            # Extract and clean floats
-            o = float(self.re_open.search(message).group(1).replace(',', ''))
-            h = float(self.re_high.search(message).group(1).replace(',', ''))
-            l = float(self.re_low.search(message).group(1).replace(',', ''))
-            c = float(self.re_close.search(message).group(1).replace(',', ''))
-            v = float(self.re_vol.search(message).group(1).replace(',', ''))
-            
-            return pd.Series([base_symbol, asset_class, timeframe, o, h, l, c, v])
-        except AttributeError:
-            # Failsafe for corrupted rows
-            return pd.Series([None, None, None, None, None, None, None, None])
+            tf_match = self.re_tf.search(message)
+            if tf_match:
+                tf_raw = tf_match.group(1).strip().strip('"')
+                timeframe = self.tf_map.get(tf_raw, tf_raw)
+        except Exception:
+            timeframe = None
+
+        def _parse_numeric(match: re.Match[str] | None) -> float:
+            if match is None:
+                return np.nan
+            raw_value = match.group(1).strip()
+            if raw_value == 'NA':
+                return np.nan
+            try:
+                return float(raw_value.replace(',', ''))
+            except (TypeError, ValueError):
+                return np.nan
+
+        try:
+            o = _parse_numeric(self.re_open.search(message))
+        except Exception:
+            o = np.nan
+        try:
+            h = _parse_numeric(self.re_high.search(message))
+        except Exception:
+            h = np.nan
+        try:
+            lo = _parse_numeric(self.re_low.search(message))
+        except Exception:
+            lo = np.nan
+        try:
+            c = _parse_numeric(self.re_close.search(message))
+        except Exception:
+            c = np.nan
+        try:
+            v = _parse_numeric(self.re_vol.search(message))
+        except Exception:
+            v = np.nan
+
+        return pd.Series(
+            [
+                base_symbol,
+                source_exchange,
+                source_symbol,
+                symbol_payload_json,
+                pair_symbol,
+                asset_class,
+                contract_kind,
+                quote_asset,
+                expiry_code,
+                timeframe,
+                o,
+                h,
+                lo,
+                c,
+                v,
+            ]
+        )
+
+    def _load_inbox_file(self, path: str) -> pd.DataFrame:
+        """
+        Loads either a standard TradingView CSV export or a raw log file where
+        each line embeds its own timestamp prefix before `SYMBOL:`.
+        """
+        records: list[tuple[str, str]] = []
+        with open(path, encoding="utf-8", newline="") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                raw_match = RAW_LOG_LINE_RE.match(line)
+                if raw_match is not None:
+                    records.append(
+                        (
+                            raw_match.group("timestamp").strip(),
+                            raw_match.group("message").strip(),
+                        )
+                    )
+                    continue
+
+                if "," not in raw_line:
+                    continue
+                first, remainder = raw_line.split(",", 1)
+                first = first.strip().lstrip("\ufeff")
+                second = remainder.strip()
+                if first.lower() == "date" and second.lower().startswith("message"):
+                    continue
+
+                message = second
+                if message.startswith('"') and message.endswith('"') and len(message) >= 2:
+                    message = message[1:-1].replace('""', '"')
+                if message:
+                    records.append((first, message))
+
+        if not records:
+            return pd.DataFrame(columns=["Date", "Message"])
+        return pd.DataFrame.from_records(records, columns=["Date", "Message"])
+
+    def _parse_timestamp_series(self, series: pd.Series) -> pd.Series:
+        ts = pd.to_datetime(series, errors="coerce")
+        if ts.notna().sum() == 0:
+            return ts
+        if ts.dt.tz is None:
+            return ts.dt.tz_localize("Asia/Kolkata")
+        return ts.dt.tz_convert("Asia/Kolkata")
+
+    def _validate_ingestion_batch(self, df: pd.DataFrame, file_name: str) -> None:
+        identity_cols = [
+            "source_exchange",
+            "source_symbol",
+            "asset_class",
+            "timeframe",
+            "timestamp",
+        ]
+        identity_df = df.dropna(subset=identity_cols)
+        if identity_df.empty:
+            return
+
+        duplicate_mask = identity_df.duplicated(identity_cols, keep=False)
+        if not duplicate_mask.any():
+            return
+
+        sample_cols = [
+            "pair_symbol",
+            "source_exchange",
+            "source_symbol",
+            "asset_class",
+            "timeframe",
+            "timestamp",
+        ]
+        sample = identity_df.loc[duplicate_mask, sample_cols].head(5).to_dict("records")
+        raise ValueError(
+            f"Duplicate source-identity rows detected in {file_name}: {sample}"
+        )
+
+    def _enforce_physics(self, df):
+        """Enforces OHLC structural bounds before any downstream repair logic."""
+        df = df.copy()
+        df['high'] = df[['open', 'close', 'high']].max(axis=1)
+        df['low'] = df[['open', 'close', 'low']].min(axis=1)
+        return df
 
     def _interpolate_volume(self, df):
         """Surgically repairs 0 Volume using volatility-matched proxy logic."""
@@ -191,6 +482,31 @@ class DataVault:
         
         return df.drop(columns=['TR'])
 
+    def _compute_realized_volatility(self, df):
+        """Vectorizes 21-period bipower variation and backfills initial gaps."""
+        df = df.copy()
+        df['realized_volatility'] = np.nan
+
+        for timeframe, annualization_factor in REALIZED_VOL_ANNUALIZATION.items():
+            tf_mask = df['timeframe'] == timeframe
+            if not tf_mask.any():
+                continue
+
+            tf_df = df.loc[tf_mask].sort_values('timestamp').copy()
+            closes = tf_df['close'].where(tf_df['close'] > 0)
+
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_returns = np.log(closes / closes.shift(1))
+
+            bpv_component = (np.pi / 2.0) * log_returns.abs() * log_returns.shift(1).abs()
+            rolling_sum = bpv_component.rolling(window=21, min_periods=2).sum()
+            rv = np.sqrt(np.maximum(rolling_sum * annualization_factor, 0.0))
+            rv = rv.bfill().fillna(0.0)
+
+            df.loc[tf_df.index, 'realized_volatility'] = rv.to_numpy()
+
+        return df
+
     def _generate_macro_layers(self, df_1d):
         """Forges macro regimes natively from the data that physically exists, immune to exchange schedules."""
         macro_dfs = []
@@ -216,9 +532,21 @@ class DataVault:
         # 3. Aggregation Physics
         agg_logic = {
             'timestamp': 'first',
-            'base_symbol': 'first', 'asset_class': 'first',
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
-            'volume': 'sum', 'is_synthetic_vol': 'max'
+            'base_symbol': 'first',
+            'source_exchange': 'first',
+            'source_symbol': 'first',
+            'symbol_payload_json': 'first',
+            'pair_symbol': 'first',
+            'asset_class': 'first',
+            'contract_kind': 'first',
+            'quote_asset': 'first',
+            'expiry_code': 'first',
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'is_synthetic_vol': 'max',
         }
         
         for label, group_cols in signatures.items():
@@ -236,9 +564,77 @@ class DataVault:
                 
         return pd.concat(macro_dfs, ignore_index=True) if macro_dfs else pd.DataFrame()
 
+    def _run_global_schedule_sync(self):
+        """Prunes any source/asset rows whose trade date is outside the 1D/1H sync set."""
+        cursor = self.conn.cursor()
+        cursor.execute('DROP TABLE IF EXISTS temp_sync_dates')
+        cursor.execute('''
+            CREATE TEMP TABLE temp_sync_dates AS
+            SELECT
+                d.source_exchange_key,
+                d.source_symbol_key,
+                d.asset_class,
+                d.trade_date
+            FROM (
+                SELECT DISTINCT
+                    COALESCE(source_exchange, '') AS source_exchange_key,
+                    COALESCE(source_symbol, base_symbol) AS source_symbol_key,
+                    asset_class,
+                    DATE(timestamp, '+05:30') AS trade_date
+                FROM market_dna
+                WHERE timeframe = '1D'
+            ) AS d
+            INNER JOIN (
+                SELECT DISTINCT
+                    COALESCE(source_exchange, '') AS source_exchange_key,
+                    COALESCE(source_symbol, base_symbol) AS source_symbol_key,
+                    asset_class,
+                    DATE(timestamp, '+05:30') AS trade_date
+                FROM market_dna
+                WHERE timeframe = '1H'
+            ) AS h
+              ON d.source_exchange_key = h.source_exchange_key
+             AND d.source_symbol_key = h.source_symbol_key
+             AND d.asset_class = h.asset_class
+             AND d.trade_date = h.trade_date
+        ''')
+        cursor.execute('''
+            SELECT COUNT(*)
+            FROM market_dna AS m
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM temp_sync_dates AS s
+                WHERE s.source_exchange_key = COALESCE(m.source_exchange, '')
+                  AND s.source_symbol_key = COALESCE(m.source_symbol, m.base_symbol)
+                  AND s.asset_class = m.asset_class
+                  AND s.trade_date = DATE(m.timestamp, '+05:30')
+            )
+        ''')
+        rows_pruned = cursor.fetchone()[0]
+        cursor.execute('''
+            DELETE FROM market_dna
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM temp_sync_dates AS s
+                WHERE s.source_exchange_key = COALESCE(market_dna.source_exchange, '')
+                  AND s.source_symbol_key = COALESCE(
+                      market_dna.source_symbol,
+                      market_dna.base_symbol
+                  )
+                  AND s.asset_class = market_dna.asset_class
+                  AND s.trade_date = DATE(market_dna.timestamp, '+05:30')
+            )
+        ''')
+        cursor.execute('DROP TABLE temp_sync_dates')
+        self.conn.commit()
+        print(f"  [+] Global schedule sync pruned {rows_pruned} unsynced rows.")
+
     def process_inbox(self):
         """Orchestrates the ingestion, cleaning, resampling, and persistence."""
-        csv_files = glob.glob(os.path.join(self.inbox_path, '*.csv'))
+        inbox_files: list[str] = []
+        for pattern in ("*.csv", "*.log", "*.txt"):
+            inbox_files.extend(glob.glob(os.path.join(self.inbox_path, pattern)))
+        csv_files = sorted(set(inbox_files))
         
         if not csv_files:
             print("Inbox is empty. No data to ingest.")
@@ -247,9 +643,8 @@ class DataVault:
         for file in csv_files:
             print(f"Ingesting: {os.path.basename(file)}")
             
-            # Read CSV. Using header=0 to handle standard TradingView export headers
             try:
-                raw_df = pd.read_csv(file, names=['Date', 'Message'], header=0)
+                raw_df = self._load_inbox_file(file)
             except Exception as e:
                 print(f"Failed to read {file}: {e}")
                 continue
@@ -258,58 +653,92 @@ class DataVault:
             raw_df = raw_df.dropna(subset=['Date', 'Message'])
             
             # Extract data using the Regex Cleaver
-            extracted = raw_df['Message'].apply(self._extract_message_data)
-            extracted.columns = ['base_symbol', 'asset_class', 'timeframe', 'open', 'high', 'low', 'close', 'volume']
+            try:
+                extracted = raw_df['Message'].apply(self._extract_message_data)
+            except ValueError as e:
+                print(f"  [!] Identity parse failed for {os.path.basename(file)}: {e}")
+                print("  [!] Source left in inbox for correction.\n")
+                continue
+            extracted.columns = [
+                'base_symbol',
+                'source_exchange',
+                'source_symbol',
+                'symbol_payload_json',
+                'pair_symbol',
+                'asset_class',
+                'contract_kind',
+                'quote_asset',
+                'expiry_code',
+                'timeframe',
+                'open',
+                'high',
+                'low',
+                'close',
+                'volume',
+            ]
             
-            # Merge timestamp securely with IST localization (TradingView exports are typically exchange-local)
-            ts = pd.to_datetime(raw_df['Date'])
-            if ts.dt.tz is None:
-                extracted['timestamp'] = ts.dt.tz_localize('Asia/Kolkata')
-            else:
-                extracted['timestamp'] = ts.dt.tz_convert('Asia/Kolkata')
+            # Merge timestamp securely with IST localization for naive exports,
+            # while preserving explicit source offsets when they exist.
+            extracted['timestamp'] = self._parse_timestamp_series(raw_df['Date'])
 
             
-            # Drop rows where regex failed
-            extracted = extracted.dropna(subset=['base_symbol'])
+            # Preserve rows with broken volume, but reject rows missing structural inputs.
+            extracted = extracted.dropna(
+                subset=[
+                    'base_symbol',
+                    'source_symbol',
+                    'pair_symbol',
+                    'asset_class',
+                    'contract_kind',
+                    'timeframe',
+                    'timestamp',
+                    'open',
+                    'high',
+                    'low',
+                    'close',
+                ]
+            )
+            try:
+                self._validate_ingestion_batch(extracted, os.path.basename(file))
+            except ValueError as e:
+                print(f"  [!] Integrity failure for {os.path.basename(file)}: {e}")
+                print("  [!] Source left in inbox for correction.\n")
+                continue
             
-            # Group by asset only, allowing cross-timeframe examination
-            grouped = extracted.groupby(['base_symbol', 'asset_class'])
+            # Group by exact source identity so same-symbol multi-venue rows never mix.
+            grouped = extracted.groupby(
+                ['source_exchange', 'source_symbol', 'asset_class'],
+                dropna=False,
+            )
             
             final_dfs_to_db = []
             
-            for (sym, asset), group_df in grouped:
+            for (exchange, source_symbol, asset), group_df in grouped:
                 group_df = group_df.sort_values('timestamp')
                 
-                # Apply Volume Interpolation (Crucial for FUT)
-                clean_df = self._interpolate_volume(group_df)
+                clean_df = self._enforce_physics(group_df)
+                clean_df = self._interpolate_volume(clean_df)
+                clean_df = self._compute_realized_volatility(clean_df)
                 
                 df_1d = clean_df[clean_df['timeframe'] == '1D']
-                df_1h = clean_df[clean_df['timeframe'] == '1H']
-                
-                # THE SCHEDULE MATRIX CRUCIBLE
-                if not df_1d.empty and not df_1h.empty:
-                    # Build the Active Date Matrix
-                    active_dates = set(df_1d['timestamp'].dt.date)
-                    hourly_dates = set(df_1h['timestamp'].dt.date)
-                    
-                    missing_in_1h = active_dates - hourly_dates
-                    if missing_in_1h:
-                        print(f"  [!] FATAL INGESTION ERROR: {sym} {asset} Matrix Fragmented.")
-                        print(f"      1D file reports {len(missing_in_1h)} active days completely missing from the 1H file.")
-                        print("      Aborting ingestion for this asset to preserve data sovereignty.")
-                        continue # Skip this asset entirely
-                        
-                    print(f"  [+] Schedule Matrix Verified: Intraday parity perfectly matches Daily grid for {sym}.")
 
                 # Append the clean base layers (e.g., 1H, 1D)
                 final_dfs_to_db.append(clean_df)
                 
                 # THE MACRO FORGE TRIGGER
                 if not df_1d.empty:
-                    print(f"  [+] Forging Macro Layers for {sym} {asset}...")
+                    print(
+                        f"  [+] Forging Macro Layers for "
+                        f"{exchange}:{source_symbol} {asset}..."
+                    )
                     macro_df = self._generate_macro_layers(df_1d)
                     if not macro_df.empty:
+                        macro_df = self._compute_realized_volatility(macro_df)
                         final_dfs_to_db.append(macro_df)
+
+            if not final_dfs_to_db:
+                print("  [!] No valid rows extracted from file. Source left in inbox for inspection.\n")
+                continue
 
             # Concatenate all generated data
             master_df = pd.concat(final_dfs_to_db, ignore_index=True)
@@ -321,9 +750,24 @@ class DataVault:
             os.remove(file)
             print("Successfully processed and archived into database.\n")
 
+        self._run_global_schedule_sync()
+
     def _upsert_dataframe(self, df):
         """Performs a highly efficient SQLite INSERT OR REPLACE."""
         df_db = df.copy()
+        for col in (
+            'source_exchange',
+            'source_symbol',
+            'symbol_payload_json',
+            'pair_symbol',
+            'contract_kind',
+            'quote_asset',
+            'expiry_code',
+        ):
+            if col not in df_db.columns:
+                df_db[col] = np.nan
+        if 'realized_volatility' not in df_db.columns:
+            df_db['realized_volatility'] = np.nan
         
         # Ensure timestamp is correctly formatted as UTC ISO8601 for SQLite storage
         ts = df_db['timestamp']
@@ -335,7 +779,8 @@ class DataVault:
             ts = ts.dt.tz_localize('Asia/Kolkata')
             
         # VAULT-1 FIX: Convert to UTC and strictly format with the +00:00 offset
-        df_db['timestamp'] = ts.dt.tz_convert('UTC').dt.strftime('%Y-%m-%dT%H:%M:%S+00:00')
+        df_db['timestamp'] = ts.dt.tz_convert('UTC').dt.strftime(UTC_TIMESTAMP_FORMAT)
+        self._validate_ingestion_batch(df_db, "upsert_batch")
         
         # Write to temporary table
         df_db.to_sql('temp_market_dna', self.conn, if_exists='replace', index=False)
@@ -343,8 +788,17 @@ class DataVault:
         # Execute UPSERT
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO market_dna (base_symbol, asset_class, timeframe, timestamp, open, high, low, close, volume, is_synthetic_vol)
-            SELECT base_symbol, asset_class, timeframe, timestamp, open, high, low, close, volume, is_synthetic_vol
+            INSERT OR REPLACE INTO market_dna (
+                base_symbol, pair_symbol, asset_class, source_exchange, source_symbol,
+                symbol_payload_json, contract_kind, quote_asset, expiry_code,
+                timeframe, timestamp, open, high, low, close, volume,
+                is_synthetic_vol, realized_volatility
+            )
+            SELECT
+                base_symbol, pair_symbol, asset_class, source_exchange, source_symbol,
+                symbol_payload_json, contract_kind, quote_asset, expiry_code,
+                timeframe, timestamp, open, high, low, close, volume,
+                is_synthetic_vol, realized_volatility
             FROM temp_market_dna
         ''')
         self.conn.commit()
