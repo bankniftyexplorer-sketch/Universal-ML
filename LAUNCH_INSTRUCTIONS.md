@@ -63,11 +63,46 @@ uv run python data_vault/vault_engine.py --symbol NIFTY --pause-seconds 0
 Notes:
 
 - repeat `--symbol` to sync multiple instruments
-- omit `--symbol` to sync the core watchlist first (`NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50`, `SPX500`, `BTC`), then the rest of the curated Yahoo map
-- `--symbol` accepts curated aliases like `BTCUSDT` and raw Yahoo tickers like `AAPL`, `^GDAXI`, or `EURUSD=X`
+- omit `--symbol` to sync the core watchlist first (`NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50`, `SPX500`, `BTC`), then the rest of the curated Yahoo map and any custom aliases saved locally
+- `--symbol` accepts curated aliases like `BTCUSDT`, custom registered aliases, and raw Yahoo tickers like `AAPL`, `^GDAXI`, or `EURUSD=X`
 - normal syncs are incremental by default for speed; use `--full-refresh` when you want a max-history rebuild from Yahoo
 - `data_vault/vault_engine.py` is the canonical entrypoint
 - the root-level `vault_engine.py` remains an import-compatibility shim
+
+Register and import a new index without editing Python:
+
+```bash
+cd /home/km/Universal-ML
+uv run python data_vault/vault_engine.py --import-index DAX=^GDAXI --pause-seconds 0
+```
+
+What this does:
+
+- saves `DAX -> ^GDAXI` into `data_vault/custom_yahoo_instruments.json`
+- syncs that index immediately into the canonical DB
+- lets future runs use the plain alias:
+
+```bash
+uv run python data_vault/vault_engine.py --symbol DAX --pause-seconds 0
+```
+
+If you only want to save the alias for later:
+
+```bash
+uv run python data_vault/vault_engine.py --register-index DAX=^GDAXI
+```
+
+You can also skip alias registration and sync a raw Yahoo ticker directly:
+
+```bash
+uv run python data_vault/vault_engine.py --symbol ^GDAXI --pause-seconds 0
+```
+
+List the aliases you can use without opening Python:
+
+```bash
+uv run python data_vault/vault_engine.py --list-symbols
+```
 
 What this does:
 
@@ -85,6 +120,56 @@ Important:
 - `1D` requests use Yahoo `period=max`; `1H` requests ask for `period=max` too, but Yahoo currently returns only the last ~730 days for hourly data.
 - The sync loop is best-effort: if one Yahoo symbol returns no usable history, the run continues and reports a warning instead of aborting the whole refresh.
 - Quality rows now capture gap counts, synthetic-volume counts, staleness, fetch mode, and whether the engine had to retain old bars because Yahoo returned nothing.
+
+Automatic background refresh while the system is on:
+
+```bash
+cd /home/km/Universal-ML
+uv run python data_vault/vault_engine.py \
+  --auto-sync \
+  --pause-seconds 0 \
+  --auto-max-cpu-percent 20 \
+  --auto-min-download-kbps 32 \
+  --auto-check-interval-seconds 300 \
+  --auto-min-sync-gap-seconds 3600
+```
+
+This mode:
+
+- keeps the vault process alive
+- samples CPU usage before each decision
+- probes Yahoo throughput before each decision
+- waits until `cpu <= 20%` and the download probe clears the configured KB/s floor
+- only then starts the next sync cycle
+
+Check why auto-sync is waiting:
+
+```bash
+uv run python data_vault/vault_engine.py --resource-gate-status
+```
+
+Simple start command with the default safe thresholds:
+
+```bash
+cd /home/km/Universal-ML
+./start_vault_autosync.sh
+```
+
+Start it automatically when your Linux user session comes up:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp /home/km/Universal-ML/ops/systemd/user/universal-ml-vault-autosync.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now universal-ml-vault-autosync.service
+```
+
+Check the service:
+
+```bash
+systemctl --user status universal-ml-vault-autosync.service
+journalctl --user -u universal-ml-vault-autosync.service -f
+```
 
 ---
 

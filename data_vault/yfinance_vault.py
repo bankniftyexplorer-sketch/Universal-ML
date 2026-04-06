@@ -5,6 +5,8 @@ import json
 import os
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Iterable
@@ -19,7 +21,7 @@ try:
 except ImportError:
     from data_vault.symbol_identity import canonical_pair_symbol
 
-REALIZED_VOL_ANNUALIZATION = {"1H": 1512.0, "1D": 252.0, "1W": 52.0}
+REALIZED_VOL_ANNUALIZATION = {"1H": 1512.0, "1D": 252.0, "1W": 52.0, "1M": 12.0, "3M": 4.0, "6M": 2.0, "12M": 1.0}
 UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
 MARKET_DNA_COLUMNS = (
     "base_symbol",
@@ -125,6 +127,18 @@ FULL_REFRESH_CADENCE = {
     "1D": timedelta(days=30),
     "1H": timedelta(days=7),
 }
+CUSTOM_YAHOO_INSTRUMENTS_FILENAME = "custom_yahoo_instruments.json"
+DEFAULT_AUTO_SYNC_CHECK_INTERVAL_SECONDS = 300.0
+DEFAULT_AUTO_SYNC_MIN_GAP_SECONDS = 3600.0
+DEFAULT_AUTO_SYNC_MAX_CPU_PERCENT = 20.0
+DEFAULT_AUTO_SYNC_CPU_SAMPLE_SECONDS = 1.0
+DEFAULT_AUTO_SYNC_MIN_DOWNLOAD_KBPS = 32.0
+DEFAULT_AUTO_SYNC_PROBE_TIMEOUT_SECONDS = 10.0
+DEFAULT_AUTO_SYNC_PROBE_READ_LIMIT_BYTES = 131072
+DEFAULT_AUTO_SYNC_PROBE_URL = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
+    "?interval=1d&range=10y"
+)
 MARKET_SYNC_QUALITY_COLUMNS = (
     "run_id",
     "synced_at",
@@ -152,12 +166,23 @@ MARKET_SYNC_QUALITY_COLUMNS = (
 
 
 class YFinanceVault:
-    def __init__(self, db_path: str = "ohlcv.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "ohlcv.db",
+        custom_instruments_path: str | None = None,
+    ) -> None:
         self.db_path = self._resolve_db_path(db_path)
+        self.custom_instruments_path = self._resolve_custom_instruments_path(
+            custom_instruments_path
+        )
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self._configure_connection(self.conn)
         self._build_schema()
+        self.custom_instrument_records = self._load_custom_instrument_records()
+        self.custom_instruments = self._build_custom_instrument_lookup(
+            self.custom_instrument_records
+        )
 
     def _resolve_db_path(self, db_path: str) -> str:
         if os.path.isabs(db_path):
@@ -176,6 +201,391 @@ class YFinanceVault:
             return os.path.abspath(normalized)
 
         return os.path.join(module_dir, normalized)
+
+    def _resolve_custom_instruments_path(self, custom_instruments_path: str | None) -> str:
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(module_dir)
+        raw_path = custom_instruments_path or CUSTOM_YAHOO_INSTRUMENTS_FILENAME
+        if os.path.isabs(raw_path):
+            return raw_path
+
+        normalized = os.path.normpath(str(raw_path).strip())
+        if not normalized or normalized == ".":
+            normalized = CUSTOM_YAHOO_INSTRUMENTS_FILENAME
+
+        if os.path.dirname(normalized):
+            first_segment = normalized.split(os.sep, 1)[0]
+            if first_segment == os.path.basename(module_dir):
+                return os.path.join(repo_root, normalized)
+            return os.path.abspath(normalized)
+
+        return os.path.join(module_dir, normalized)
+
+    def _load_custom_instrument_records(self) -> dict[str, YahooInstrument]:
+        path = self.custom_instruments_path
+        if not os.path.exists(path):
+            return {}
+
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[!] Custom Yahoo instrument registry ignored: {exc}")
+            return {}
+
+        if not isinstance(payload, dict):
+            print("[!] Custom Yahoo instrument registry ignored: root JSON must be an object.")
+            return {}
+
+        records: dict[str, YahooInstrument] = {}
+        for alias, item in payload.items():
+            if not isinstance(item, dict):
+                print(f"[!] Skipping custom Yahoo instrument '{alias}': entry must be an object.")
+                continue
+
+            ticker = self._extract_yahoo_ticker(
+                str(item.get("ticker") or item.get("source_symbol") or "").strip()
+            )
+            if not ticker:
+                print(f"[!] Skipping custom Yahoo instrument '{alias}': missing ticker.")
+                continue
+
+            alias_key = canonical_pair_symbol(str(alias).strip(), asset_class="SPOT")
+            if not alias_key:
+                print(f"[!] Skipping custom Yahoo instrument '{alias}': invalid alias.")
+                continue
+
+            base_symbol = canonical_pair_symbol(
+                str(item.get("base_symbol") or alias_key).strip(),
+                asset_class="SPOT",
+            ) or alias_key
+            source_exchange = str(item.get("source_exchange") or "YAHOO").strip().upper()
+            if source_exchange != "YAHOO":
+                print(
+                    f"[!] Skipping custom Yahoo instrument '{alias_key}': "
+                    "only YAHOO source_exchange is supported."
+                )
+                continue
+
+            quote_asset = item.get("quote_asset")
+            if quote_asset is not None:
+                quote_asset = str(quote_asset).strip().upper() or None
+
+            records[alias_key] = YahooInstrument(
+                base_symbol=base_symbol,
+                ticker=ticker,
+                quote_asset=quote_asset,
+                source_exchange=source_exchange,
+            )
+        return records
+
+    def _build_custom_instrument_lookup(
+        self,
+        records: dict[str, YahooInstrument],
+    ) -> dict[str, YahooInstrument]:
+        lookup: dict[str, YahooInstrument] = {}
+        for alias_key, instrument in records.items():
+            for key in (
+                alias_key.upper(),
+                instrument.base_symbol.upper(),
+                instrument.ticker.upper(),
+                f"YAHOO:{instrument.ticker.upper()}",
+            ):
+                lookup[key] = instrument
+        return lookup
+
+    def _persist_custom_instrument_records(self) -> None:
+        directory = os.path.dirname(self.custom_instruments_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        payload = {
+            alias_key: {
+                "base_symbol": instrument.base_symbol,
+                "ticker": instrument.ticker,
+                "quote_asset": instrument.quote_asset,
+                "source_exchange": instrument.source_exchange,
+            }
+            for alias_key, instrument in sorted(self.custom_instrument_records.items())
+        }
+        with open(self.custom_instruments_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    def _parse_custom_index_spec(self, spec: str) -> tuple[str, str]:
+        token = str(spec).strip()
+        if not token:
+            raise ValueError("Custom index spec cannot be empty.")
+        alias, separator, ticker = token.partition("=")
+        alias_key = canonical_pair_symbol(alias.strip(), asset_class="SPOT")
+        ticker_value = self._extract_yahoo_ticker(ticker.strip())
+        if not separator or not alias_key or not ticker_value:
+            raise ValueError(
+                "Custom index specs must look like BASE_SYMBOL=YAHOO_TICKER, "
+                "for example DAX=^GDAXI."
+            )
+        return alias_key, ticker_value
+
+    def register_custom_index(
+        self,
+        spec: str,
+        *,
+        persist: bool = True,
+    ) -> YahooInstrument:
+        alias_key, ticker_value = self._parse_custom_index_spec(spec)
+        instrument = YahooInstrument(
+            base_symbol=alias_key,
+            ticker=ticker_value,
+            quote_asset=self._infer_quote_asset(ticker_value),
+        )
+
+        builtin = YAHOO_INSTRUMENTS.get(alias_key)
+        if builtin is not None and (
+            builtin.base_symbol != instrument.base_symbol
+            or builtin.ticker.upper() != instrument.ticker.upper()
+        ):
+            raise ValueError(
+                f"Cannot overwrite built-in Yahoo mapping for {alias_key}: "
+                f"{builtin.ticker} is already registered."
+            )
+
+        self.custom_instrument_records[alias_key] = instrument
+        self.custom_instruments = self._build_custom_instrument_lookup(
+            self.custom_instrument_records
+        )
+        if persist:
+            self._persist_custom_instrument_records()
+        return instrument
+
+    def list_available_symbols(self) -> list[tuple[str, str, str]]:
+        rows: dict[str, tuple[str, str, str]] = {}
+
+        def _add_row(alias: str, instrument: YahooInstrument, source: str) -> None:
+            alias_key = canonical_pair_symbol(alias, asset_class="SPOT") or alias.upper()
+            rows[alias_key] = (alias_key, instrument.ticker, source)
+
+        for alias, instrument in YAHOO_INSTRUMENTS.items():
+            alias_key = canonical_pair_symbol(alias, asset_class="SPOT") or alias.upper()
+            if alias_key != alias.upper():
+                continue
+            _add_row(alias_key, instrument, "builtin")
+
+        for alias_key, instrument in self.custom_instrument_records.items():
+            _add_row(alias_key, instrument, "custom")
+
+        return [rows[key] for key in sorted(rows)]
+
+    def _cpu_percent_from_proc_stat(self, sample_seconds: float) -> float:
+        sample_seconds = max(float(sample_seconds), 0.1)
+
+        def _read_snapshot() -> tuple[int, int] | None:
+            try:
+                with open("/proc/stat", encoding="utf-8") as handle:
+                    columns = handle.readline().strip().split()
+            except OSError:
+                return None
+            if not columns or columns[0] != "cpu":
+                return None
+            try:
+                values = [int(value) for value in columns[1:]]
+            except ValueError:
+                return None
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            return sum(values), idle
+
+        first = _read_snapshot()
+        if first is None:
+            cpu_count = os.cpu_count() or 1
+            load_avg = os.getloadavg()[0]
+            return max(0.0, min((load_avg / cpu_count) * 100.0, 100.0))
+
+        time.sleep(sample_seconds)
+        second = _read_snapshot()
+        if second is None:
+            cpu_count = os.cpu_count() or 1
+            load_avg = os.getloadavg()[0]
+            return max(0.0, min((load_avg / cpu_count) * 100.0, 100.0))
+
+        total_delta = max(second[0] - first[0], 1)
+        idle_delta = max(second[1] - first[1], 0)
+        busy_delta = max(total_delta - idle_delta, 0)
+        return max(0.0, min((busy_delta / total_delta) * 100.0, 100.0))
+
+    def _measure_yahoo_download_kbps(
+        self,
+        *,
+        probe_url: str,
+        timeout_seconds: float,
+        read_limit_bytes: int = DEFAULT_AUTO_SYNC_PROBE_READ_LIMIT_BYTES,
+    ) -> float:
+        request = urllib.request.Request(
+            probe_url,
+            headers={
+                "User-Agent": "Universal-ML/1.0 (+https://query1.finance.yahoo.com/)"
+            },
+        )
+        start = time.perf_counter()
+        bytes_read = 0
+        with urllib.request.urlopen(request, timeout=max(float(timeout_seconds), 1.0)) as response:
+            while bytes_read < read_limit_bytes:
+                chunk = response.read(min(65536, read_limit_bytes - bytes_read))
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+
+        elapsed = max(time.perf_counter() - start, 1e-6)
+        return (bytes_read / 1024.0) / elapsed
+
+    def resource_gate_snapshot(
+        self,
+        *,
+        max_cpu_percent: float,
+        cpu_sample_seconds: float,
+        min_download_kbps: float,
+        probe_url: str,
+        probe_timeout_seconds: float,
+    ) -> dict[str, object]:
+        snapshot = {
+            "checked_at": self._sync_now_utc(),
+            "cpu_percent": float("nan"),
+            "download_kbps": float("nan"),
+            "cpu_ok": True,
+            "network_ok": True,
+            "ready": False,
+            "network_error": None,
+            "probe_url": probe_url,
+        }
+
+        cpu_percent = self._cpu_percent_from_proc_stat(cpu_sample_seconds)
+        snapshot["cpu_percent"] = cpu_percent
+        snapshot["cpu_ok"] = cpu_percent <= float(max_cpu_percent)
+
+        if min_download_kbps > 0:
+            try:
+                download_kbps = self._measure_yahoo_download_kbps(
+                    probe_url=probe_url,
+                    timeout_seconds=probe_timeout_seconds,
+                )
+            except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+                snapshot["download_kbps"] = 0.0
+                snapshot["network_ok"] = False
+                snapshot["network_error"] = str(exc)
+            else:
+                snapshot["download_kbps"] = download_kbps
+                snapshot["network_ok"] = download_kbps >= float(min_download_kbps)
+
+        snapshot["ready"] = bool(snapshot["cpu_ok"] and snapshot["network_ok"])
+        return snapshot
+
+    def print_resource_gate_snapshot(
+        self,
+        *,
+        max_cpu_percent: float,
+        cpu_sample_seconds: float,
+        min_download_kbps: float,
+        probe_url: str,
+        probe_timeout_seconds: float,
+    ) -> dict[str, object]:
+        snapshot = self.resource_gate_snapshot(
+            max_cpu_percent=max_cpu_percent,
+            cpu_sample_seconds=cpu_sample_seconds,
+            min_download_kbps=min_download_kbps,
+            probe_url=probe_url,
+            probe_timeout_seconds=probe_timeout_seconds,
+        )
+        print("Yahoo auto-sync resource gate snapshot")
+        print(
+            f"  checked_at    : {snapshot['checked_at']}\n"
+            f"  cpu_percent   : {snapshot['cpu_percent']:.1f}\n"
+            f"  cpu_ok        : {snapshot['cpu_ok']}\n"
+            f"  download_kbps : {snapshot['download_kbps']:.1f}\n"
+            f"  network_ok    : {snapshot['network_ok']}\n"
+            f"  ready         : {snapshot['ready']}"
+        )
+        if snapshot["network_error"]:
+            print(f"  network_error : {snapshot['network_error']}")
+        print(f"  probe_url     : {snapshot['probe_url']}")
+        return snapshot
+
+    def auto_sync(
+        self,
+        base_symbols: Iterable[str] | None = None,
+        pause_seconds: float = 1.0,
+        *,
+        force_full_refresh: bool = False,
+        check_interval_seconds: float = DEFAULT_AUTO_SYNC_CHECK_INTERVAL_SECONDS,
+        min_sync_gap_seconds: float = DEFAULT_AUTO_SYNC_MIN_GAP_SECONDS,
+        max_cpu_percent: float = DEFAULT_AUTO_SYNC_MAX_CPU_PERCENT,
+        cpu_sample_seconds: float = DEFAULT_AUTO_SYNC_CPU_SAMPLE_SECONDS,
+        min_download_kbps: float = DEFAULT_AUTO_SYNC_MIN_DOWNLOAD_KBPS,
+        probe_url: str = DEFAULT_AUTO_SYNC_PROBE_URL,
+        probe_timeout_seconds: float = DEFAULT_AUTO_SYNC_PROBE_TIMEOUT_SECONDS,
+    ) -> None:
+        check_interval_seconds = max(float(check_interval_seconds), 1.0)
+        min_sync_gap_seconds = max(float(min_sync_gap_seconds), 0.0)
+        last_attempt_started_monotonic: float | None = None
+
+        print("Starting resource-gated Yahoo auto-sync supervisor.")
+        print(
+            "  thresholds: "
+            f"cpu<={max_cpu_percent:.1f}% | "
+            f"download>={min_download_kbps:.1f} KB/s | "
+            f"min_gap={min_sync_gap_seconds:.0f}s | "
+            f"check_every={check_interval_seconds:.0f}s"
+        )
+
+        while True:
+            now_monotonic = time.monotonic()
+            if last_attempt_started_monotonic is not None:
+                seconds_since_last_attempt = now_monotonic - last_attempt_started_monotonic
+                if seconds_since_last_attempt < min_sync_gap_seconds:
+                    remaining = min_sync_gap_seconds - seconds_since_last_attempt
+                    print(
+                        "  [auto] Cooling down before next sync window: "
+                        f"{remaining:.0f}s remaining."
+                    )
+                    time.sleep(min(check_interval_seconds, max(remaining, 1.0)))
+                    continue
+
+            snapshot = self.resource_gate_snapshot(
+                max_cpu_percent=max_cpu_percent,
+                cpu_sample_seconds=cpu_sample_seconds,
+                min_download_kbps=min_download_kbps,
+                probe_url=probe_url,
+                probe_timeout_seconds=probe_timeout_seconds,
+            )
+            if not snapshot["ready"]:
+                network_detail = ""
+                if snapshot["network_error"]:
+                    network_detail = f" | network_error={snapshot['network_error']}"
+                print(
+                    "  [auto] Waiting for healthy resource window: "
+                    f"cpu={snapshot['cpu_percent']:.1f}% "
+                    f"(limit {max_cpu_percent:.1f}%) | "
+                    f"download={snapshot['download_kbps']:.1f} KB/s "
+                    f"(floor {min_download_kbps:.1f})"
+                    f"{network_detail}"
+                )
+                time.sleep(check_interval_seconds)
+                continue
+
+            print(
+                "  [auto] Resource window open. Launching sync: "
+                f"cpu={snapshot['cpu_percent']:.1f}% | "
+                f"download={snapshot['download_kbps']:.1f} KB/s"
+            )
+            last_attempt_started_monotonic = time.monotonic()
+            try:
+                self.sync(
+                    base_symbols=base_symbols,
+                    pause_seconds=pause_seconds,
+                    force_full_refresh=force_full_refresh,
+                )
+            except Exception as exc:
+                print(f"  [auto] Sync cycle failed: {exc}")
+            else:
+                print(f"  [auto] Sync cycle finished at {self._sync_now_utc()}.")
+
 
     def _configure_connection(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -440,12 +850,23 @@ class YFinanceVault:
         if instrument is not None:
             return instrument
 
+        custom_instrument = self.custom_instruments.get(key)
+        if custom_instrument is not None:
+            return custom_instrument
+
+        yahoo_ticker = self._extract_yahoo_ticker(raw_symbol)
+        custom_instrument = self.custom_instruments.get(yahoo_ticker.upper())
+        if custom_instrument is not None:
+            return custom_instrument
+
         pair_symbol = canonical_pair_symbol(raw_symbol, asset_class="SPOT")
         mapped_instrument = YAHOO_INSTRUMENTS.get(pair_symbol)
         if mapped_instrument is not None:
             return mapped_instrument
+        mapped_custom_instrument = self.custom_instruments.get(pair_symbol)
+        if mapped_custom_instrument is not None:
+            return mapped_custom_instrument
 
-        yahoo_ticker = self._extract_yahoo_ticker(raw_symbol)
         return YahooInstrument(
             base_symbol=pair_symbol or key,
             ticker=yahoo_ticker,
@@ -1168,25 +1589,51 @@ class YFinanceVault:
         result = df.copy()
         result["realized_volatility"] = np.nan
 
-        for timeframe, annualization_factor in REALIZED_VOL_ANNUALIZATION.items():
+        for timeframe, ann_factor in REALIZED_VOL_ANNUALIZATION.items():
             tf_mask = result["timeframe"] == timeframe
             if not tf_mask.any():
                 continue
 
             tf_df = result.loc[tf_mask].sort_values("timestamp").copy()
-            closes = tf_df["close"].where(tf_df["close"] > 0)
+            o = tf_df["open"].to_numpy(dtype=float)
+            h = tf_df["high"].to_numpy(dtype=float)
+            lo = tf_df["low"].to_numpy(dtype=float)
+            c = tf_df["close"].to_numpy(dtype=float)
+            n_bars = len(c)
+            window = 21
+
+            rv_yz = np.full(n_bars, np.nan)
 
             with np.errstate(divide="ignore", invalid="ignore"):
-                log_returns = np.log(closes / closes.shift(1))
+                log_oc = np.log(np.maximum(c, 1e-9) / np.maximum(o, 1e-9))
+                log_co = np.zeros(n_bars)
+                log_co[1:] = np.log(np.maximum(o[1:], 1e-9) / np.maximum(c[:-1], 1e-9))
+                log_hc = np.log(np.maximum(h, 1e-9) / np.maximum(c, 1e-9))
+                log_ho = np.log(np.maximum(h, 1e-9) / np.maximum(o, 1e-9))
+                log_lc = np.log(np.maximum(lo, 1e-9) / np.maximum(c, 1e-9))
+                log_lo = np.log(np.maximum(lo, 1e-9) / np.maximum(o, 1e-9))
+                rs = log_hc * log_ho + log_lc * log_lo
 
-            bpv_component = (
-                (np.pi / 2.0) * log_returns.abs() * log_returns.shift(1).abs()
-            )
-            rolling_sum = bpv_component.rolling(window=21, min_periods=2).sum()
-            rv = np.sqrt(np.maximum(rolling_sum * annualization_factor, 0.0))
-            rv = rv.bfill().fillna(0.0)
+            k = 0.34 / (1.34 + (window + 1) / (window - 1))
 
-            result.loc[tf_df.index, "realized_volatility"] = rv.to_numpy()
+            for i in range(window, n_bars):
+                s = slice(i - window + 1, i + 1)
+                co_s = log_co[max(i - window + 2, 1):i + 1]
+                if len(co_s) < 2:
+                    continue
+                mu_o = co_s.mean()
+                sigma_o2 = float(np.mean((co_s - mu_o) ** 2))
+                oc_s = log_oc[s]
+                mu_c = oc_s.mean()
+                sigma_c2 = float(np.mean((oc_s - mu_c) ** 2))
+                sigma_rs2 = float(rs[s].mean())
+                yz_var = sigma_o2 + k * sigma_rs2 + (1.0 - k) * sigma_c2
+                if np.isfinite(yz_var) and yz_var > 0:
+                    rv_yz[i] = np.sqrt(yz_var * ann_factor)
+
+            rv_series = pd.Series(rv_yz, index=tf_df.index)
+            rv_series = rv_series.bfill().fillna(0.0)
+            result.loc[tf_df.index, "realized_volatility"] = rv_series.to_numpy()
 
         return self._copy_attrs(df, result)
 
@@ -1536,6 +1983,11 @@ class YFinanceVault:
                 for symbol in YAHOO_INSTRUMENTS
                 if symbol not in CORE_WATCHLIST_SYMBOLS
             ]
+            requested_symbols.extend(
+                alias
+                for alias in sorted(self.custom_instrument_records)
+                if alias not in requested_symbols
+            )
         else:
             requested_symbols = [str(symbol).strip() for symbol in base_symbols if str(symbol).strip()]
 
@@ -1574,12 +2026,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--symbol",
         action="append",
         default=None,
-        help="Base symbol to sync. Repeat for multiple symbols. Defaults to all mapped symbols.",
+        help=(
+            "Base symbol to sync. Repeat for multiple symbols. Accepts curated aliases, "
+            "custom registered aliases, and raw Yahoo tickers. Defaults to all mapped symbols."
+        ),
+    )
+    parser.add_argument(
+        "--import-index",
+        action="append",
+        default=None,
+        help=(
+            "Import an index without agent help. Use ALIAS=YAHOO_TICKER to persist a new "
+            "local alias and sync it immediately, or pass a raw Yahoo ticker like ^GDAXI."
+        ),
+    )
+    parser.add_argument(
+        "--register-index",
+        action="append",
+        default=None,
+        help=(
+            "Persist a custom Yahoo-backed index alias without syncing yet. "
+            "Format: ALIAS=YAHOO_TICKER, for example DAX=^GDAXI."
+        ),
     )
     parser.add_argument(
         "--db-path",
         default="ohlcv.db",
         help="SQLite database path. Defaults to data_vault/ohlcv.db.",
+    )
+    parser.add_argument(
+        "--custom-instruments-path",
+        default=None,
+        help=(
+            "JSON file that stores custom Yahoo-backed aliases. "
+            "Defaults to data_vault/custom_yahoo_instruments.json."
+        ),
+    )
+    parser.add_argument(
+        "--list-symbols",
+        action="store_true",
+        help=(
+            "List the built-in and custom Yahoo-backed aliases currently available "
+            "for plain --symbol use."
+        ),
     )
     parser.add_argument(
         "--pause-seconds",
@@ -1592,19 +2081,151 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore incremental windows and rebuild each requested symbol from Yahoo max history.",
     )
+    parser.add_argument(
+        "--auto-sync",
+        action="store_true",
+        help=(
+            "Keep the vault running and auto-sync only when CPU load and Yahoo probe speed "
+            "meet the configured thresholds."
+        ),
+    )
+    parser.add_argument(
+        "--auto-check-interval-seconds",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_CHECK_INTERVAL_SECONDS,
+        help="How often the auto-sync supervisor checks resource health.",
+    )
+    parser.add_argument(
+        "--auto-min-sync-gap-seconds",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_MIN_GAP_SECONDS,
+        help="Minimum wall-clock gap between auto-sync attempts.",
+    )
+    parser.add_argument(
+        "--auto-max-cpu-percent",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_MAX_CPU_PERCENT,
+        help="Maximum sampled CPU usage percent allowed before an auto-sync may start.",
+    )
+    parser.add_argument(
+        "--auto-cpu-sample-seconds",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_CPU_SAMPLE_SECONDS,
+        help="Sampling window used to estimate CPU usage before each auto-sync decision.",
+    )
+    parser.add_argument(
+        "--auto-min-download-kbps",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_MIN_DOWNLOAD_KBPS,
+        help="Minimum Yahoo probe download throughput required before an auto-sync may start.",
+    )
+    parser.add_argument(
+        "--auto-probe-url",
+        default=DEFAULT_AUTO_SYNC_PROBE_URL,
+        help="Yahoo endpoint used to estimate download throughput for auto-sync gating.",
+    )
+    parser.add_argument(
+        "--auto-probe-timeout-seconds",
+        type=float,
+        default=DEFAULT_AUTO_SYNC_PROBE_TIMEOUT_SECONDS,
+        help="Timeout used by the Yahoo probe request for auto-sync gating.",
+    )
+    parser.add_argument(
+        "--resource-gate-status",
+        action="store_true",
+        help=(
+            "Print a one-shot CPU and Yahoo throughput snapshot using the current "
+            "auto-sync thresholds, then exit unless other work was requested."
+        ),
+    )
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    vault = YFinanceVault(db_path=args.db_path)
-    vault.sync(
-        base_symbols=args.symbol,
-        pause_seconds=args.pause_seconds,
-        force_full_refresh=args.full_refresh,
+    vault = YFinanceVault(
+        db_path=args.db_path,
+        custom_instruments_path=args.custom_instruments_path,
     )
-    print("Yahoo Finance sync complete. Database locked and ready.")
+
+    requested_symbols = list(args.symbol or [])
+
+    for spec in args.register_index or []:
+        instrument = vault.register_custom_index(spec)
+        print(
+            f"[register-index] {instrument.base_symbol} -> {instrument.ticker} "
+            f"saved to {vault.custom_instruments_path}"
+        )
+
+    for spec in args.import_index or []:
+        token = str(spec).strip()
+        if not token:
+            continue
+        if "=" in token:
+            instrument = vault.register_custom_index(token)
+            requested_symbols.append(instrument.base_symbol)
+            print(
+                f"[import-index] registered {instrument.base_symbol} -> {instrument.ticker} "
+                "and queued it for sync."
+            )
+        else:
+            requested_symbols.append(token)
+
+    did_auxiliary_action = False
+
+    if args.list_symbols:
+        print("Available Yahoo-backed aliases")
+        for alias_key, ticker, source in vault.list_available_symbols():
+            print(f"  {alias_key:16s} -> {ticker:20s} [{source}]")
+        print("  Raw Yahoo tickers such as ^GDAXI or EURUSD=X also work directly.")
+        did_auxiliary_action = True
+
+    if args.resource_gate_status:
+        vault.print_resource_gate_snapshot(
+            max_cpu_percent=args.auto_max_cpu_percent,
+            cpu_sample_seconds=args.auto_cpu_sample_seconds,
+            min_download_kbps=args.auto_min_download_kbps,
+            probe_url=args.auto_probe_url,
+            probe_timeout_seconds=args.auto_probe_timeout_seconds,
+        )
+        did_auxiliary_action = True
+
+    sync_requested = bool(
+        requested_symbols
+        or args.import_index
+        or (
+            not args.register_index
+            and not args.list_symbols
+            and not args.resource_gate_status
+        )
+    )
+
+    if args.auto_sync:
+        vault.auto_sync(
+            base_symbols=requested_symbols or None,
+            pause_seconds=args.pause_seconds,
+            force_full_refresh=args.full_refresh,
+            check_interval_seconds=args.auto_check_interval_seconds,
+            min_sync_gap_seconds=args.auto_min_sync_gap_seconds,
+            max_cpu_percent=args.auto_max_cpu_percent,
+            cpu_sample_seconds=args.auto_cpu_sample_seconds,
+            min_download_kbps=args.auto_min_download_kbps,
+            probe_url=args.auto_probe_url,
+            probe_timeout_seconds=args.auto_probe_timeout_seconds,
+        )
+        return 0
+
+    if sync_requested:
+        vault.sync(
+            base_symbols=requested_symbols or None,
+            pause_seconds=args.pause_seconds,
+            force_full_refresh=args.full_refresh,
+        )
+        print("Yahoo Finance sync complete. Database locked and ready.")
+    else:
+        if not did_auxiliary_action:
+            print("Custom index registry updated. No sync requested.")
     return 0
 
 

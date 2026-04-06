@@ -1,0 +1,14 @@
+[Unit]
+Description=Universal-ML Yahoo vault auto-sync supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/km/Universal-ML
+ExecStart=/home/km/Universal-ML/start_vault_autosync.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

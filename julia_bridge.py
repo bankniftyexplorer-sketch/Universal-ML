@@ -106,6 +106,32 @@ def _compute_atr14_array(
     return atr
 
 
+def _compute_contract_atr14_array(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+) -> np.ndarray:
+    """
+    Match universal_ml_engine._compute_atr14() exactly for the Kalman contract.
+
+    This uses the repo's canonical rolling-mean ATR14 with early bars filled by
+    the raw true range, which differs from the bridge's legacy Wilder helper.
+    """
+    prev_close = np.empty_like(closes, dtype=np.float64)
+    prev_close[0] = closes[0]
+    prev_close[1:] = closes[:-1]
+    tr = np.maximum(
+        highs - lows,
+        np.maximum(
+            np.abs(highs - prev_close),
+            np.abs(lows - prev_close),
+        ),
+    )
+    tr_series = pd.Series(tr)
+    atr = tr_series.rolling(14).mean().fillna(tr_series).to_numpy(dtype=np.float64)
+    return _to_f64(atr)
+
+
 def _times_to_ns(series: pd.Series) -> np.ndarray:
     """
     Convert a pandas datetime Series to int64 Unix nanoseconds (sorted ascending).
@@ -137,18 +163,6 @@ _THERMO_COLS = (
     "session_time_pos",
     "eod_basis_momentum",
 )
-_FIB_SLOTS = ("a", "b", "c")
-_FIB_FIELDS = (
-    "close_pos",
-    "zone",
-    "wick_rej_bull",
-    "wick_rej_bear",
-    "body_acc",
-    "ext_pct",
-)
-_FIB_ALL_COLS = tuple(
-    f"fib_{slot}_{field}" for slot in _FIB_SLOTS for field in _FIB_FIELDS
-)
 _THERMO_NT_FIELDS = (
     "basis_pct",
     "basis_z",
@@ -156,7 +170,6 @@ _THERMO_NT_FIELDS = (
     "basis_v10",
     "session_pos",
     "eod_momentum",
-    *_FIB_ALL_COLS,
 )
 
 
@@ -164,10 +177,6 @@ def _build_thermo(df: pd.DataFrame, n: int):
     """
     Build thermo NamedTuple for Julia if all base thermodynamic columns exist.
     Returns None otherwise (Julia side checks for `nothing`).
-
-    Fib columns are included when present and zero-filled when absent so the
-    Julia DNA layer can keep a stable field contract across training and
-    inference paths.
     """
     if not all(c in df.columns for c in _THERMO_COLS):
         return None
@@ -176,11 +185,6 @@ def _build_thermo(df: pd.DataFrame, n: int):
     field_sig = ", ".join(_THERMO_NT_FIELDS)
     thermo_namedtuple = jl.seval(f"({field_sig}) -> (; {field_sig})")
 
-    def _fib(col: str) -> np.ndarray:
-        if col in df.columns:
-            return _to_f64(df[col].to_numpy()[:n])
-        return np.zeros(n, dtype=np.float64)
-
     return thermo_namedtuple(
         _to_f64(df["basis_pct"].to_numpy()[:n]),
         _to_f64(df["basis_z_score"].to_numpy()[:n]),
@@ -188,7 +192,6 @@ def _build_thermo(df: pd.DataFrame, n: int):
         _to_f64(df["basis_vel_10"].to_numpy()[:n]),
         _to_f64(df["session_time_pos"].to_numpy()[:n]),
         _to_f64(df["eod_basis_momentum"].to_numpy()[:n]),
-        *[_fib(col) for col in _FIB_ALL_COLS],
     )
 
 
@@ -204,6 +207,396 @@ def _jl_dict_to_df(jl_dict, index: pd.Index) -> pd.DataFrame:
         vec = np.array(jl_dict[k], dtype=np.float64)
         py_dict[key] = vec
     return pd.DataFrame(py_dict, index=index)
+
+
+def _prepare_kalman_frame(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    return df.sort_values("time").reset_index(drop=True).copy()
+
+
+def _extract_kalman_inputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    src = _prepare_kalman_frame(df)
+    if src is None:
+        raise ValueError("Kalman frame is missing or empty.")
+
+    opens = _to_f64(src["open"].to_numpy())
+    highs = _to_f64(src["high"].to_numpy())
+    lows = _to_f64(src["low"].to_numpy())
+    closes = _to_f64(src["close"].to_numpy())
+    volumes = _to_f64(np.nan_to_num(src["volume"].to_numpy(dtype=float), nan=0.0))
+
+    if "atr14" in src.columns:
+        atr = _to_f64(src["atr14"].to_numpy())
+        invalid = ~np.isfinite(atr) | (atr <= 0.0)
+        if np.any(invalid):
+            fallback = _compute_contract_atr14_array(highs, lows, closes)
+            atr = atr.copy()
+            atr[invalid] = fallback[invalid]
+    else:
+        atr = _compute_contract_atr14_array(highs, lows, closes)
+
+    invalid = ~np.isfinite(atr) | (atr <= 0.0)
+    if np.any(invalid):
+        atr = atr.copy()
+        atr[invalid] = 1.0
+
+    return {
+        "time": _times_to_ns(src["time"]),
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+        "atr": atr,
+    }
+
+
+def _materialize_kalman_state(state) -> dict[str, np.ndarray]:
+    return {
+        "kalman": np.array(state.kalman, dtype=np.float64),
+        "regime": np.array(state.regime, dtype=np.float64),
+        "bar_delta": np.array(state.bar_delta, dtype=np.float64),
+        "swing_accum": np.array(state.swing_accum, dtype=np.float64),
+        "net_swing_delta": np.array(state.net_swing_delta, dtype=np.float64),
+        "swing_type": np.array(state.swing_type, dtype=np.int64),
+        "swing_price": np.array(state.swing_price, dtype=np.float64),
+        "swing_bar": np.array(state.swing_bar, dtype=np.int64),
+        "confirm_bar": np.array(state.confirm_bar, dtype=np.int64),
+        "segment_direction": np.array(state.segment_direction, dtype=np.int64),
+        "segment_start_confirm_bar": np.array(
+            state.segment_start_confirm_bar,
+            dtype=np.int64,
+        ),
+        "segment_end_confirm_bar": np.array(
+            state.segment_end_confirm_bar,
+            dtype=np.int64,
+        ),
+        "segment_bar_count": np.array(state.segment_bar_count, dtype=np.int64),
+        "segment_raw_delta": np.array(state.segment_raw_delta, dtype=np.float64),
+        "segment_high": np.array(state.segment_high, dtype=np.float64),
+        "segment_low": np.array(state.segment_low, dtype=np.float64),
+        "segment_price_range": np.array(state.segment_price_range, dtype=np.float64),
+        "segment_atr_ref": np.array(state.segment_atr_ref, dtype=np.float64),
+        "bull_swing_delta": np.array(state.bull_swing_delta, dtype=np.float64),
+        "prev_bull_swing_delta": np.array(
+            state.prev_bull_swing_delta,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_div": np.array(
+            state.bull_swing_delta_div,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta": np.array(state.bear_swing_delta, dtype=np.float64),
+        "prev_bear_swing_delta": np.array(
+            state.prev_bear_swing_delta,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_div": np.array(
+            state.bear_swing_delta_div,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_per_bar": np.array(
+            state.bull_swing_delta_per_bar,
+            dtype=np.float64,
+        ),
+        "prev_bull_swing_delta_per_bar": np.array(
+            state.prev_bull_swing_delta_per_bar,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_per_bar_div": np.array(
+            state.bull_swing_delta_per_bar_div,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_per_bar": np.array(
+            state.bear_swing_delta_per_bar,
+            dtype=np.float64,
+        ),
+        "prev_bear_swing_delta_per_bar": np.array(
+            state.prev_bear_swing_delta_per_bar,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_per_bar_div": np.array(
+            state.bear_swing_delta_per_bar_div,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_per_range": np.array(
+            state.bull_swing_delta_per_range,
+            dtype=np.float64,
+        ),
+        "prev_bull_swing_delta_per_range": np.array(
+            state.prev_bull_swing_delta_per_range,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_per_range_div": np.array(
+            state.bull_swing_delta_per_range_div,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_per_range": np.array(
+            state.bear_swing_delta_per_range,
+            dtype=np.float64,
+        ),
+        "prev_bear_swing_delta_per_range": np.array(
+            state.prev_bear_swing_delta_per_range,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_per_range_div": np.array(
+            state.bear_swing_delta_per_range_div,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_per_atr_range": np.array(
+            state.bull_swing_delta_per_atr_range,
+            dtype=np.float64,
+        ),
+        "prev_bull_swing_delta_per_atr_range": np.array(
+            state.prev_bull_swing_delta_per_atr_range,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_per_atr_range_div": np.array(
+            state.bull_swing_delta_per_atr_range_div,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_per_atr_range": np.array(
+            state.bear_swing_delta_per_atr_range,
+            dtype=np.float64,
+        ),
+        "prev_bear_swing_delta_per_atr_range": np.array(
+            state.prev_bear_swing_delta_per_atr_range,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_per_atr_range_div": np.array(
+            state.bear_swing_delta_per_atr_range_div,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_eff": np.array(
+            state.bull_swing_delta_eff,
+            dtype=np.float64,
+        ),
+        "prev_bull_swing_delta_eff": np.array(
+            state.prev_bull_swing_delta_eff,
+            dtype=np.float64,
+        ),
+        "bull_swing_delta_eff_div": np.array(
+            state.bull_swing_delta_eff_div,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_eff": np.array(
+            state.bear_swing_delta_eff,
+            dtype=np.float64,
+        ),
+        "prev_bear_swing_delta_eff": np.array(
+            state.prev_bear_swing_delta_eff,
+            dtype=np.float64,
+        ),
+        "bear_swing_delta_eff_div": np.array(
+            state.bear_swing_delta_eff_div,
+            dtype=np.float64,
+        ),
+    }
+
+
+def _split_swings_by_type(state: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    swing_type = state["swing_type"]
+    swing_price = state["swing_price"]
+    confirm_bar = state["confirm_bar"]
+    high_mask = swing_type == 1
+    low_mask = swing_type == -1
+    return {
+        "high_price": _to_f64(swing_price[high_mask]),
+        "high_confirm": _to_i64(confirm_bar[high_mask]),
+        "low_price": _to_f64(swing_price[low_mask]),
+        "low_confirm": _to_i64(confirm_bar[low_mask]),
+    }
+
+
+def _map_htf_series_to_primary(
+    primary_times_ns: np.ndarray,
+    htf_times_ns: np.ndarray,
+    values: np.ndarray,
+) -> np.ndarray:
+    mapped = np.zeros(len(primary_times_ns), dtype=np.float64)
+    if len(htf_times_ns) == 0 or len(values) == 0:
+        return mapped
+    idx_map = np.searchsorted(htf_times_ns, primary_times_ns, side="right") - 1
+    valid = (idx_map >= 0) & (idx_map < len(values))
+    if np.any(valid):
+        mapped[valid] = values[idx_map[valid]]
+    return mapped
+
+
+_KALMAN_BASE_STATE_FIELDS = (
+    "bar_delta",
+    "regime",
+    "swing_accum",
+    "net_swing_delta",
+)
+_KALMAN_DIRECTIONAL_STATE_FIELDS = (
+    "bull_swing_delta",
+    "prev_bull_swing_delta",
+    "bull_swing_delta_div",
+    "bear_swing_delta",
+    "prev_bear_swing_delta",
+    "bear_swing_delta_div",
+    "bull_swing_delta_per_bar",
+    "prev_bull_swing_delta_per_bar",
+    "bull_swing_delta_per_bar_div",
+    "bear_swing_delta_per_bar",
+    "prev_bear_swing_delta_per_bar",
+    "bear_swing_delta_per_bar_div",
+    "bull_swing_delta_per_range",
+    "prev_bull_swing_delta_per_range",
+    "bull_swing_delta_per_range_div",
+    "bear_swing_delta_per_range",
+    "prev_bear_swing_delta_per_range",
+    "bear_swing_delta_per_range_div",
+    "bull_swing_delta_per_atr_range",
+    "prev_bull_swing_delta_per_atr_range",
+    "bull_swing_delta_per_atr_range_div",
+    "bear_swing_delta_per_atr_range",
+    "prev_bear_swing_delta_per_atr_range",
+    "bear_swing_delta_per_atr_range_div",
+    "bull_swing_delta_eff",
+    "prev_bull_swing_delta_eff",
+    "bull_swing_delta_eff_div",
+    "bear_swing_delta_eff",
+    "prev_bear_swing_delta_eff",
+    "bear_swing_delta_eff_div",
+)
+_KALMAN_STATE_FIELDS = _KALMAN_BASE_STATE_FIELDS + _KALMAN_DIRECTIONAL_STATE_FIELDS
+_KALMAN_PIPELINES = {
+    "1H": {
+        "pairs": (("a", "1M"), ("b", "1W"), ("c", "1D")),
+        "mapped": ("1M", "1W", "1D"),
+    },
+    "1D": {
+        "pairs": (("a", "6M"), ("b", "1M"), ("c", "1W")),
+        "mapped": ("6M", "1M", "1W"),
+    },
+}
+
+
+def _kalman_structural_engine(
+    df_primary: pd.DataFrame,
+    htf_frames: dict[str, pd.DataFrame | None],
+    *,
+    primary_tf: str,
+) -> pd.DataFrame:
+    """
+    Compute the full Kalman structural feature family for the requested lane.
+    """
+    config = _KALMAN_PIPELINES.get(primary_tf.upper())
+    if config is None:
+        raise ValueError(f"Unsupported Kalman structural primary TF: {primary_tf}")
+
+    primary = _prepare_kalman_frame(df_primary)
+    if primary is None:
+        return pd.DataFrame(index=df_primary.index)
+
+    _, TM = _init_julia()
+    primary_inputs = _extract_kalman_inputs(primary)
+    primary_state = _materialize_kalman_state(
+        TM.compute_kalman_tf_state(
+            primary_inputs["open"],
+            primary_inputs["high"],
+            primary_inputs["low"],
+            primary_inputs["close"],
+            primary_inputs["volume"],
+            primary_inputs["atr"],
+        )
+    )
+
+    result = pd.DataFrame(index=primary.index)
+    for field in _KALMAN_STATE_FIELDS:
+        result[f"kf_{field}"] = primary_state[field]
+
+    htf_states: dict[str, dict[str, np.ndarray] | None] = {}
+    for label in config["mapped"]:
+        frame = _prepare_kalman_frame(htf_frames.get(label))
+        if frame is None:
+            htf_states[label] = None
+            continue
+        inputs = _extract_kalman_inputs(frame)
+        state = _materialize_kalman_state(
+            TM.compute_kalman_tf_state(
+                inputs["open"],
+                inputs["high"],
+                inputs["low"],
+                inputs["close"],
+                inputs["volume"],
+                inputs["atr"],
+            )
+        )
+        inputs.update(state)
+        htf_states[label] = inputs
+
+        prefix = label.lower()
+        for field in _KALMAN_STATE_FIELDS:
+            result[f"kf_{prefix}_{field}"] = _map_htf_series_to_primary(
+                primary_inputs["time"],
+                inputs["time"],
+                inputs[field],
+            )
+
+    empty_f64 = np.empty(0, dtype=np.float64)
+    empty_i64 = np.empty(0, dtype=np.int64)
+
+    for slot, label in config["pairs"]:
+        htf_state = htf_states.get(label)
+        if htf_state is None:
+            fib_jl = TM.htf_fib_observation(
+                primary_inputs["open"],
+                primary_inputs["high"],
+                primary_inputs["low"],
+                primary_inputs["close"],
+                primary_inputs["atr"],
+                primary_state["bar_delta"],
+                primary_inputs["time"],
+                empty_f64,
+                empty_i64,
+                empty_f64,
+                empty_i64,
+                empty_i64,
+                slot,
+            )
+        else:
+            split_swings = _split_swings_by_type(htf_state)
+            fib_jl = TM.htf_fib_observation(
+                primary_inputs["open"],
+                primary_inputs["high"],
+                primary_inputs["low"],
+                primary_inputs["close"],
+                primary_inputs["atr"],
+                primary_state["bar_delta"],
+                primary_inputs["time"],
+                split_swings["high_price"],
+                split_swings["high_confirm"],
+                split_swings["low_price"],
+                split_swings["low_confirm"],
+                htf_state["time"],
+                slot,
+            )
+
+        fib_df = _jl_dict_to_df(fib_jl, primary.index)
+        for col in fib_df.columns:
+            result[col] = fib_df[col].values
+
+    ordered_cols = [
+        "kf_bar_delta",
+        "kf_regime",
+        "kf_swing_accum",
+        "kf_net_swing_delta",
+    ]
+    ordered_cols.extend(f"kf_{field}" for field in _KALMAN_DIRECTIONAL_STATE_FIELDS)
+    for slot, _ in config["pairs"]:
+        for ratio_idx in range(1, 8):
+            for obs in ("o", "h", "l", "c", "delta"):
+                ordered_cols.append(f"kf_{slot}_{ratio_idx}_{obs}")
+    for label in config["mapped"]:
+        prefix = label.lower()
+        for field in _KALMAN_STATE_FIELDS:
+            ordered_cols.append(f"kf_{prefix}_{field}")
+
+    return result.reindex(columns=ordered_cols, fill_value=0.0)
 
 
 def compute_hurst_fast(
@@ -415,6 +808,61 @@ def holographic_feature_engine_daily(
 
 
 # ─────────────────────────────────────────────────────────────
+# PUBLIC API: Kalman structural feature family
+# ─────────────────────────────────────────────────────────────
+
+
+def kalman_structural_engine_fast(
+    df_1h: pd.DataFrame,
+    df_1d: pd.DataFrame | None = None,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Compute the 1H-lane Kalman structural feature family.
+
+    Output columns include:
+    - primary: base Kalman state plus direction-aware completed swing families
+    - fib observation: `kf_a_*`, `kf_b_*`, `kf_c_*` across 7 fib ratios
+    - mapped HTF state: `kf_1m_*`, `kf_1w_*`, `kf_1d_*`
+    """
+    return _kalman_structural_engine(
+        df_1h,
+        {
+            "1D": df_1d,
+            "1W": df_1w,
+            "1M": df_1m,
+        },
+        primary_tf="1H",
+    )
+
+
+def kalman_structural_engine_daily(
+    df_1d: pd.DataFrame,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+    df_6m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Compute the 1D-lane Kalman structural feature family.
+
+    Output columns include:
+    - primary: base Kalman state plus direction-aware completed swing families
+    - fib observation: `kf_a_*`, `kf_b_*`, `kf_c_*` across 7 fib ratios
+    - mapped HTF state: `kf_6m_*`, `kf_1m_*`, `kf_1w_*`
+    """
+    return _kalman_structural_engine(
+        df_1d,
+        {
+            "1W": df_1w,
+            "1M": df_1m,
+            "6M": df_6m,
+        },
+        primary_tf="1D",
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # PUBLIC API: SMC institutional intent features
 # ─────────────────────────────────────────────────────────────
 
@@ -426,11 +874,11 @@ def smc_feature_engine_fast(
     df_1m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Compute 42 SMC institutional intent features for the 1H lane.
+    Compute 47 SMC institutional intent features for the 1H lane.
 
-    Layer 1: 30 primary features via ToonMath.compute_smc_features on 1H
+    Layer 1: 34 primary features via ToonMath.compute_smc_features on 1H
     Layer 2: 6 HTF projection features (structure_trend + amd_phase from 1D/1W/1M)
-    Layer 3: 6 confluence features (cross-TF interactions)
+    Layer 3: 7 confluence features (cross-TF interactions)
 
     Parameters
     ----------
@@ -439,7 +887,7 @@ def smc_feature_engine_fast(
 
     Returns
     -------
-    pd.DataFrame — 42 columns indexed same as df_1h, all column names prefixed 'smc_'
+    pd.DataFrame — 47 columns indexed same as df_1h, all column names prefixed 'smc_'
     """
     jl, TM = _init_julia()
 
@@ -450,7 +898,18 @@ def smc_feature_engine_fast(
     v = _to_f64(df_1h["volume"].to_numpy())
     a = _to_f64(df_1h["atr14"].to_numpy())
 
-    jl_result = TM.compute_smc_features(o, h, lo, c, v, a)
+    jl_result = TM.compute_smc_features(
+        o,
+        h,
+        lo,
+        c,
+        v,
+        a,
+        structure_window=24,
+        fvg_max_age=24,
+        ob_max_age=24,
+        warmup=32,
+    )
     smc_cols = {
         f"smc_{str(k)}": np.array(jl_result[k], dtype=np.float64) for k in jl_result
     }
@@ -503,7 +962,17 @@ def smc_feature_engine_fast(
         result["smc_amd_phase"] * result["smc_structure_trend_score"]
     )
     result["smc_full_entry_signal"] = (
-        result["smc_indu_confirmed"] * result["smc_mss_confirmed"]
+        result["smc_mss_confirmed"]
+        * np.where(
+            result["smc_pd_zone"] < 0.5,
+            1.0 - result["smc_pd_zone"],
+            result["smc_pd_zone"],
+        )
+    )
+    result["smc_pd_ob_confluence"] = np.where(
+        result["smc_ob_nearest_dist"] < 3.0,
+        np.abs(result["smc_pd_zone"] - 0.5) * result["smc_ob_quality_score"],
+        0.0,
     )
     result["smc_htf_trend_alignment"] = np.sign(
         result["smc_structure_trend_score"]
@@ -527,7 +996,7 @@ def smc_feature_engine_daily(
     df_6m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Compute 42 SMC institutional intent features for the 1D lane.
+    Compute 47 SMC institutional intent features for the 1D lane.
 
     Same architecture as smc_feature_engine_fast but:
     - Primary TF = 1D
@@ -540,7 +1009,7 @@ def smc_feature_engine_daily(
 
     Returns
     -------
-    pd.DataFrame — 42 columns, all prefixed 'smc_'
+    pd.DataFrame — 47 columns, all prefixed 'smc_'
     """
     jl, TM = _init_julia()
 
@@ -551,7 +1020,18 @@ def smc_feature_engine_daily(
     v = _to_f64(df_1d["volume"].to_numpy())
     a = _to_f64(df_1d["atr14"].to_numpy())
 
-    jl_result = TM.compute_smc_features(o, h, lo, c, v, a)
+    jl_result = TM.compute_smc_features(
+        o,
+        h,
+        lo,
+        c,
+        v,
+        a,
+        structure_window=40,
+        fvg_max_age=60,
+        ob_max_age=60,
+        warmup=50,
+    )
     smc_cols = {
         f"smc_{str(k)}": np.array(jl_result[k], dtype=np.float64) for k in jl_result
     }
@@ -604,7 +1084,17 @@ def smc_feature_engine_daily(
         result["smc_amd_phase"] * result["smc_structure_trend_score"]
     )
     result["smc_full_entry_signal"] = (
-        result["smc_indu_confirmed"] * result["smc_mss_confirmed"]
+        result["smc_mss_confirmed"]
+        * np.where(
+            result["smc_pd_zone"] < 0.5,
+            1.0 - result["smc_pd_zone"],
+            result["smc_pd_zone"],
+        )
+    )
+    result["smc_pd_ob_confluence"] = np.where(
+        result["smc_ob_nearest_dist"] < 3.0,
+        np.abs(result["smc_pd_zone"] - 0.5) * result["smc_ob_quality_score"],
+        0.0,
     )
     result["smc_htf_trend_alignment"] = np.sign(
         result["smc_structure_trend_score"]
@@ -708,3 +1198,150 @@ def add_target_fast(
         df["target"] = df["target"].fillna(0.5)
 
     return df
+
+
+# ─────────────────────────────────────────────────────────────
+# REALIZED VOLATILITY V2 — Julia-Native Multi-Estimator Surface
+# ─────────────────────────────────────────────────────────────
+
+_RV_FEAT_KEYS = [
+    "yz_log", "yz_z", "yz_pctrank", "yz_trend",
+    "yz_shock", "vov", "pk_log", "range_eff",
+    "jump_ratio", "rv_asym", "rv_skew",
+]
+
+
+def _rv_julia_to_columns(
+    jl_result,
+    prefix: str,
+) -> dict[str, np.ndarray]:
+    return {
+        f"rv_{prefix}_{str(k)}": np.array(jl_result[k], dtype=np.float64)
+        for k in _RV_FEAT_KEYS
+    }
+
+
+def _rv_htf_layer(
+    result: pd.DataFrame,
+    base_times_ns: np.ndarray,
+    primary_log_col: str,
+    htf_df: pd.DataFrame | None,
+    htf_label: str,
+    htf_ann: float,
+    TM,
+) -> pd.DataFrame:
+    htf_feat_cols = [f"rv_{htf_label}_{k}" for k in _RV_FEAT_KEYS]
+    term_col = f"rv_term_{htf_label}_{primary_log_col.split('_')[1]}"
+
+    if htf_df is None or len(htf_df) < 3:
+        for col in htf_feat_cols + [term_col]:
+            result[col] = 0.0
+        return result
+
+    src = htf_df.sort_values("time").reset_index(drop=True)
+    htf_jl = TM.compute_rv_features(
+        _to_f64(src["open"].to_numpy()),
+        _to_f64(src["high"].to_numpy()),
+        _to_f64(src["low"].to_numpy()),
+        _to_f64(src["close"].to_numpy()),
+        annualization=htf_ann,
+    )
+
+    htf_times_ns = _times_to_ns(src["time"])
+    idx_map = np.searchsorted(htf_times_ns, base_times_ns, side="right") - 1
+    idx_map = np.clip(idx_map, 0, len(src) - 1)
+
+    for feat_key in _RV_FEAT_KEYS:
+        htf_vals = np.array(htf_jl[feat_key], dtype=np.float64)
+        result[f"rv_{htf_label}_{feat_key}"] = htf_vals[idx_map]
+
+    result[term_col] = (
+        result[f"rv_{htf_label}_yz_log"] - result[primary_log_col]
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-8.0, 8.0)
+    return result
+
+
+def rv_feature_engine_fast(
+    df_1h: pd.DataFrame,
+    df_1d: pd.DataFrame | None = None,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Julia RV engine for 1H lane. Returns DataFrame with rv_* columns.
+
+    Primary: 11 features.
+    Per HTF:  11 features + 1 term structure = 12.
+    Total with all 3 HTFs: 11 + 3*12 = 47 columns.
+    """
+    _, TM = _init_julia()
+
+    jl_result = TM.compute_rv_features(
+        _to_f64(df_1h["open"].to_numpy()),
+        _to_f64(df_1h["high"].to_numpy()),
+        _to_f64(df_1h["low"].to_numpy()),
+        _to_f64(df_1h["close"].to_numpy()),
+        annualization=1512.0,
+    )
+    result = pd.DataFrame(_rv_julia_to_columns(jl_result, "1h"), index=df_1h.index)
+
+    base_times_ns = _times_to_ns(df_1h["time"])
+    primary_log_col = "rv_1h_yz_log"
+
+    htf_layers = [
+        (df_1d, "1d", 252.0),
+        (df_1w, "1w", 52.0),
+        (df_1m, "1m", 12.0),
+    ]
+    if any(htf_df is not None for htf_df, _, _ in htf_layers):
+        for htf_df, htf_label, htf_ann in htf_layers:
+            result = _rv_htf_layer(
+                result, base_times_ns, primary_log_col,
+                htf_df, htf_label, htf_ann, TM,
+            )
+
+    return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def rv_feature_engine_daily(
+    df_1d: pd.DataFrame,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+    df_3m: pd.DataFrame | None = None,
+    df_6m: pd.DataFrame | None = None,
+    df_12m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Julia RV engine for 1D lane. Returns DataFrame with rv_* columns.
+
+    Primary: 11 features.
+    Per HTF:  11 features + 1 term structure = 12.
+    Total with all 5 HTFs: 11 + 5*12 = 71 columns.
+    """
+    _, TM = _init_julia()
+
+    jl_result = TM.compute_rv_features(
+        _to_f64(df_1d["open"].to_numpy()),
+        _to_f64(df_1d["high"].to_numpy()),
+        _to_f64(df_1d["low"].to_numpy()),
+        _to_f64(df_1d["close"].to_numpy()),
+        annualization=252.0,
+    )
+    result = pd.DataFrame(_rv_julia_to_columns(jl_result, "1d"), index=df_1d.index)
+
+    base_times_ns = _times_to_ns(df_1d["time"])
+    primary_log_col = "rv_1d_yz_log"
+
+    htf_layers = [
+        (df_1w, "1w", 52.0),
+        (df_1m, "1m", 12.0),
+        (df_3m, "3m", 4.0),
+        (df_6m, "6m", 2.0),
+        (df_12m, "12m", 1.0),
+    ]
+    if any(htf_df is not None for htf_df, _, _ in htf_layers):
+        for htf_df, htf_label, htf_ann in htf_layers:
+            result = _rv_htf_layer(
+                result, base_times_ns, primary_log_col,
+                htf_df, htf_label, htf_ann, TM,
+            )
+
+    return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)

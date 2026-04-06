@@ -21,8 +21,8 @@ from universal_ml_engine import (
     describe_selected_frame,
     merge_higher_tf,
     migrate_legacy_artifacts,
-    fib_structural_basis,
     NON_FEATURE_COLS_SET,
+    finalize_forecast_context,
     predict_next_bar,
     predict_trade_plan,
     resolve_artifact_path,
@@ -30,6 +30,8 @@ from universal_ml_engine import (
 )
 from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
+    kalman_structural_engine_fast,
+    rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
 from shadow_brain import ShadowBrain
@@ -64,7 +66,10 @@ def main():
     )
 
     tf_maps = {
-        "SPOT": bridge.fetch_holographic_stack(SYMBOL, "SPOT"),
+        "SPOT": bridge.fetch_holographic_stack(
+            SYMBOL,
+            "SPOT",
+        ),
     }
 
     primary_frames, reference_frames = build_timeframe_selection(
@@ -112,18 +117,14 @@ def main():
     except ValueError:
         return
 
-    df_1h = fib_structural_basis(
-        df_1h,
-        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
-        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
-    )
-
     df_1h_labelled = _compute_atr14(df_1h.copy())
+    kf_df_full = kalman_structural_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
 
     # ── 5. THE SURGICAL TRUNCATION (CONTEXT ISOLATION) ────────────────────
     # Truncate the execution array to the last 150 bars to save computation.
     # The rolling Z-Score (20) and ATR (14) are already calculated securely.
     df_1h_tail = df_1h_labelled.tail(150).reset_index(drop=True)
+    kf_df_tail = kf_df_full.tail(150).reset_index(drop=True)
 
     # ── 6. GEOMETRIC RECONSTRUCTION ───────────────────────────────────────
     df_full = holographic_feature_engine(
@@ -135,6 +136,11 @@ def main():
     smc_df = smc_feature_engine_fast(df_1h_tail, df_1d, df_1w, df_1m)
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
+    rv_df = rv_feature_engine_fast(df_1h_tail, df_1d, df_1w, df_1m)
+    for col in rv_df.columns:
+        df_full[col] = rv_df[col].values
+    for col in kf_df_tail.columns:
+        df_full[col] = kf_df_tail[col].values
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
 
     NON_FEATURE_COLS = set(NON_FEATURE_COLS_SET)
@@ -192,6 +198,13 @@ def main():
     trade_plan = predict_trade_plan(
         trade_plan_models, feature_cols_to_use, last_row.copy(), pred["direction"], atr
     )
+    pred, filter_note = finalize_forecast_context(
+        pred,
+        timeframe="1H",
+        bar_time=last_row.get("time"),
+        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+        base_note=trade_plan["note"],
+    )
 
     # Initialize and Train Shadow Brain with Strict Symbol Isolation
     shadow = ShadowBrain(
@@ -244,7 +257,6 @@ def main():
     print(f"  Entry Price : {close_price:,.2f} (Current Close)")
 
     trail_str = "N/A"
-    filter_note = trade_plan["note"]
     if pred["direction"] in {"UP", "DOWN"} and np.isfinite(trade_plan["sl"]):
         sl_str = (
             f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
@@ -258,9 +270,6 @@ def main():
         trail_str = f"{trade_plan['trail_r']:.2f}R trailing stop after TP1"
     else:
         sl_str, tp1_str, tp2_str = "N/A", "N/A", "N/A"
-
-    if pred["signal_strength"] == "NO_TRADE":
-        filter_note = f"{filter_note} Filtered: conf below {LIVE_CONFIDENCE_THRESHOLD:.2f}".strip()
 
     if pred["direction"] in {"UP", "DOWN"}:
         print(f"  Stop Loss   : {sl_str}")

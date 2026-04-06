@@ -28,6 +28,7 @@ Universal-ML is a machine learning trading system that predicts financial instru
 - Assume the target machine is `i7-4770`, `16 GB DDR3 RAM`, `M.2 NVMe`. Optimize for that hardware with memory-aware and CPU-aware engineering, but without changing results.
 - Prefer deterministic, auditable behavior over cleverness. Hidden fallbacks, silent behavior drift, and speculative “helpful” shortcuts are defects unless explicitly intended.
 - Validate all affected execution paths, not just the file being edited. In this repo, that often means training plus at least the matching backtest, live, selector, or guardrail path.
+- After any bugfix, modification, or addition that changes architecture, lane behavior, feature contracts, data contracts, or file ownership, update `PROJECT_MAP.md` in the same turn before considering the task complete.
 - Do not leave dead compatibility shims, one-off migration hacks, debug prints, placeholder code, or speculative scaffolding after the task unless the user explicitly asks to keep them.
 - If a task-specific document says exactly what to insert, preserve names, signatures, keys, and contracts exactly unless the existing codebase makes literal insertion invalid. In that case, adapt only the minimum necessary while preserving the intended interface.
 

@@ -25,19 +25,20 @@ from holographic_engine import feature_selection_pipeline
 from julia_bridge import (
     add_target_fast,
     holographic_feature_engine_daily,
+    kalman_structural_engine_daily,
+    rv_feature_engine_daily,
     smc_feature_engine_daily,
 )
 from universal_ml_engine import (
     LIVE_CONFIDENCE_THRESHOLD,
     MODEL_N_JOBS,
     TRADE_PLAN_LABEL_COLS,
-    _FIB_RAW_COLS,
     _compute_atr14,
     build_timeframe_selection,
     describe_selected_frame,
-    fib_structural_basis,
     inject_thermodynamic_basis,
     migrate_legacy_artifacts,
+    finalize_forecast_context,
     predict_next_bar,
     predict_trade_plan,
     save_report,
@@ -61,6 +62,7 @@ NON_FEATURE_COLS_DAILY = {
     "close",
     "volume",
     "atr14",
+    "realized_volatility",
     "basis_pts",
     "basis_pct",
     "basis_z_score",
@@ -82,7 +84,7 @@ NON_FEATURE_COLS_DAILY = {
     "long_mae_atr",
     "short_mfe_atr",
     "short_mae_atr",
-} | _FIB_RAW_COLS
+}
 
 
 def compute_macro_regime(
@@ -429,7 +431,11 @@ def main() -> None:
 
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     tf_maps = {
-        "SPOT": bridge.fetch_holographic_stack(symbol, "SPOT"),
+        "SPOT": bridge.fetch_holographic_stack(
+            symbol,
+            "SPOT",
+            include_realized_vol=True,
+        ),
     }
 
     primary_frames, reference_frames = build_timeframe_selection(
@@ -475,12 +481,11 @@ def main() -> None:
     df_1d["session_time_pos"] = 0.0
     df_1d["eod_basis_momentum"] = 0.0
 
-    print("  [TOON DAILY] Fibonacci Structural Basis (1W→a, 1M→b, 3M→c)...")
-    df_1d = fib_structural_basis(
-        df_1d,
-        htf_frames={"1W": df_1w, "1M": df_1m, "3M": df_3m},
-        pairs=[("1W", "a"), ("1M", "b"), ("3M", "c")],
-    )
+    print("  [TOON DAILY] Building RV Surface (Julia RV engine)...")
+    rv_df = rv_feature_engine_daily(df_1d, df_1w, df_1m, df_3m, df_6m, df_12m)
+    for col in rv_df.columns:
+        df_1d[col] = rv_df[col].values
+    print(f"  [TOON DAILY] RV features injected: {len(rv_df.columns)} columns")
 
     print("  [TOON DAILY] Layer 1: Julia holographic extraction (1D + 1W/1M/3M)...")
     df_1d_labelled = _compute_atr14(df_1d.copy())
@@ -492,6 +497,12 @@ def main() -> None:
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
     print(f"  [TOON DAILY] SMC features injected: {len(smc_df.columns)} columns")
+
+    print("  [TOON DAILY] Layer 1c: Kalman structural feature family...")
+    kf_df = kalman_structural_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in kf_df.columns:
+        df_full[col] = kf_df[col].values
+    print(f"  [TOON DAILY] Kalman structural features injected: {len(kf_df.columns)} columns")
 
     print("  [TOON DAILY] Layer 2: Injecting macro regime overlays (6M/12M)...")
     df_full = inject_macro_regime(df_full, df_6m, "6m")
@@ -658,7 +669,13 @@ def main() -> None:
     )
 
     trail_str = "N/A"
-    filter_note = trade_plan["note"]
+    pred, filter_note = finalize_forecast_context(
+        pred,
+        timeframe="1D",
+        bar_time=last_row.get("time"),
+        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+        base_note=trade_plan["note"],
+    )
     if pred["direction"] in {"UP", "DOWN"} and np.isfinite(trade_plan["sl"]):
         sl_str = (
             f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"

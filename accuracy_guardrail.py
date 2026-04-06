@@ -42,6 +42,10 @@ from daily_ml_engine import (
 from julia_bridge import (
     add_target_fast,
     holographic_feature_engine_fast,
+    kalman_structural_engine_daily,
+    kalman_structural_engine_fast,
+    rv_feature_engine_daily,
+    rv_feature_engine_fast,
     smc_feature_engine_daily,
     smc_feature_engine_fast,
 )
@@ -53,7 +57,6 @@ from universal_ml_engine import (
     TRADE_PLAN_LABEL_COLS,
     _compute_atr14,
     build_timeframe_selection,
-    fib_structural_basis,
     inject_thermodynamic_basis,
     merge_higher_tf,
     migrate_legacy_artifacts,
@@ -263,7 +266,11 @@ def _inject_macro_regime(
 def _load_tf_maps(data_dir: str, symbol: str) -> dict[str, dict[str, pd.DataFrame]]:
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     return {
-        "SPOT": bridge.fetch_holographic_stack(symbol, "SPOT"),
+        "SPOT": bridge.fetch_holographic_stack(
+            symbol,
+            "SPOT",
+            include_realized_vol=True,
+        ),
     }
 
 
@@ -290,16 +297,17 @@ def _build_1h_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
         symbol=symbol,
         logger=None,
     )
-    df_1h = fib_structural_basis(
-        df_1h,
-        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
-        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
-    )
     df_1h_labelled = _compute_atr14(df_1h.copy())
     df_full = holographic_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     smc_df = smc_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
+    kf_df = kalman_structural_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in kf_df.columns:
+        df_full[col] = kf_df[col].values
+    rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in rv_df.columns:
+        df_full[col] = rv_df[col].values
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
     df_full = add_target_fast(
         df_full,
@@ -348,16 +356,17 @@ def _build_1d_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
 
     df_1d["session_time_pos"] = 0.0
     df_1d["eod_basis_momentum"] = 0.0
-    df_1d = fib_structural_basis(
-        df_1d,
-        htf_frames={"1W": df_1w, "1M": df_1m, "3M": df_3m},
-        pairs=[("1W", "a"), ("1M", "b"), ("3M", "c")],
-    )
+    rv_df = rv_feature_engine_daily(df_1d, df_1w, df_1m, df_3m, df_6m, df_12m)
+    for col in rv_df.columns:
+        df_1d[col] = rv_df[col].values
     df_1d_labelled = _compute_atr14(df_1d.copy())
     df_full = holographic_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_3m)
     smc_df = smc_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
+    kf_df = kalman_structural_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in kf_df.columns:
+        df_full[col] = kf_df[col].values
     df_full = _inject_macro_regime(df_full, df_6m, "6m")
     df_full = _inject_macro_regime(df_full, df_12m, "12m")
     df_full = add_daily_confluence(df_full)

@@ -17,12 +17,16 @@ import numpy as np
 import pandas as pd
 
 from backtest_engine import calculate_metrics, generate_report, run_backtest
-from julia_bridge import holographic_feature_engine_daily, smc_feature_engine_daily
+from julia_bridge import (
+    holographic_feature_engine_daily,
+    kalman_structural_engine_daily,
+    rv_feature_engine_daily,
+    smc_feature_engine_daily,
+)
 from universal_ml_engine import (
     _compute_atr14,
     build_timeframe_selection,
     describe_selected_frame,
-    fib_structural_basis,
     inject_thermodynamic_basis,
     migrate_legacy_artifacts,
     resolve_artifact_path,
@@ -77,7 +81,11 @@ def main() -> None:
 
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     tf_maps = {
-        "SPOT": bridge.fetch_holographic_stack(symbol, "SPOT"),
+        "SPOT": bridge.fetch_holographic_stack(
+            symbol,
+            "SPOT",
+            include_realized_vol=True,
+        ),
     }
 
     primary_frames, reference_frames = build_timeframe_selection(
@@ -142,12 +150,9 @@ def main() -> None:
     df_1d["session_time_pos"] = 0.0
     df_1d["eod_basis_momentum"] = 0.0
 
-    print("  [=] Fibonacci Structural Basis (1W→a, 1M→b, 3M→c)...")
-    df_1d = fib_structural_basis(
-        df_1d,
-        htf_frames={"1W": df_1w, "1M": df_1m, "3M": df_3m},
-        pairs=[("1W", "a"), ("1M", "b"), ("3M", "c")],
-    )
+    rv_df = rv_feature_engine_daily(df_1d, df_1w, df_1m, df_3m, df_6m, df_12m)
+    for col in rv_df.columns:
+        df_1d[col] = rv_df[col].values
 
     df_1d_labelled = _compute_atr14(df_1d.copy())
     df_full = holographic_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_3m)
@@ -155,6 +160,9 @@ def main() -> None:
     smc_df = smc_feature_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
+    kf_df = kalman_structural_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in kf_df.columns:
+        df_full[col] = kf_df[col].values
 
     from daily_ml_engine import add_daily_confluence, inject_macro_regime
 

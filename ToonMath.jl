@@ -38,6 +38,10 @@ const RUNNER_FRACTION       = 0.25
 const TRAIL_R_MULT          = 1.0
 const EXEC_FEE_PCT          = 0.0005
 const EXEC_SLIPPAGE_BPS     = 0.0003
+# ratio_idx mapping is a public production contract:
+# 1 => 0.000, 2 => 0.236, 3 => 0.382, 4 => 0.500, 5 => 0.618, 6 => 0.786, 7 => 1.000
+const KALMAN_FIB_RATIOS     = (0.000, 0.236, 0.382, 0.500, 0.618, 0.786, 1.000)
+const KALMAN_SWING_EPS      = 1e-9
 
 
 # ─────────────────────────────────────────────────────────────
@@ -145,6 +149,775 @@ end
 
 
 # ─────────────────────────────────────────────────────────────
+# KALMAN STRUCTURAL FEATURE FAMILY
+# ─────────────────────────────────────────────────────────────
+
+@inline function _safe_ohlc4(o::Float64, h::Float64, l::Float64, c::Float64)::Float64
+    prod = o * h * l * c
+    if isfinite(prod) && prod > 0.0
+        return prod ^ 0.25
+    end
+    return isfinite(c) ? c : 0.0
+end
+
+@inline function _safe_oc(o::Float64, c::Float64)::Float64
+    prod = o * c
+    if isfinite(prod) && prod > 0.0
+        return sqrt(prod)
+    end
+    return isfinite(o) && isfinite(c) ? (o + c) * 0.5 : 0.0
+end
+
+function kalman_filter(
+    ohlc4::AbstractVector{Float64},
+    closes::AbstractVector{Float64};
+    R::Float64 = 1.0,
+    Q::Float64 = 0.001,
+)
+    return kalman_filter(
+        collect(Float64, ohlc4),
+        collect(Float64, closes);
+        R = R,
+        Q = Q,
+    )
+end
+
+function kalman_filter(
+    ohlc4::Vector{Float64},
+    closes::Vector{Float64};
+    R::Float64 = 1.0,
+    Q::Float64 = 0.001,
+)::NamedTuple{(:kalman, :regime), Tuple{Vector{Float64}, Vector{Float64}}}
+    n = length(ohlc4)
+    if length(closes) != n
+        throw(ArgumentError("kalman_filter inputs must have identical lengths"))
+    end
+
+    kalman = zeros(Float64, n)
+    regime = zeros(Float64, n)
+    n == 0 && return (kalman = kalman, regime = regime)
+
+    x = isfinite(ohlc4[1]) ? ohlc4[1] : (isfinite(closes[1]) ? closes[1] : 0.0)
+    P = 1.0
+
+    @inbounds for i in 1:n
+        meas = isfinite(ohlc4[i]) ? ohlc4[i] : x
+        P_pred = P + Q
+        K = P_pred / (P_pred + R)
+        x = x + K * (meas - x)
+        P = (1.0 - K) * P_pred
+        kalman[i] = x
+        close_i = isfinite(closes[i]) ? closes[i] : x
+        regime[i] = close_i - x
+    end
+
+    return (kalman = kalman, regime = regime)
+end
+
+function kalman_swing_detect(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+    oc::AbstractVector{Float64},
+    kalman::AbstractVector{Float64},
+)
+    return kalman_swing_detect(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+        collect(Float64, oc),
+        collect(Float64, kalman),
+    )
+end
+
+function kalman_swing_detect(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    oc::Vector{Float64},
+    kalman::Vector{Float64},
+)::NamedTuple{
+    (:swing_type, :swing_price, :swing_bar, :confirm_bar),
+    Tuple{Vector{Int64}, Vector{Float64}, Vector{Int64}, Vector{Int64}},
+}
+    n = length(opens)
+    if length(highs) != n || length(lows) != n || length(closes) != n || length(oc) != n || length(kalman) != n
+        throw(ArgumentError("kalman_swing_detect inputs must have identical lengths"))
+    end
+
+    max_events = max(2 * max(n - 1, 0), 0)
+    swing_type = Vector{Int64}(undef, max_events)
+    swing_price = Vector{Float64}(undef, max_events)
+    swing_bar = Vector{Int64}(undef, max_events)
+    confirm_bar = Vector{Int64}(undef, max_events)
+    count = 0
+
+    @inbounds for i in 2:n
+        k = kalman[i]
+        body_high_cross = closes[i] < k && opens[i] > k
+        wick_high_test = oc[i] > k && lows[i] <= k
+        body_low_cross = closes[i] > k && opens[i] < k
+        wick_low_test = oc[i] < k && highs[i] >= k
+
+        if body_high_cross || wick_high_test
+            prev_high = highs[i - 1]
+            curr_high = highs[i]
+            count += 1
+            swing_type[count] = 1
+            if curr_high >= prev_high
+                swing_price[count] = curr_high
+                swing_bar[count] = Int64(i)
+            else
+                swing_price[count] = prev_high
+                swing_bar[count] = Int64(i - 1)
+            end
+            confirm_bar[count] = Int64(i)
+        end
+
+        if body_low_cross || wick_low_test
+            prev_low = lows[i - 1]
+            curr_low = lows[i]
+            count += 1
+            swing_type[count] = -1
+            if curr_low <= prev_low
+                swing_price[count] = curr_low
+                swing_bar[count] = Int64(i)
+            else
+                swing_price[count] = prev_low
+                swing_bar[count] = Int64(i - 1)
+            end
+            confirm_bar[count] = Int64(i)
+        end
+    end
+
+    resize!(swing_type, count)
+    resize!(swing_price, count)
+    resize!(swing_bar, count)
+    resize!(confirm_bar, count)
+
+    return (
+        swing_type = swing_type,
+        swing_price = swing_price,
+        swing_bar = swing_bar,
+        confirm_bar = confirm_bar,
+    )
+end
+
+function candle_geometry_delta(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+    volumes::AbstractVector{Float64},
+)
+    return candle_geometry_delta(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+        collect(Float64, volumes),
+    )
+end
+
+function candle_geometry_delta(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    volumes::Vector{Float64},
+)::Vector{Float64}
+    n = length(opens)
+    if length(highs) != n || length(lows) != n || length(closes) != n || length(volumes) != n
+        throw(ArgumentError("candle_geometry_delta inputs must have identical lengths"))
+    end
+
+    delta = zeros(Float64, n)
+    n < 2 && return delta
+
+    @inbounds for i in 2:n
+        prev_c = isfinite(closes[i - 1]) ? closes[i - 1] : closes[i]
+        tw = max(0.0, max(highs[i], prev_c) - max(opens[i], closes[i]))
+        bw = max(0.0, min(opens[i], closes[i]) - min(lows[i], prev_c))
+        body = abs(opens[i] - closes[i])
+
+        tw_sq = tw * tw
+        bw_sq = bw * bw
+        body_sq = body * body
+        total_sq = tw_sq + bw_sq + body_sq
+        special_move = bw + (closes[i] - opens[i]) - tw
+
+        if total_sq < 1e-18
+            delta[i] = 0.0
+            continue
+        end
+
+        cond = special_move >= 0.0
+        buy_share = bw_sq + (cond ? body_sq : 0.0)
+        sell_share = tw_sq + (cond ? 0.0 : body_sq)
+        ret_u = buy_share / total_sq
+        ret_d = sell_share / total_sq
+        vol_i = isfinite(volumes[i]) ? volumes[i] : 0.0
+        delta[i] = cond ? vol_i * ret_u : -vol_i * ret_d
+    end
+
+    return delta
+end
+
+function swing_delta_accumulation(
+    bar_delta::AbstractVector{Float64},
+    swing_confirm_bars::AbstractVector{Int64},
+)
+    return swing_delta_accumulation(
+        collect(Float64, bar_delta),
+        collect(Int64, swing_confirm_bars),
+    )
+end
+
+function swing_delta_accumulation(
+    bar_delta::Vector{Float64},
+    swing_confirm_bars::Vector{Int64},
+)::NamedTuple{(:swing_accum, :net_swing_delta), Tuple{Vector{Float64}, Vector{Float64}}}
+    n = length(bar_delta)
+    swing_accum = zeros(Float64, n)
+    net_swing_delta = zeros(Float64, n)
+
+    segment_sum = 0.0
+    swing_ptr = 1
+    n_swings = length(swing_confirm_bars)
+    completed_count = 0
+    completed_prev = 0.0
+    completed_curr = 0.0
+    current_net = 0.0
+
+    @inbounds for i in 1:n
+        while swing_ptr <= n_swings && swing_confirm_bars[swing_ptr] < i
+            swing_ptr += 1
+        end
+
+        while swing_ptr <= n_swings && swing_confirm_bars[swing_ptr] == i
+            completed = segment_sum
+            completed_count += 1
+            if completed_count == 1
+                completed_curr = completed
+                current_net = 0.0
+            else
+                completed_prev = completed_curr
+                completed_curr = completed
+                current_net = completed_curr - completed_prev
+            end
+            segment_sum = 0.0
+            swing_ptr += 1
+        end
+
+        delta_i = isfinite(bar_delta[i]) ? bar_delta[i] : 0.0
+        segment_sum += delta_i
+        swing_accum[i] = segment_sum
+        net_swing_delta[i] = current_net
+    end
+
+    return (swing_accum = swing_accum, net_swing_delta = net_swing_delta)
+end
+
+function completed_swing_state(
+    bar_delta::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    atrs::AbstractVector{Float64},
+    swing_type::AbstractVector{Int64},
+    swing_price::AbstractVector{Float64},
+    swing_confirm_bars::AbstractVector{Int64},
+)
+    return completed_swing_state(
+        collect(Float64, bar_delta),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, atrs),
+        collect(Int64, swing_type),
+        collect(Float64, swing_price),
+        collect(Int64, swing_confirm_bars),
+    )
+end
+
+function completed_swing_state(
+    bar_delta::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    atrs::Vector{Float64},
+    swing_type::Vector{Int64},
+    swing_price::Vector{Float64},
+    swing_confirm_bars::Vector{Int64},
+)
+    n = length(bar_delta)
+    if length(highs) != n || length(lows) != n || length(atrs) != n
+        throw(ArgumentError("completed_swing_state price and ATR inputs must have identical lengths"))
+    end
+
+    n_swings = length(swing_type)
+    if length(swing_price) != n_swings || length(swing_confirm_bars) != n_swings
+        throw(ArgumentError("completed_swing_state swing inputs must have identical lengths"))
+    end
+
+    bull_swing_delta = zeros(Float64, n)
+    prev_bull_swing_delta = zeros(Float64, n)
+    bull_swing_delta_div = zeros(Float64, n)
+    bear_swing_delta = zeros(Float64, n)
+    prev_bear_swing_delta = zeros(Float64, n)
+    bear_swing_delta_div = zeros(Float64, n)
+
+    bull_swing_delta_per_bar = zeros(Float64, n)
+    prev_bull_swing_delta_per_bar = zeros(Float64, n)
+    bull_swing_delta_per_bar_div = zeros(Float64, n)
+    bear_swing_delta_per_bar = zeros(Float64, n)
+    prev_bear_swing_delta_per_bar = zeros(Float64, n)
+    bear_swing_delta_per_bar_div = zeros(Float64, n)
+
+    bull_swing_delta_per_range = zeros(Float64, n)
+    prev_bull_swing_delta_per_range = zeros(Float64, n)
+    bull_swing_delta_per_range_div = zeros(Float64, n)
+    bear_swing_delta_per_range = zeros(Float64, n)
+    prev_bear_swing_delta_per_range = zeros(Float64, n)
+    bear_swing_delta_per_range_div = zeros(Float64, n)
+
+    bull_swing_delta_per_atr_range = zeros(Float64, n)
+    prev_bull_swing_delta_per_atr_range = zeros(Float64, n)
+    bull_swing_delta_per_atr_range_div = zeros(Float64, n)
+    bear_swing_delta_per_atr_range = zeros(Float64, n)
+    prev_bear_swing_delta_per_atr_range = zeros(Float64, n)
+    bear_swing_delta_per_atr_range_div = zeros(Float64, n)
+
+    bull_swing_delta_eff = zeros(Float64, n)
+    prev_bull_swing_delta_eff = zeros(Float64, n)
+    bull_swing_delta_eff_div = zeros(Float64, n)
+    bear_swing_delta_eff = zeros(Float64, n)
+    prev_bear_swing_delta_eff = zeros(Float64, n)
+    bear_swing_delta_eff_div = zeros(Float64, n)
+
+    segment_direction = zeros(Int64, n_swings)
+    segment_start_confirm_bar = zeros(Int64, n_swings)
+    segment_end_confirm_bar = zeros(Int64, n_swings)
+    segment_bar_count = zeros(Int64, n_swings)
+    segment_raw_delta = zeros(Float64, n_swings)
+    segment_high = zeros(Float64, n_swings)
+    segment_low = zeros(Float64, n_swings)
+    segment_price_range = zeros(Float64, n_swings)
+    segment_atr_ref = zeros(Float64, n_swings)
+
+    bull_current = zeros(Float64, 5)
+    bull_previous = zeros(Float64, 5)
+    bear_current = zeros(Float64, 5)
+    bear_previous = zeros(Float64, 5)
+    has_bull_current = false
+    has_bull_previous = false
+    has_bear_current = false
+    has_bear_previous = false
+
+    segment_sum = 0.0
+    swing_ptr = 1
+    last_confirm_bar = 1
+
+    @inbounds for i in 1:n
+        while swing_ptr <= n_swings && swing_confirm_bars[swing_ptr] < i
+            swing_ptr += 1
+        end
+
+        while swing_ptr <= n_swings && swing_confirm_bars[swing_ptr] == i
+            confirm_idx = clamp(swing_confirm_bars[swing_ptr], 1, n)
+            start_confirm_idx = clamp(last_confirm_bar, 1, n)
+            segment_last_bar = confirm_idx - 1
+            bar_count = max(confirm_idx - start_confirm_idx, 0)
+
+            raw_delta = segment_sum
+            fallback_atr = atrs[confirm_idx]
+            atr_ref = isfinite(fallback_atr) && fallback_atr > KALMAN_SWING_EPS ? fallback_atr : 1.0
+            anchor_price = isfinite(swing_price[swing_ptr]) ? swing_price[swing_ptr] : 0.0
+            hi = anchor_price
+            lo = anchor_price
+
+            if bar_count > 0
+                hi = maximum(@view highs[start_confirm_idx:segment_last_bar])
+                lo = minimum(@view lows[start_confirm_idx:segment_last_bar])
+                atr_ref = median(@view atrs[start_confirm_idx:segment_last_bar])
+                if !isfinite(atr_ref) || atr_ref <= KALMAN_SWING_EPS
+                    atr_ref = isfinite(fallback_atr) && fallback_atr > KALMAN_SWING_EPS ? fallback_atr : 1.0
+                end
+            end
+
+            if !isfinite(hi)
+                hi = anchor_price
+            end
+            if !isfinite(lo)
+                lo = anchor_price
+            end
+
+            price_range = max(hi - lo, 0.0)
+            bar_count_f = Float64(bar_count)
+            delta_per_bar = raw_delta / max(bar_count_f, 1.0)
+            delta_per_range = raw_delta / max(price_range, KALMAN_SWING_EPS)
+            atr_scaled_range = price_range / max(atr_ref, KALMAN_SWING_EPS)
+            delta_per_atr_range = raw_delta / max(atr_scaled_range, KALMAN_SWING_EPS)
+            delta_efficiency = raw_delta / max(bar_count_f * atr_ref, KALMAN_SWING_EPS)
+
+            segment_direction[swing_ptr] = swing_type[swing_ptr] >= 0 ? 1 : -1
+            segment_start_confirm_bar[swing_ptr] = Int64(start_confirm_idx)
+            segment_end_confirm_bar[swing_ptr] = Int64(confirm_idx)
+            segment_bar_count[swing_ptr] = Int64(bar_count)
+            segment_raw_delta[swing_ptr] = raw_delta
+            segment_high[swing_ptr] = hi
+            segment_low[swing_ptr] = lo
+            segment_price_range[swing_ptr] = price_range
+            segment_atr_ref[swing_ptr] = atr_ref
+
+            if segment_direction[swing_ptr] == 1
+                if has_bull_current
+                    bull_previous[1] = bull_current[1]
+                    bull_previous[2] = bull_current[2]
+                    bull_previous[3] = bull_current[3]
+                    bull_previous[4] = bull_current[4]
+                    bull_previous[5] = bull_current[5]
+                    has_bull_previous = true
+                end
+                bull_current[1] = raw_delta
+                bull_current[2] = delta_per_bar
+                bull_current[3] = delta_per_range
+                bull_current[4] = delta_per_atr_range
+                bull_current[5] = delta_efficiency
+                has_bull_current = true
+            else
+                if has_bear_current
+                    bear_previous[1] = bear_current[1]
+                    bear_previous[2] = bear_current[2]
+                    bear_previous[3] = bear_current[3]
+                    bear_previous[4] = bear_current[4]
+                    bear_previous[5] = bear_current[5]
+                    has_bear_previous = true
+                end
+                bear_current[1] = raw_delta
+                bear_current[2] = delta_per_bar
+                bear_current[3] = delta_per_range
+                bear_current[4] = delta_per_atr_range
+                bear_current[5] = delta_efficiency
+                has_bear_current = true
+            end
+
+            segment_sum = 0.0
+            last_confirm_bar = confirm_idx
+            swing_ptr += 1
+        end
+
+        bull_swing_delta[i] = bull_current[1]
+        prev_bull_swing_delta[i] = has_bull_previous ? bull_previous[1] : 0.0
+        bull_swing_delta_div[i] = has_bull_previous ? (bull_current[1] - bull_previous[1]) : 0.0
+        bear_swing_delta[i] = bear_current[1]
+        prev_bear_swing_delta[i] = has_bear_previous ? bear_previous[1] : 0.0
+        bear_swing_delta_div[i] = has_bear_previous ? (bear_current[1] - bear_previous[1]) : 0.0
+
+        bull_swing_delta_per_bar[i] = bull_current[2]
+        prev_bull_swing_delta_per_bar[i] = has_bull_previous ? bull_previous[2] : 0.0
+        bull_swing_delta_per_bar_div[i] = has_bull_previous ? (bull_current[2] - bull_previous[2]) : 0.0
+        bear_swing_delta_per_bar[i] = bear_current[2]
+        prev_bear_swing_delta_per_bar[i] = has_bear_previous ? bear_previous[2] : 0.0
+        bear_swing_delta_per_bar_div[i] = has_bear_previous ? (bear_current[2] - bear_previous[2]) : 0.0
+
+        bull_swing_delta_per_range[i] = bull_current[3]
+        prev_bull_swing_delta_per_range[i] = has_bull_previous ? bull_previous[3] : 0.0
+        bull_swing_delta_per_range_div[i] = has_bull_previous ? (bull_current[3] - bull_previous[3]) : 0.0
+        bear_swing_delta_per_range[i] = bear_current[3]
+        prev_bear_swing_delta_per_range[i] = has_bear_previous ? bear_previous[3] : 0.0
+        bear_swing_delta_per_range_div[i] = has_bear_previous ? (bear_current[3] - bear_previous[3]) : 0.0
+
+        bull_swing_delta_per_atr_range[i] = bull_current[4]
+        prev_bull_swing_delta_per_atr_range[i] = has_bull_previous ? bull_previous[4] : 0.0
+        bull_swing_delta_per_atr_range_div[i] = has_bull_previous ? (bull_current[4] - bull_previous[4]) : 0.0
+        bear_swing_delta_per_atr_range[i] = bear_current[4]
+        prev_bear_swing_delta_per_atr_range[i] = has_bear_previous ? bear_previous[4] : 0.0
+        bear_swing_delta_per_atr_range_div[i] = has_bear_previous ? (bear_current[4] - bear_previous[4]) : 0.0
+
+        bull_swing_delta_eff[i] = bull_current[5]
+        prev_bull_swing_delta_eff[i] = has_bull_previous ? bull_previous[5] : 0.0
+        bull_swing_delta_eff_div[i] = has_bull_previous ? (bull_current[5] - bull_previous[5]) : 0.0
+        bear_swing_delta_eff[i] = bear_current[5]
+        prev_bear_swing_delta_eff[i] = has_bear_previous ? bear_previous[5] : 0.0
+        bear_swing_delta_eff_div[i] = has_bear_previous ? (bear_current[5] - bear_previous[5]) : 0.0
+
+        delta_i = isfinite(bar_delta[i]) ? bar_delta[i] : 0.0
+        segment_sum += delta_i
+    end
+
+    return (
+        segment_direction = segment_direction,
+        segment_start_confirm_bar = segment_start_confirm_bar,
+        segment_end_confirm_bar = segment_end_confirm_bar,
+        segment_bar_count = segment_bar_count,
+        segment_raw_delta = segment_raw_delta,
+        segment_high = segment_high,
+        segment_low = segment_low,
+        segment_price_range = segment_price_range,
+        segment_atr_ref = segment_atr_ref,
+        bull_swing_delta = bull_swing_delta,
+        prev_bull_swing_delta = prev_bull_swing_delta,
+        bull_swing_delta_div = bull_swing_delta_div,
+        bear_swing_delta = bear_swing_delta,
+        prev_bear_swing_delta = prev_bear_swing_delta,
+        bear_swing_delta_div = bear_swing_delta_div,
+        bull_swing_delta_per_bar = bull_swing_delta_per_bar,
+        prev_bull_swing_delta_per_bar = prev_bull_swing_delta_per_bar,
+        bull_swing_delta_per_bar_div = bull_swing_delta_per_bar_div,
+        bear_swing_delta_per_bar = bear_swing_delta_per_bar,
+        prev_bear_swing_delta_per_bar = prev_bear_swing_delta_per_bar,
+        bear_swing_delta_per_bar_div = bear_swing_delta_per_bar_div,
+        bull_swing_delta_per_range = bull_swing_delta_per_range,
+        prev_bull_swing_delta_per_range = prev_bull_swing_delta_per_range,
+        bull_swing_delta_per_range_div = bull_swing_delta_per_range_div,
+        bear_swing_delta_per_range = bear_swing_delta_per_range,
+        prev_bear_swing_delta_per_range = prev_bear_swing_delta_per_range,
+        bear_swing_delta_per_range_div = bear_swing_delta_per_range_div,
+        bull_swing_delta_per_atr_range = bull_swing_delta_per_atr_range,
+        prev_bull_swing_delta_per_atr_range = prev_bull_swing_delta_per_atr_range,
+        bull_swing_delta_per_atr_range_div = bull_swing_delta_per_atr_range_div,
+        bear_swing_delta_per_atr_range = bear_swing_delta_per_atr_range,
+        prev_bear_swing_delta_per_atr_range = prev_bear_swing_delta_per_atr_range,
+        bear_swing_delta_per_atr_range_div = bear_swing_delta_per_atr_range_div,
+        bull_swing_delta_eff = bull_swing_delta_eff,
+        prev_bull_swing_delta_eff = prev_bull_swing_delta_eff,
+        bull_swing_delta_eff_div = bull_swing_delta_eff_div,
+        bear_swing_delta_eff = bear_swing_delta_eff,
+        prev_bear_swing_delta_eff = prev_bear_swing_delta_eff,
+        bear_swing_delta_eff_div = bear_swing_delta_eff_div,
+    )
+end
+
+function _init_kf_pair_features(pair_label::String, n::Int)::Dict{String, Vector{Float64}}
+    result = Dict{String, Vector{Float64}}()
+    for ratio_idx in 1:length(KALMAN_FIB_RATIOS)
+        result[string("kf_", pair_label, "_", ratio_idx, "_o")] = zeros(Float64, n)
+        result[string("kf_", pair_label, "_", ratio_idx, "_h")] = zeros(Float64, n)
+        result[string("kf_", pair_label, "_", ratio_idx, "_l")] = zeros(Float64, n)
+        result[string("kf_", pair_label, "_", ratio_idx, "_c")] = zeros(Float64, n)
+        result[string("kf_", pair_label, "_", ratio_idx, "_delta")] = zeros(Float64, n)
+    end
+    return result
+end
+
+function htf_fib_observation(
+    ltf_opens::AbstractVector{Float64},
+    ltf_highs::AbstractVector{Float64},
+    ltf_lows::AbstractVector{Float64},
+    ltf_closes::AbstractVector{Float64},
+    ltf_atrs::AbstractVector{Float64},
+    ltf_bar_delta::AbstractVector{Float64},
+    ltf_times_ns::AbstractVector{Int64},
+    htf_swing_highs_price::AbstractVector{Float64},
+    htf_swing_highs_confirm::AbstractVector{Int64},
+    htf_swing_lows_price::AbstractVector{Float64},
+    htf_swing_lows_confirm::AbstractVector{Int64},
+    htf_times_ns::AbstractVector{Int64},
+    pair_label::AbstractString,
+)
+    return htf_fib_observation(
+        collect(Float64, ltf_opens),
+        collect(Float64, ltf_highs),
+        collect(Float64, ltf_lows),
+        collect(Float64, ltf_closes),
+        collect(Float64, ltf_atrs),
+        collect(Float64, ltf_bar_delta),
+        collect(Int64, ltf_times_ns),
+        collect(Float64, htf_swing_highs_price),
+        collect(Int64, htf_swing_highs_confirm),
+        collect(Float64, htf_swing_lows_price),
+        collect(Int64, htf_swing_lows_confirm),
+        collect(Int64, htf_times_ns),
+        String(pair_label),
+    )
+end
+
+function htf_fib_observation(
+    ltf_opens::Vector{Float64},
+    ltf_highs::Vector{Float64},
+    ltf_lows::Vector{Float64},
+    ltf_closes::Vector{Float64},
+    ltf_atrs::Vector{Float64},
+    ltf_bar_delta::Vector{Float64},
+    ltf_times_ns::Vector{Int64},
+    htf_swing_highs_price::Vector{Float64},
+    htf_swing_highs_confirm::Vector{Int64},
+    htf_swing_lows_price::Vector{Float64},
+    htf_swing_lows_confirm::Vector{Int64},
+    htf_times_ns::Vector{Int64},
+    pair_label::String,
+)::Dict{String, Vector{Float64}}
+    n = length(ltf_opens)
+    if length(ltf_highs) != n || length(ltf_lows) != n || length(ltf_closes) != n || length(ltf_atrs) != n || length(ltf_bar_delta) != n || length(ltf_times_ns) != n
+        throw(ArgumentError("htf_fib_observation LTF inputs must have identical lengths"))
+    end
+    if length(htf_swing_highs_price) != length(htf_swing_highs_confirm) || length(htf_swing_lows_price) != length(htf_swing_lows_confirm)
+        throw(ArgumentError("htf_fib_observation swing price/confirm inputs must have identical lengths"))
+    end
+
+    result = _init_kf_pair_features(pair_label, n)
+    open_cols = [result[string("kf_", pair_label, "_", ratio_idx, "_o")] for ratio_idx in 1:length(KALMAN_FIB_RATIOS)]
+    high_cols = [result[string("kf_", pair_label, "_", ratio_idx, "_h")] for ratio_idx in 1:length(KALMAN_FIB_RATIOS)]
+    low_cols = [result[string("kf_", pair_label, "_", ratio_idx, "_l")] for ratio_idx in 1:length(KALMAN_FIB_RATIOS)]
+    close_cols = [result[string("kf_", pair_label, "_", ratio_idx, "_c")] for ratio_idx in 1:length(KALMAN_FIB_RATIOS)]
+    delta_cols = [result[string("kf_", pair_label, "_", ratio_idx, "_delta")] for ratio_idx in 1:length(KALMAN_FIB_RATIOS)]
+
+    n_high = length(htf_swing_highs_confirm)
+    n_low = length(htf_swing_lows_confirm)
+    if n_high == 0 || n_low == 0 || isempty(htf_times_ns)
+        return result
+    end
+
+    high_confirm_times = Vector{Int64}(undef, n_high)
+    low_confirm_times = Vector{Int64}(undef, n_low)
+
+    @inbounds for j in 1:n_high
+        idx = clamp(htf_swing_highs_confirm[j], 1, length(htf_times_ns))
+        high_confirm_times[j] = htf_times_ns[idx]
+    end
+    @inbounds for j in 1:n_low
+        idx = clamp(htf_swing_lows_confirm[j], 1, length(htf_times_ns))
+        low_confirm_times[j] = htf_times_ns[idx]
+    end
+
+    @inbounds for i in 1:n
+        high_pos = searchsortedlast(high_confirm_times, ltf_times_ns[i])
+        low_pos = searchsortedlast(low_confirm_times, ltf_times_ns[i])
+        if high_pos == 0 || low_pos == 0
+            continue
+        end
+
+        swing_high = htf_swing_highs_price[high_pos]
+        swing_low = htf_swing_lows_price[low_pos]
+        if !isfinite(swing_high) || !isfinite(swing_low) || swing_high <= swing_low
+            continue
+        end
+
+        atr_i = ltf_atrs[i]
+        atr_scale = isfinite(atr_i) && abs(atr_i) > 1e-9 ? atr_i : 1.0
+        bar_delta_i = isfinite(ltf_bar_delta[i]) ? ltf_bar_delta[i] : 0.0
+        fib_range = swing_high - swing_low
+
+        for (ratio_idx, ratio) in enumerate(KALMAN_FIB_RATIOS)
+            level = swing_low + ratio * fib_range
+            open_cols[ratio_idx][i] = (ltf_opens[i] - level) / atr_scale
+            high_cols[ratio_idx][i] = (ltf_highs[i] - level) / atr_scale
+            low_cols[ratio_idx][i] = (ltf_lows[i] - level) / atr_scale
+            close_cols[ratio_idx][i] = (ltf_closes[i] - level) / atr_scale
+            delta_cols[ratio_idx][i] = bar_delta_i
+        end
+    end
+
+    return result
+end
+
+function compute_kalman_tf_state(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+    volumes::AbstractVector{Float64},
+    atrs::AbstractVector{Float64},
+)
+    return compute_kalman_tf_state(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+        collect(Float64, volumes),
+        collect(Float64, atrs),
+    )
+end
+
+function compute_kalman_tf_state(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+    volumes::Vector{Float64},
+    atrs::Vector{Float64},
+)
+    n = length(opens)
+    if length(highs) != n || length(lows) != n || length(closes) != n || length(volumes) != n || length(atrs) != n
+        throw(ArgumentError("compute_kalman_tf_state inputs must have identical lengths"))
+    end
+
+    ohlc4 = Vector{Float64}(undef, n)
+    oc = Vector{Float64}(undef, n)
+    @inbounds for i in 1:n
+        ohlc4[i] = _safe_ohlc4(opens[i], highs[i], lows[i], closes[i])
+        oc[i] = _safe_oc(opens[i], closes[i])
+    end
+
+    kalman_state = kalman_filter(ohlc4, closes)
+    bar_delta = candle_geometry_delta(opens, highs, lows, closes, volumes)
+    swings = kalman_swing_detect(opens, highs, lows, closes, oc, kalman_state.kalman)
+    swing_delta = swing_delta_accumulation(bar_delta, swings.confirm_bar)
+    completed_swings = completed_swing_state(
+        bar_delta,
+        highs,
+        lows,
+        atrs,
+        swings.swing_type,
+        swings.swing_price,
+        swings.confirm_bar,
+    )
+
+    return (
+        kalman = kalman_state.kalman,
+        regime = kalman_state.regime,
+        bar_delta = bar_delta,
+        swing_accum = swing_delta.swing_accum,
+        net_swing_delta = swing_delta.net_swing_delta,
+        swing_type = swings.swing_type,
+        swing_price = swings.swing_price,
+        swing_bar = swings.swing_bar,
+        confirm_bar = swings.confirm_bar,
+        segment_direction = completed_swings.segment_direction,
+        segment_start_confirm_bar = completed_swings.segment_start_confirm_bar,
+        segment_end_confirm_bar = completed_swings.segment_end_confirm_bar,
+        segment_bar_count = completed_swings.segment_bar_count,
+        segment_raw_delta = completed_swings.segment_raw_delta,
+        segment_high = completed_swings.segment_high,
+        segment_low = completed_swings.segment_low,
+        segment_price_range = completed_swings.segment_price_range,
+        segment_atr_ref = completed_swings.segment_atr_ref,
+        bull_swing_delta = completed_swings.bull_swing_delta,
+        prev_bull_swing_delta = completed_swings.prev_bull_swing_delta,
+        bull_swing_delta_div = completed_swings.bull_swing_delta_div,
+        bear_swing_delta = completed_swings.bear_swing_delta,
+        prev_bear_swing_delta = completed_swings.prev_bear_swing_delta,
+        bear_swing_delta_div = completed_swings.bear_swing_delta_div,
+        bull_swing_delta_per_bar = completed_swings.bull_swing_delta_per_bar,
+        prev_bull_swing_delta_per_bar = completed_swings.prev_bull_swing_delta_per_bar,
+        bull_swing_delta_per_bar_div = completed_swings.bull_swing_delta_per_bar_div,
+        bear_swing_delta_per_bar = completed_swings.bear_swing_delta_per_bar,
+        prev_bear_swing_delta_per_bar = completed_swings.prev_bear_swing_delta_per_bar,
+        bear_swing_delta_per_bar_div = completed_swings.bear_swing_delta_per_bar_div,
+        bull_swing_delta_per_range = completed_swings.bull_swing_delta_per_range,
+        prev_bull_swing_delta_per_range = completed_swings.prev_bull_swing_delta_per_range,
+        bull_swing_delta_per_range_div = completed_swings.bull_swing_delta_per_range_div,
+        bear_swing_delta_per_range = completed_swings.bear_swing_delta_per_range,
+        prev_bear_swing_delta_per_range = completed_swings.prev_bear_swing_delta_per_range,
+        bear_swing_delta_per_range_div = completed_swings.bear_swing_delta_per_range_div,
+        bull_swing_delta_per_atr_range = completed_swings.bull_swing_delta_per_atr_range,
+        prev_bull_swing_delta_per_atr_range = completed_swings.prev_bull_swing_delta_per_atr_range,
+        bull_swing_delta_per_atr_range_div = completed_swings.bull_swing_delta_per_atr_range_div,
+        bear_swing_delta_per_atr_range = completed_swings.bear_swing_delta_per_atr_range,
+        prev_bear_swing_delta_per_atr_range = completed_swings.prev_bear_swing_delta_per_atr_range,
+        bear_swing_delta_per_atr_range_div = completed_swings.bear_swing_delta_per_atr_range_div,
+        bull_swing_delta_eff = completed_swings.bull_swing_delta_eff,
+        prev_bull_swing_delta_eff = completed_swings.prev_bull_swing_delta_eff,
+        bull_swing_delta_eff_div = completed_swings.bull_swing_delta_eff_div,
+        bear_swing_delta_eff = completed_swings.bear_swing_delta_eff,
+        prev_bear_swing_delta_eff = completed_swings.prev_bear_swing_delta_eff,
+        bear_swing_delta_eff_div = completed_swings.bear_swing_delta_eff_div,
+    )
+end
+
+
+# ─────────────────────────────────────────────────────────────
 # LAYER 1 — DNA STRAND
 # ─────────────────────────────────────────────────────────────
 
@@ -175,24 +948,6 @@ function _dna!(out::Dict{String,Float64}, b, tf::String, w::Int, thermo)
             out[string(p, "_basis_v10")] = thermo.basis_v10[k]
             out[string(p, "_session_pos")] = thermo.session_pos[k]
             out[string(p, "_eod_momentum")] = thermo.eod_momentum[k]
-            out[string(p, "_fib_a_close_pos")] = thermo.fib_a_close_pos[k]
-            out[string(p, "_fib_a_zone")] = thermo.fib_a_zone[k]
-            out[string(p, "_fib_a_wick_rej_bull")] = thermo.fib_a_wick_rej_bull[k]
-            out[string(p, "_fib_a_wick_rej_bear")] = thermo.fib_a_wick_rej_bear[k]
-            out[string(p, "_fib_a_body_acc")] = thermo.fib_a_body_acc[k]
-            out[string(p, "_fib_a_ext_pct")] = thermo.fib_a_ext_pct[k]
-            out[string(p, "_fib_b_close_pos")] = thermo.fib_b_close_pos[k]
-            out[string(p, "_fib_b_zone")] = thermo.fib_b_zone[k]
-            out[string(p, "_fib_b_wick_rej_bull")] = thermo.fib_b_wick_rej_bull[k]
-            out[string(p, "_fib_b_wick_rej_bear")] = thermo.fib_b_wick_rej_bear[k]
-            out[string(p, "_fib_b_body_acc")] = thermo.fib_b_body_acc[k]
-            out[string(p, "_fib_b_ext_pct")] = thermo.fib_b_ext_pct[k]
-            out[string(p, "_fib_c_close_pos")] = thermo.fib_c_close_pos[k]
-            out[string(p, "_fib_c_zone")] = thermo.fib_c_zone[k]
-            out[string(p, "_fib_c_wick_rej_bull")] = thermo.fib_c_wick_rej_bull[k]
-            out[string(p, "_fib_c_wick_rej_bear")] = thermo.fib_c_wick_rej_bear[k]
-            out[string(p, "_fib_c_body_acc")] = thermo.fib_c_body_acc[k]
-            out[string(p, "_fib_c_ext_pct")] = thermo.fib_c_ext_pct[k]
         else
             out[string(p, "_basis_pct")] = 0.0
             out[string(p, "_basis_z")] = 0.0
@@ -200,24 +955,6 @@ function _dna!(out::Dict{String,Float64}, b, tf::String, w::Int, thermo)
             out[string(p, "_basis_v10")] = 0.0
             out[string(p, "_session_pos")] = 0.0
             out[string(p, "_eod_momentum")] = 0.0
-            out[string(p, "_fib_a_close_pos")] = 0.0
-            out[string(p, "_fib_a_zone")] = 0.0
-            out[string(p, "_fib_a_wick_rej_bull")] = 0.0
-            out[string(p, "_fib_a_wick_rej_bear")] = 0.0
-            out[string(p, "_fib_a_body_acc")] = 0.0
-            out[string(p, "_fib_a_ext_pct")] = 0.0
-            out[string(p, "_fib_b_close_pos")] = 0.0
-            out[string(p, "_fib_b_zone")] = 0.0
-            out[string(p, "_fib_b_wick_rej_bull")] = 0.0
-            out[string(p, "_fib_b_wick_rej_bear")] = 0.0
-            out[string(p, "_fib_b_body_acc")] = 0.0
-            out[string(p, "_fib_b_ext_pct")] = 0.0
-            out[string(p, "_fib_c_close_pos")] = 0.0
-            out[string(p, "_fib_c_zone")] = 0.0
-            out[string(p, "_fib_c_wick_rej_bull")] = 0.0
-            out[string(p, "_fib_c_wick_rej_bear")] = 0.0
-            out[string(p, "_fib_c_body_acc")] = 0.0
-            out[string(p, "_fib_c_ext_pct")] = 0.0
         end
     end
 end
@@ -441,24 +1178,6 @@ function _process_tf!(
                     basis_v10 = thermo.basis_v10[slice_range],
                     session_pos = thermo.session_pos[slice_range],
                     eod_momentum = thermo.eod_momentum[slice_range],
-                    fib_a_close_pos = thermo.fib_a_close_pos[slice_range],
-                    fib_a_zone = thermo.fib_a_zone[slice_range],
-                    fib_a_wick_rej_bull = thermo.fib_a_wick_rej_bull[slice_range],
-                    fib_a_wick_rej_bear = thermo.fib_a_wick_rej_bear[slice_range],
-                    fib_a_body_acc = thermo.fib_a_body_acc[slice_range],
-                    fib_a_ext_pct = thermo.fib_a_ext_pct[slice_range],
-                    fib_b_close_pos = thermo.fib_b_close_pos[slice_range],
-                    fib_b_zone = thermo.fib_b_zone[slice_range],
-                    fib_b_wick_rej_bull = thermo.fib_b_wick_rej_bull[slice_range],
-                    fib_b_wick_rej_bear = thermo.fib_b_wick_rej_bear[slice_range],
-                    fib_b_body_acc = thermo.fib_b_body_acc[slice_range],
-                    fib_b_ext_pct = thermo.fib_b_ext_pct[slice_range],
-                    fib_c_close_pos = thermo.fib_c_close_pos[slice_range],
-                    fib_c_zone = thermo.fib_c_zone[slice_range],
-                    fib_c_wick_rej_bull = thermo.fib_c_wick_rej_bull[slice_range],
-                    fib_c_wick_rej_bear = thermo.fib_c_wick_rej_bear[slice_range],
-                    fib_c_body_acc = thermo.fib_c_body_acc[slice_range],
-                    fib_c_ext_pct = thermo.fib_c_ext_pct[slice_range],
                 )
             else
                 thermo_slice = nothing
@@ -1268,11 +1987,31 @@ end
 # SMC TOKEN 1 / TOKEN 2 FEATURES
 # ─────────────────────────────────────────────────────────────
 
-struct FVGEntry
+mutable struct FVGEntry
     bar_idx::Int
     top::Float64
     bottom::Float64
     direction::Float64
+    max_fill_pct::Float64
+end
+
+mutable struct OBEntry
+    bar_idx::Int
+    ob_high::Float64
+    ob_low::Float64
+    midpoint::Float64
+    direction::Float64
+    quality::Float64
+    mitigated::Bool
+end
+
+struct BreakerEntry
+    bar_idx::Int
+    zone_high::Float64
+    zone_low::Float64
+    midpoint::Float64
+    direction::Float64
+    strength::Float64
 end
 
 @inline function _smc_input_length(
@@ -1348,6 +2087,10 @@ function _compute_smc_core(
     indu_direction = fill(0.0, n)
     indu_magnitude = fill(0.0, n)
     indu_age_bars = fill(0.0, n)
+    pd_zone = fill(0.5, n)
+    breaker_direction = fill(0.0, n)
+    breaker_dist = fill(99.0, n)
+    breaker_strength = fill(0.0, n)
 
     swing_high_indices = Int[]
     swing_high_prices = Float64[]
@@ -1357,18 +2100,10 @@ function _compute_smc_core(
     structure_events = Float64[]
     last_confirmed_swing_high = NaN
     last_confirmed_swing_low = NaN
-    prev_swing_high = NaN
-    prev_swing_low = NaN
-    consecutive_bearish_structure = 0
-    consecutive_bullish_structure = 0
 
     active_fvgs = FVGEntry[]
-
-    best_ob_idx = 0
-    best_ob_midpoint = NaN
-    best_ob_direction = 0.0
-    best_ob_quality = 0.0
-    best_ob_disp_confirmed = false
+    active_obs = OBEntry[]
+    active_breakers = BreakerEntry[]
 
     amd_current_state = 0
     amd_state_start_bar = 1
@@ -1389,50 +2124,45 @@ function _compute_smc_core(
         prev_atr = (isfinite(atrs[i - 1]) && atrs[i - 1] > 0.0) ? atrs[i - 1] : curr_atr
         ready = i > warmup
 
-        if i >= 4
-            k = i - 2
-            prominence_threshold = 0.3 * prev_atr
+        if i >= 6
+            k = i - 3
+            swing_atr = (isfinite(atrs[k]) && atrs[k] > 0.0) ? atrs[k] : prev_atr
+            prominence_threshold = 0.3 * swing_atr
 
-            if highs[k] > highs[k - 1] && highs[k] > highs[k + 1]
-                left_prom = highs[k] - highs[k - 1]
-                right_prom = highs[k] - highs[k + 1]
+            is_sh = highs[k] > highs[k - 1] && highs[k] > highs[k - 2] &&
+                    highs[k] > highs[k + 1] && highs[k] > highs[k + 2]
+            if is_sh
+                left_prom = min(highs[k] - highs[k - 1], highs[k] - highs[k - 2])
+                right_prom = min(highs[k] - highs[k + 1], highs[k] - highs[k + 2])
                 if min(left_prom, right_prom) >= prominence_threshold
                     push!(swing_high_indices, k)
                     push!(swing_high_prices, highs[k])
 
                     if isfinite(last_confirmed_swing_high)
-                        prev_swing_high = last_confirmed_swing_high
                         if highs[k] > last_confirmed_swing_high
                             push!(structure_events, 1.0)
-                            consecutive_bullish_structure += 1
-                            consecutive_bearish_structure = 0
                         else
-                            push!(structure_events, -0.5)
-                            consecutive_bearish_structure += 1
-                            consecutive_bullish_structure = 0
+                            push!(structure_events, -1.0)
                         end
                     end
                     last_confirmed_swing_high = highs[k]
                 end
             end
 
-            if lows[k] < lows[k - 1] && lows[k] < lows[k + 1]
-                left_prom = lows[k - 1] - lows[k]
-                right_prom = lows[k + 1] - lows[k]
+            is_sl = lows[k] < lows[k - 1] && lows[k] < lows[k - 2] &&
+                    lows[k] < lows[k + 1] && lows[k] < lows[k + 2]
+            if is_sl
+                left_prom = min(lows[k - 1] - lows[k], lows[k - 2] - lows[k])
+                right_prom = min(lows[k + 1] - lows[k], lows[k + 2] - lows[k])
                 if min(left_prom, right_prom) >= prominence_threshold
                     push!(swing_low_indices, k)
                     push!(swing_low_prices, lows[k])
 
                     if isfinite(last_confirmed_swing_low)
-                        prev_swing_low = last_confirmed_swing_low
                         if lows[k] < last_confirmed_swing_low
                             push!(structure_events, -1.0)
-                            consecutive_bearish_structure += 1
-                            consecutive_bullish_structure = 0
                         else
-                            push!(structure_events, 0.5)
-                            consecutive_bullish_structure += 1
-                            consecutive_bearish_structure = 0
+                            push!(structure_events, 1.0)
                         end
                     end
                     last_confirmed_swing_low = lows[k]
@@ -1488,67 +2218,143 @@ function _compute_smc_core(
             density = 0.0
             radius = 5.0 * curr_atr
             c_prev = closes[i - 1]
-            for sp in swing_high_prices
-                if abs(sp - c_prev) <= radius
+            for idx in length(swing_high_indices):-1:1
+                if i - swing_high_indices[idx] > structure_window
+                    break
+                end
+                if abs(swing_high_prices[idx] - c_prev) <= radius
                     density += 1.0
                 end
             end
-            for sp in swing_low_prices
-                if abs(sp - c_prev) <= radius
+            for idx in length(swing_low_indices):-1:1
+                if i - swing_low_indices[idx] > structure_window
+                    break
+                end
+                if abs(swing_low_prices[idx] - c_prev) <= radius
                     density += 1.0
                 end
             end
             pool_density[i] = density
         end
 
-        if include_ob && ready
-            found_ob = false
-            for k in (i - 2):-1:max(1, i - ob_max_age)
-                if k + 1 > n
-                    continue
-                end
-                if disp_confirmed[k + 1] == 1.0
-                    dir_k = closes[k] >= opens[k] ? 1.0 : -1.0
-                    dir_k1 = closes[k + 1] >= opens[k + 1] ? 1.0 : -1.0
-
-                    if dir_k != dir_k1
-                        age = i - 1 - k
-                        body_ratio_k = abs(closes[k] - opens[k]) / (curr_atr + 1e-9)
-                        quality = disp_body_ratio[k + 1] * body_ratio_k * exp(-ob_decay_rate * age)
-
-                        ob_quality_score[i] = quality
-                        ob_direction[i] = -dir_k
-                        best_ob_midpoint = (opens[k] + closes[k]) / 2.0
-                        ob_nearest_dist[i] = abs(closes[i - 1] - best_ob_midpoint) / curr_atr
-                        ob_nearest_dist[i] = min(ob_nearest_dist[i], 99.0)
-                        ob_age_bars[i] = Float64(age)
-
-                        best_ob_idx = k
-                        best_ob_direction = -dir_k
-                        best_ob_quality = quality
-                        best_ob_disp_confirmed = true
-
-                        found_ob = true
-                        break
-                    end
+        if include_ob && ready && disp_confirmed[i] == 1.0 && i >= 3
+            k = i - 2
+            if k >= 1
+                dir_k = closes[k] >= opens[k] ? 1.0 : -1.0
+                dir_k1 = closes[i - 1] >= opens[i - 1] ? 1.0 : -1.0
+                if dir_k != dir_k1
+                    body_ratio_k = abs(closes[k] - opens[k]) / (curr_atr + 1e-9)
+                    quality = disp_body_ratio[i] * body_ratio_k
+                    ob_h = max(opens[k], closes[k])
+                    ob_l = min(opens[k], closes[k])
+                    push!(
+                        active_obs,
+                        OBEntry(k, ob_h, ob_l, (ob_h + ob_l) / 2.0, -dir_k, quality, false),
+                    )
                 end
             end
-            if !found_ob
-                best_ob_idx = 0
-                best_ob_midpoint = NaN
-                best_ob_direction = 0.0
-                best_ob_quality = 0.0
-                best_ob_disp_confirmed = false
+        end
+
+        if include_ob && ready
+            j_ob = 1
+            while j_ob <= length(active_obs)
+                ob = active_obs[j_ob]
+                age = i - 1 - ob.bar_idx
+
+                if age > ob_max_age
+                    deleteat!(active_obs, j_ob)
+                    continue
+                end
+
+                if !ob.mitigated
+                    if ob.direction > 0.0
+                        if lows[i - 1] < ob.ob_low
+                            ob.mitigated = true
+                            push!(
+                                active_breakers,
+                                BreakerEntry(
+                                    ob.bar_idx,
+                                    ob.ob_high,
+                                    ob.ob_low,
+                                    ob.midpoint,
+                                    -ob.direction,
+                                    ob.quality * 0.8,
+                                ),
+                            )
+                        end
+                    else
+                        if highs[i - 1] > ob.ob_high
+                            ob.mitigated = true
+                            push!(
+                                active_breakers,
+                                BreakerEntry(
+                                    ob.bar_idx,
+                                    ob.ob_high,
+                                    ob.ob_low,
+                                    ob.midpoint,
+                                    -ob.direction,
+                                    ob.quality * 0.8,
+                                ),
+                            )
+                        end
+                    end
+                end
+
+                if ob.mitigated && age > 5
+                    deleteat!(active_obs, j_ob)
+                    continue
+                end
+
+                j_ob += 1
+            end
+
+            best_dist = 99.0
+            best_ob_local = nothing
+            for ob in active_obs
+                if ob.mitigated
+                    continue
+                end
+                age = i - 1 - ob.bar_idx
+                dist = abs(closes[i - 1] - ob.midpoint) / curr_atr
+                if dist < best_dist
+                    best_dist = dist
+                    best_ob_local = ob
+                end
+            end
+            if best_ob_local !== nothing
+                age = i - 1 - best_ob_local.bar_idx
+                ob_quality_score[i] = best_ob_local.quality * exp(-ob_decay_rate * age)
+                ob_direction[i] = best_ob_local.direction
+                ob_nearest_dist[i] = min(best_dist, 99.0)
+                ob_age_bars[i] = Float64(age)
+            end
+
+            filter!(b -> (i - 1 - b.bar_idx) <= ob_max_age, active_breakers)
+
+            if !isempty(active_breakers)
+                best_breaker_dist = 99.0
+                best_brk = active_breakers[1]
+                for brk in active_breakers
+                    dist = abs(closes[i - 1] - brk.midpoint) / curr_atr
+                    if dist < best_breaker_dist
+                        best_breaker_dist = dist
+                        best_brk = brk
+                    end
+                end
+                age = i - 1 - best_brk.bar_idx
+                breaker_direction[i] = best_brk.direction
+                breaker_dist[i] = min(best_breaker_dist, 99.0)
+                breaker_strength[i] = best_brk.strength * exp(-ob_decay_rate * age)
             end
         end
 
         if include_fvg
             if i >= 4
                 if lows[i - 1] > highs[i - 3]
-                    push!(active_fvgs, FVGEntry(i - 2, lows[i - 1], highs[i - 3], 1.0))
+                    push!(active_fvgs, FVGEntry(i - 2, lows[i - 1], highs[i - 3], 1.0, 0.0))
                 end
                 if highs[i - 1] < lows[i - 3]
-                    push!(active_fvgs, FVGEntry(i - 2, lows[i - 3], highs[i - 1], -1.0))
+                    push!(active_fvgs, FVGEntry(i - 2, lows[i - 3], highs[i - 1], -1.0, 0.0))
                 end
             end
 
@@ -1563,16 +2369,20 @@ function _compute_smc_core(
 
                 gap_size = fvg.top - fvg.bottom
                 if gap_size > 0.0
+                    fill_this_bar = 0.0
                     if fvg.direction > 0.0
                         if lows[i - 1] <= fvg.top
-                            filled_depth = fvg.top - max(lows[i - 1], fvg.bottom)
-                            _ = filled_depth
+                            fill_this_bar = (fvg.top - max(lows[i - 1], fvg.bottom)) / gap_size
                         end
                     else
                         if highs[i - 1] >= fvg.bottom
-                            filled_depth = min(highs[i - 1], fvg.top) - fvg.bottom
-                            _ = filled_depth
+                            fill_this_bar = (min(highs[i - 1], fvg.top) - fvg.bottom) / gap_size
                         end
+                    end
+                    fvg.max_fill_pct = max(fvg.max_fill_pct, fill_this_bar)
+                    if fvg.max_fill_pct >= 0.95
+                        deleteat!(active_fvgs, j)
+                        continue
                     end
                 end
                 j += 1
@@ -1606,20 +2416,7 @@ function _compute_smc_core(
                 if nearest_idx > 0
                     nfvg = active_fvgs[nearest_idx]
                     fvg_direction[i] = nfvg.direction
-
-                    gap_size = nfvg.top - nfvg.bottom
-                    if gap_size > 0.0
-                        max_fill = 0.0
-                        for j in nfvg.bar_idx:(i - 1)
-                            if nfvg.direction > 0.0
-                                fill = max(0.0, nfvg.top - max(lows[j], nfvg.bottom))
-                            else
-                                fill = max(0.0, min(highs[j], nfvg.top) - nfvg.bottom)
-                            end
-                            max_fill = max(max_fill, fill)
-                        end
-                        fvg_fill_pct[i] = clamp(max_fill / gap_size, 0.0, 1.0)
-                    end
+                    fvg_fill_pct[i] = clamp(nfvg.max_fill_pct, 0.0, 1.0)
                 end
             end
         end
@@ -1643,25 +2440,23 @@ function _compute_smc_core(
                 structure_trend_score[i] = clamp((bullish_count - bearish_count) / total, -1.0, 1.0)
             end
 
-            if !isempty(structure_events) && structure_events[end] == 1.0
-                if consecutive_bullish_structure == 1 && consecutive_bearish_structure == 0
-                    if n_events >= 3
-                        prev_bear = 0
-                        for check_idx in (n_events - 1):-1:max(1, n_events - 5)
-                            if structure_events[check_idx] < 0.0
-                                prev_bear += 1
-                            else
-                                break
-                            end
+            if !isempty(structure_events) && structure_events[end] > 0.0
+                if n_events >= 3
+                    prev_bear = 0
+                    for check_idx in (n_events - 1):-1:max(1, n_events - 5)
+                        if structure_events[check_idx] < 0.0
+                            prev_bear += 1
+                        else
+                            break
                         end
-                        if prev_bear >= 2
-                            choch_bull_signal[i] = 1.0
-                        end
+                    end
+                    if prev_bear >= 2
+                        choch_bull_signal[i] = 1.0
                     end
                 end
             end
 
-            if !isempty(structure_events) && structure_events[end] == -1.0
+            if !isempty(structure_events) && structure_events[end] < 0.0
                 if n_events >= 3
                     prev_bull = 0
                     for check_idx in (n_events - 1):-1:max(1, n_events - 5)
@@ -1677,15 +2472,37 @@ function _compute_smc_core(
                 end
             end
 
-            if choch_bull_signal[i] == 1.0 && disp_confirmed[i] == 1.0
-                if isfinite(last_confirmed_swing_high) && closes[i - 1] > last_confirmed_swing_high
-                    mss_confirmed[i] = 1.0
-                end
-            elseif choch_bear_signal[i] == 1.0 && disp_confirmed[i] == 1.0
-                if isfinite(last_confirmed_swing_low) && closes[i - 1] < last_confirmed_swing_low
-                    mss_confirmed[i] = 1.0
+            if isfinite(last_confirmed_swing_high) && isfinite(last_confirmed_swing_low)
+                dealing_range = last_confirmed_swing_high - last_confirmed_swing_low
+                if dealing_range > 0.0
+                    pd_zone[i] = clamp(
+                        (closes[i - 1] - last_confirmed_swing_low) / dealing_range,
+                        0.0,
+                        1.0,
+                    )
                 end
             end
+
+            mss_score = 0.0
+            has_choch = choch_bull_signal[i] == 1.0 || choch_bear_signal[i] == 1.0
+            if has_choch
+                mss_score += 0.4
+            end
+            if disp_magnitude[i] > 1.0
+                mss_score += clamp(0.3 * (disp_magnitude[i] - 1.0) / 2.0, 0.0, 0.3)
+            end
+            if has_choch
+                if choch_bull_signal[i] == 1.0 && isfinite(last_confirmed_swing_high)
+                    if closes[i - 1] > last_confirmed_swing_high
+                        mss_score += 0.3
+                    end
+                elseif choch_bear_signal[i] == 1.0 && isfinite(last_confirmed_swing_low)
+                    if closes[i - 1] < last_confirmed_swing_low
+                        mss_score += 0.3
+                    end
+                end
+            end
+            mss_confirmed[i] = clamp(mss_score, 0.0, 1.0)
         end
 
         if ready
@@ -1709,6 +2526,12 @@ function _compute_smc_core(
                 if sweep_bull_mag[i] > 0.5 || sweep_bear_mag[i] > 0.5
                     amd_current_state = 2
                     transitioned = true
+                elseif amd_state_bar_count > 30
+                    amd_state_start_bar = i
+                    amd_state_high = highs[i - 1]
+                    amd_state_low = lows[i - 1]
+                    amd_state_vol_sum = volumes[i - 1]
+                    amd_state_bar_count = 1
                 end
             elseif amd_current_state == 2
                 if disp_confirmed[i] == 1.0
@@ -1729,7 +2552,7 @@ function _compute_smc_core(
 
                 if amd_state_bar_count >= 10 &&
                    state_range < 0.5 * curr_atr &&
-                   avg_state_vol < 0.6 * avg_vol_50
+                   avg_state_vol < 0.7 * avg_vol_50
                     amd_current_state = 1
                     transitioned = true
                 end
@@ -1833,6 +2656,10 @@ function _compute_smc_core(
         indu_direction = indu_direction,
         indu_magnitude = indu_magnitude,
         indu_age_bars = indu_age_bars,
+        pd_zone = pd_zone,
+        breaker_direction = breaker_direction,
+        breaker_dist = breaker_dist,
+        breaker_strength = breaker_strength,
     )
 end
 
@@ -1875,7 +2702,7 @@ end
 """
     compute_smc_features(opens, highs, lows, closes, volumes, atrs; ...) -> Dict{String, Vector{Float64}}
 
-Compute the 30 Token 1 / Token 2 SMC feature columns defined in the repo spec.
+Compute the 34 Token 1 / Token 2 SMC feature columns defined in the repo spec.
 The returned keys intentionally omit the Python-side `smc_` prefix.
 """
 function compute_smc_features(
@@ -1948,6 +2775,10 @@ function compute_smc_features(
         "indu_direction" => cols.indu_direction,
         "indu_magnitude" => cols.indu_magnitude,
         "indu_age_bars" => cols.indu_age_bars,
+        "pd_zone" => cols.pd_zone,
+        "breaker_direction" => cols.breaker_direction,
+        "breaker_dist" => cols.breaker_dist,
+        "breaker_strength" => cols.breaker_strength,
     )
 end
 
@@ -1960,6 +2791,8 @@ function compute_smc_htf_features(
     atrs::AbstractVector{Float64};
     swing_lookback::Int = 10,
     structure_window::Int = 40,
+    fvg_max_age::Int = 50,
+    ob_max_age::Int = 50,
     amd_accum_window::Int = 20,
     warmup::Int = 50,
 )::Dict{String, Vector{Float64}}
@@ -1972,6 +2805,8 @@ function compute_smc_htf_features(
         collect(Float64, atrs);
         swing_lookback = swing_lookback,
         structure_window = structure_window,
+        fvg_max_age = fvg_max_age,
+        ob_max_age = ob_max_age,
         amd_accum_window = amd_accum_window,
         warmup = warmup,
     )
@@ -1991,6 +2826,8 @@ function compute_smc_htf_features(
     atrs::Vector{Float64};
     swing_lookback::Int = 10,
     structure_window::Int = 40,
+    fvg_max_age::Int = 50,
+    ob_max_age::Int = 50,
     amd_accum_window::Int = 20,
     warmup::Int = 50,
 )::Dict{String, Vector{Float64}}
@@ -2003,8 +2840,8 @@ function compute_smc_htf_features(
         atrs;
         swing_lookback = swing_lookback,
         structure_window = structure_window,
-        fvg_max_age = 50,
-        ob_max_age = 50,
+        fvg_max_age = fvg_max_age,
+        ob_max_age = ob_max_age,
         ob_decay_rate = 0.02,
         disp_body_threshold = 1.5,
         amd_accum_window = amd_accum_window,
@@ -2019,6 +2856,330 @@ function compute_smc_htf_features(
     return Dict{String, Vector{Float64}}(
         "structure_trend_score" => cols.structure_trend_score,
         "amd_phase" => cols.amd_phase,
+    )
+end
+
+
+# ─────────────────────────────────────────────────────────────
+# REALIZED VOLATILITY V2 — Institutional Multi-Estimator Surface
+# ─────────────────────────────────────────────────────────────
+
+function compute_rv_features(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64};
+    rv_window::Int = 21,
+    z_window::Int = 63,
+    short_window::Int = 5,
+    long_window::Int = 21,
+    annualization::Float64 = 252.0,
+)::Dict{String, Vector{Float64}}
+    return compute_rv_features(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes);
+        rv_window = rv_window,
+        z_window = z_window,
+        short_window = short_window,
+        long_window = long_window,
+        annualization = annualization,
+    )
+end
+
+"""
+    compute_rv_features(opens, highs, lows, closes; ...) -> Dict{String, Vector{Float64}}
+
+Single-pass Yang-Zhang + Parkinson + jump/asymmetry/skewness volatility surface.
+Returns 11 features per timeframe:
+
+Estimators (2):
+  yz_log     — log1p(Yang-Zhang annualized RV)
+  pk_log     — log1p(Parkinson annualized RV)
+
+Regime (2):
+  yz_z       — z-score vs z_window history
+  yz_pctrank — percentile rank [0,1] over z_window
+
+Dynamics (3):
+  yz_trend   — short MA / long MA ratio - 1
+  yz_shock   — 1-bar surprise (rv/prev_rv - 1)
+  vov        — vol-of-vol: std(rv,21)/mean(rv,21)
+
+Structure (2):
+  range_eff  — Parkinson/Yang-Zhang ratio (microstructure efficiency)
+  jump_ratio — (simple_var - BPV) / simple_var  (jump vs diffusion)
+
+Asymmetry (2):
+  rv_asym    — down_vol / up_vol ratio (leverage effect, Black 1976)
+  rv_skew    — realized skewness of returns (3rd moment, crash/melt-up)
+"""
+function compute_rv_features(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64};
+    rv_window::Int = 21,
+    z_window::Int = 63,
+    short_window::Int = 5,
+    long_window::Int = 21,
+    annualization::Float64 = 252.0,
+)::Dict{String, Vector{Float64}}
+    n = length(closes)
+    eps = 1e-9
+
+    yz_log_out = fill(0.0, n)
+    yz_z_out = fill(0.0, n)
+    yz_pctrank_out = fill(0.5, n)
+    yz_trend_out = fill(0.0, n)
+    yz_shock_out = fill(0.0, n)
+    vov_out = fill(0.0, n)
+    pk_log_out = fill(0.0, n)
+    range_eff_out = fill(1.0, n)
+    jump_ratio_out = fill(0.0, n)
+    rv_asym_out = fill(1.0, n)
+    rv_skew_out = fill(0.0, n)
+
+    log_co = fill(0.0, n)
+    log_oc = fill(0.0, n)
+    log_ret = fill(0.0, n)
+    rs_comp = fill(0.0, n)
+    pk_comp = fill(0.0, n)
+
+    for i in 1:n
+        o_i = opens[i]
+        h_i = highs[i]
+        l_i = lows[i]
+        c_i = closes[i]
+        if o_i <= 0.0 || h_i <= 0.0 || l_i <= 0.0 || c_i <= 0.0
+            continue
+        end
+        log_oc[i] = log(c_i / o_i)
+        if i > 1 && closes[i - 1] > 0.0
+            log_co[i] = log(o_i / closes[i - 1])
+            log_ret[i] = log(c_i / closes[i - 1])
+        end
+        log_hc = log(h_i / c_i)
+        log_ho = log(h_i / o_i)
+        log_lc = log(l_i / c_i)
+        log_lo = log(l_i / o_i)
+        rs_comp[i] = log_hc * log_ho + log_lc * log_lo
+        pk_comp[i] = log(h_i / l_i)^2
+    end
+
+    yz_rv = fill(0.0, n)
+    pk_rv = fill(0.0, n)
+    pk_factor = 1.0 / (4.0 * log(2.0))
+    k = 0.34 / (1.34 + (rv_window + 1) / (rv_window - 1))
+
+    for i in rv_window:n
+        s = (i - rv_window + 1):i
+        co_start = max(i - rv_window + 2, 2)
+        co_slice = @view log_co[co_start:i]
+        if length(co_slice) < 2
+            continue
+        end
+
+        mu_o = 0.0
+        @inbounds for v in co_slice
+            mu_o += v
+        end
+        mu_o /= length(co_slice)
+        sigma_o2 = 0.0
+        @inbounds for v in co_slice
+            sigma_o2 += (v - mu_o)^2
+        end
+        sigma_o2 /= length(co_slice)
+
+        oc_slice = @view log_oc[s]
+        mu_c = 0.0
+        @inbounds for v in oc_slice
+            mu_c += v
+        end
+        mu_c /= rv_window
+        sigma_c2 = 0.0
+        @inbounds for v in oc_slice
+            sigma_c2 += (v - mu_c)^2
+        end
+        sigma_c2 /= rv_window
+
+        sigma_rs2 = 0.0
+        @inbounds for v in @view rs_comp[s]
+            sigma_rs2 += v
+        end
+        sigma_rs2 /= rv_window
+
+        yz_var = sigma_o2 + k * sigma_rs2 + (1.0 - k) * sigma_c2
+        if isfinite(yz_var) && yz_var > 0.0
+            yz_rv[i] = sqrt(yz_var * annualization)
+        end
+
+        pk_sum = 0.0
+        @inbounds for v in @view pk_comp[s]
+            pk_sum += v
+        end
+        pk_var = pk_sum / rv_window * pk_factor * annualization
+        if pk_var > 0.0
+            pk_rv[i] = sqrt(pk_var)
+        end
+
+        ret_slice = @view log_ret[s]
+        mu_ret = 0.0
+        @inbounds for v in ret_slice
+            mu_ret += v
+        end
+        mu_ret /= rv_window
+        simple_var = 0.0
+        @inbounds for v in ret_slice
+            simple_var += (v - mu_ret)^2
+        end
+        simple_var /= rv_window
+
+        bpv = 0.0
+        bpv_count = 0
+        for j in (i - rv_window + 2):i
+            bpv += abs(log_ret[j]) * abs(log_ret[j - 1])
+            bpv_count += 1
+        end
+        if bpv_count > 0
+            bpv = bpv / bpv_count * (pi / 2.0)
+        end
+        if simple_var > eps
+            jump_ratio_out[i] = clamp((simple_var - bpv) / simple_var, 0.0, 1.0)
+        end
+
+        down_var = 0.0
+        down_count = 0
+        up_var = 0.0
+        up_count = 0
+        for j in s
+            r = log_ret[j]
+            if r < 0.0
+                down_var += r * r
+                down_count += 1
+            elseif r > 0.0
+                up_var += r * r
+                up_count += 1
+            end
+        end
+        if down_count > 0
+            down_var /= down_count
+        end
+        if up_count > 0
+            up_var /= up_count
+        end
+        if up_var > eps
+            rv_asym_out[i] = clamp(down_var / up_var, 0.1, 10.0)
+        end
+
+        m2 = 0.0
+        m3 = 0.0
+        for j in s
+            r = log_ret[j]
+            r2 = r * r
+            m2 += r2
+            m3 += r2 * r
+        end
+        m2 /= rv_window
+        m3 /= rv_window
+        denom = m2^1.5
+        if denom > eps
+            rv_skew_out[i] = clamp(m3 / denom, -5.0, 5.0)
+        end
+    end
+
+    first_valid = 0
+    for i in rv_window:n
+        if yz_rv[i] > 0.0
+            first_valid = i
+            break
+        end
+    end
+    if first_valid > 0
+        for i in 1:(first_valid - 1)
+            yz_rv[i] = yz_rv[first_valid]
+            pk_rv[i] = pk_rv[first_valid]
+            jump_ratio_out[i] = jump_ratio_out[first_valid]
+            rv_asym_out[i] = rv_asym_out[first_valid]
+            rv_skew_out[i] = rv_skew_out[first_valid]
+        end
+    end
+
+    yz_cumsum = fill(0.0, n + 1)
+    for i in 1:n
+        yz_cumsum[i + 1] = yz_cumsum[i] + yz_rv[i]
+    end
+
+    for i in 1:n
+        rv_i = yz_rv[i]
+
+        yz_log_out[i] = log1p(rv_i)
+        pk_log_out[i] = log1p(pk_rv[i])
+
+        if rv_i > eps
+            range_eff_out[i] = clamp(pk_rv[i] / rv_i, 0.2, 5.0)
+        end
+
+        if i > 1 && yz_rv[i - 1] > eps
+            yz_shock_out[i] = clamp((rv_i / yz_rv[i - 1]) - 1.0, -5.0, 5.0)
+        end
+
+        if i >= z_window
+            z_start = i - z_window + 1
+            z_mean = (yz_cumsum[i + 1] - yz_cumsum[z_start]) / z_window
+            z_var = 0.0
+            @inbounds for j in z_start:i
+                z_var += (yz_rv[j] - z_mean)^2
+            end
+            z_std = sqrt(z_var / z_window)
+            if z_std > eps
+                yz_z_out[i] = clamp((rv_i - z_mean) / z_std, -8.0, 8.0)
+            end
+            rank_count = 0
+            @inbounds for j in z_start:i
+                if yz_rv[j] <= rv_i
+                    rank_count += 1
+                end
+            end
+            yz_pctrank_out[i] = Float64(rank_count) / Float64(z_window)
+        end
+
+        if i >= long_window
+            short_start = max(1, i - short_window + 1)
+            long_start = i - long_window + 1
+            short_mean = (yz_cumsum[i + 1] - yz_cumsum[short_start]) / (i - short_start + 1)
+            long_mean = (yz_cumsum[i + 1] - yz_cumsum[long_start]) / long_window
+            if long_mean > eps
+                yz_trend_out[i] = clamp((short_mean / long_mean) - 1.0, -5.0, 5.0)
+            end
+        end
+
+        if i >= rv_window
+            vov_start = i - rv_window + 1
+            vov_mean = (yz_cumsum[i + 1] - yz_cumsum[vov_start]) / rv_window
+            if vov_mean > eps
+                vov_var = 0.0
+                @inbounds for j in vov_start:i
+                    vov_var += (yz_rv[j] - vov_mean)^2
+                end
+                vov_out[i] = clamp(sqrt(vov_var / rv_window) / vov_mean, 0.0, 5.0)
+            end
+        end
+    end
+
+    return Dict{String, Vector{Float64}}(
+        "yz_log" => yz_log_out,
+        "yz_z" => yz_z_out,
+        "yz_pctrank" => yz_pctrank_out,
+        "yz_trend" => yz_trend_out,
+        "yz_shock" => yz_shock_out,
+        "vov" => vov_out,
+        "pk_log" => pk_log_out,
+        "range_eff" => range_eff_out,
+        "jump_ratio" => jump_ratio_out,
+        "rv_asym" => rv_asym_out,
+        "rv_skew" => rv_skew_out,
     )
 end
 

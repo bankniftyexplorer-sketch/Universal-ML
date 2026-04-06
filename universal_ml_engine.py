@@ -22,6 +22,8 @@ import matplotlib.gridspec as gridspec
 
 from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
+    kalman_structural_engine_fast,
+    rv_feature_engine_fast,
     smc_feature_engine_fast,
     add_target_fast as add_target,
 )
@@ -46,23 +48,6 @@ RUNNER_FRACTION = 0.25
 TRAIL_R_MULT = 1.0
 MIN_LABEL_EDGE_R = 0.25
 MIN_LABEL_BEST_R = 0.15
-# ─────────────────────────────────────────────
-# FIBONACCI STRUCTURAL BASIS CONSTANTS
-# ─────────────────────────────────────────────
-FIB_RATIOS = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
-FIB_ATR_PROMINENCE = 0.5
-_FIB_RAW_COLS = frozenset(
-    f"fib_{slot}_{field}"
-    for slot in ("a", "b", "c")
-    for field in (
-        "close_pos",
-        "zone",
-        "wick_rej_bull",
-        "wick_rej_bear",
-        "body_acc",
-        "ext_pct",
-    )
-)
 EXEC_FEE_PCT = 0.0005
 EXEC_SLIPPAGE_BPS = 0.0003
 TIME_COL_CANDIDATES = (
@@ -127,8 +112,27 @@ NON_FEATURE_COLS_SET = frozenset(
         "m_low",
         "m_close",
         "m_volume",
+        "realized_volatility",
     }
-) | _FIB_RAW_COLS
+)
+HTF_ASOF_TOLERANCE = {
+    "1D": pd.Timedelta("2 days"),
+    "1W": pd.Timedelta("14 days"),
+    "1M": pd.Timedelta("62 days"),
+    "3M": pd.Timedelta("184 days"),
+    "6M": pd.Timedelta("370 days"),
+    "12M": pd.Timedelta("740 days"),
+}
+_DEFAULT_TF_GAPS = {
+    "1M": pd.Timedelta(days=31),
+    "3M": pd.Timedelta(days=93),
+    "6M": pd.Timedelta(days=186),
+    "12M": pd.Timedelta(days=372),
+}
+FORECAST_STALE_THRESHOLDS = {
+    "1H": pd.Timedelta(hours=36),
+    "1D": pd.Timedelta(days=4),
+}
 PRIMARY_ASSET_CLASS = "SPOT"
 
 
@@ -164,8 +168,14 @@ def fetch_spot_timeframes(
     bridge,
     symbol: str,
     labels: tuple[str, ...],
+    *,
+    include_realized_vol: bool = False,
 ) -> dict[str, pd.DataFrame | None]:
-    tf_map = bridge.fetch_holographic_stack(symbol, PRIMARY_ASSET_CLASS)
+    tf_map = bridge.fetch_holographic_stack(
+        symbol,
+        PRIMARY_ASSET_CLASS,
+        include_realized_vol=include_realized_vol,
+    )
     return build_spot_timeframe_selection(tf_map, labels)
 
 
@@ -1319,7 +1329,7 @@ def predict_next_bar(
     if confidence >= confidence_threshold:
         signal = "STRONG"
     else:
-        signal = "WEAK"
+        signal = "NO_TRADE"
 
     return {
         "direction": direction,
@@ -1329,146 +1339,87 @@ def predict_next_bar(
     }
 
 
-# ─────────────────────────────────────────────
-# 7. MAIN EXECUTION (Optimized for performance)
-# ─────────────────────────────────────────────
+def _append_filter_note(existing_note: str, extra_note: str) -> str:
+    left = str(existing_note or "").strip()
+    right = str(extra_note or "").strip()
+    if not right:
+        return left
+    if not left:
+        return right
+    return f"{left} {right}".strip()
 
 
-def fib_structural_basis(
-    df_ltf: pd.DataFrame,
-    htf_frames: dict[str, pd.DataFrame | None],
-    pairs: list[tuple[str, str]],
-) -> pd.DataFrame:
-    """
-    Inject per-bar Fibonacci structural features onto the primary timeframe.
+def _format_age_delta(delta: pd.Timedelta) -> str:
+    total_seconds = max(int(delta.total_seconds()), 0)
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and not days:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append("0m")
+    return " ".join(parts[:2])
 
-    For each (HTF, slot) pair, the latest qualifying HTF swing high and swing
-    low are detected in real price space, merged backward onto the LTF bars,
-    and converted into six structural interaction columns.
-    """
-    result = df_ltf.sort_values("time").reset_index(drop=True).copy()
-    fib_ratios = np.array(FIB_RATIOS, dtype=np.float64)
 
-    def _write_defaults(prefix: str) -> None:
-        result[f"{prefix}_close_pos"] = 0.5
-        result[f"{prefix}_zone"] = 3.0
-        result[f"{prefix}_wick_rej_bull"] = 0.0
-        result[f"{prefix}_wick_rej_bear"] = 0.0
-        result[f"{prefix}_body_acc"] = 0.0
-        result[f"{prefix}_ext_pct"] = 0.0
+def forecast_staleness_note(
+    bar_time,
+    timeframe: str,
+    *,
+    now: pd.Timestamp | None = None,
+) -> str:
+    if bar_time is None or pd.isna(bar_time):
+        return ""
 
-    for htf_key, slot in pairs:
-        prefix = f"fib_{slot}"
-        df_htf = htf_frames.get(htf_key)
-        if df_htf is None or df_htf.empty or len(df_htf) < 10:
-            _write_defaults(prefix)
-            continue
+    bar_ts = pd.Timestamp(bar_time)
+    if bar_ts.tzinfo is None:
+        bar_ts = bar_ts.tz_localize("Asia/Kolkata")
+    current_ts = now if now is not None else pd.Timestamp.now(tz=bar_ts.tz)
+    if current_ts.tzinfo is None:
+        current_ts = current_ts.tz_localize(bar_ts.tz)
+    else:
+        current_ts = current_ts.tz_convert(bar_ts.tz)
 
-        htf = df_htf.sort_values("time").reset_index(drop=True).copy()
-        prev_close = htf["close"].shift(1).fillna(htf["close"])
-        true_range = np.maximum(
-            htf["high"] - htf["low"],
-            np.maximum(
-                np.abs(htf["high"] - prev_close),
-                np.abs(htf["low"] - prev_close),
-            ),
+    threshold = FORECAST_STALE_THRESHOLDS.get(str(timeframe).upper())
+    if threshold is None:
+        return ""
+
+    age = current_ts - bar_ts
+    if age <= threshold:
+        return ""
+    return (
+        f"Stale data: latest {str(timeframe).upper()} bar is "
+        f"{_format_age_delta(age)} old."
+    )
+
+
+def finalize_forecast_context(
+    pred: dict,
+    *,
+    timeframe: str,
+    bar_time,
+    confidence_threshold: float,
+    base_note: str = "",
+) -> tuple[dict, str]:
+    result = dict(pred)
+    filter_note = str(base_note or "").strip()
+
+    if result.get("signal_strength") == "NO_TRADE":
+        filter_note = _append_filter_note(
+            filter_note,
+            f"Filtered: confidence below {confidence_threshold:.2f}.",
         )
-        atr14 = true_range.rolling(14).mean().fillna(true_range).to_numpy(dtype=float)
-        highs = htf["high"].to_numpy(dtype=float)
-        lows = htf["low"].to_numpy(dtype=float)
-        n_htf = len(htf)
 
-        swing_highs: list[tuple[int, float]] = []
-        swing_lows: list[tuple[int, float]] = []
-        for j in range(1, n_htf - 1):
-            if (
-                highs[j] > highs[j - 1]
-                and highs[j] > highs[j + 1]
-                and (highs[j] - max(highs[j - 1], highs[j + 1]))
-                >= FIB_ATR_PROMINENCE * atr14[j]
-            ):
-                swing_highs.append((j, highs[j]))
-            if (
-                lows[j] < lows[j - 1]
-                and lows[j] < lows[j + 1]
-                and (min(lows[j - 1], lows[j + 1]) - lows[j])
-                >= FIB_ATR_PROMINENCE * atr14[j]
-            ):
-                swing_lows.append((j, lows[j]))
+    stale_note = forecast_staleness_note(bar_time, timeframe)
+    if stale_note:
+        result["signal_strength"] = "NO_TRADE"
+        filter_note = _append_filter_note(filter_note, stale_note)
 
-        fib_swing_low = np.full(n_htf, np.nan, dtype=float)
-        fib_swing_high = np.full(n_htf, np.nan, dtype=float)
-
-        if swing_highs and swing_lows:
-            sh_idx = np.array([idx for idx, _ in swing_highs], dtype=int)
-            sh_price = np.array([price for _, price in swing_highs], dtype=float)
-            sl_idx = np.array([idx for idx, _ in swing_lows], dtype=int)
-            sl_price = np.array([price for _, price in swing_lows], dtype=float)
-            bars = np.arange(n_htf, dtype=int)
-
-            sh_pos = np.searchsorted(sh_idx, bars, side="left") - 1
-            sl_pos = np.searchsorted(sl_idx, bars, side="left") - 1
-
-            valid_h = sh_pos >= 0
-            valid_l = sl_pos >= 0
-            valid = valid_h & valid_l
-            if np.any(valid):
-                last_high = np.full(n_htf, np.nan, dtype=float)
-                last_low = np.full(n_htf, np.nan, dtype=float)
-                last_high[valid_h] = sh_price[sh_pos[valid_h]]
-                last_low[valid_l] = sl_price[sl_pos[valid_l]]
-                non_degenerate = valid & (last_high > last_low)
-                fib_swing_low[non_degenerate] = last_low[non_degenerate]
-                fib_swing_high[non_degenerate] = last_high[non_degenerate]
-
-        merged = pd.merge_asof(
-            result[["time", "open", "high", "low", "close"]].sort_values("time"),
-            pd.DataFrame(
-                {
-                    "time": htf["time"],
-                    "fib_swing_low": fib_swing_low,
-                    "fib_swing_high": fib_swing_high,
-                }
-            ).sort_values("time"),
-            on="time",
-            direction="backward",
-        ).reset_index(drop=True)
-
-        close_vals = merged["close"].to_numpy(dtype=float)
-        fib_low = merged["fib_swing_low"].to_numpy(dtype=float)
-        fib_high = merged["fib_swing_high"].to_numpy(dtype=float)
-        fib_low = np.where(np.isnan(fib_low), close_vals * 0.97, fib_low)
-        fib_high = np.where(np.isnan(fib_high), close_vals * 1.03, fib_high)
-        fib_range = np.where((fib_high - fib_low) < 1e-9, 1e-9, fib_high - fib_low)
-
-        ltf_open = merged["open"].to_numpy(dtype=float)
-        ltf_high = merged["high"].to_numpy(dtype=float)
-        ltf_low = merged["low"].to_numpy(dtype=float)
-        ltf_close = merged["close"].to_numpy(dtype=float)
-
-        close_pos = (ltf_close - fib_low) / fib_range
-        zone = np.searchsorted(fib_ratios, close_pos, side="left").astype(float)
-        zone = np.clip(zone, 0.0, float(len(fib_ratios)))
-
-        level_prices = fib_low[:, None] + fib_range[:, None] * fib_ratios[None, :]
-        nearest_idx = np.argmin(np.abs(level_prices - ltf_close[:, None]), axis=1)
-        nearest_level = level_prices[np.arange(len(ltf_close)), nearest_idx]
-
-        wick_rej_bull = ((ltf_low < nearest_level) & (ltf_close >= nearest_level)).astype(float)
-        wick_rej_bear = ((ltf_high > nearest_level) & (ltf_close <= nearest_level)).astype(float)
-        body_top = np.maximum(ltf_open, ltf_close)
-        body_bot = np.minimum(ltf_open, ltf_close)
-        body_acc = ((body_bot >= nearest_level) | (body_top <= nearest_level)).astype(float)
-        ext_pct = np.maximum(0.0, close_pos - 1.0)
-
-        result[f"{prefix}_close_pos"] = close_pos
-        result[f"{prefix}_zone"] = zone
-        result[f"{prefix}_wick_rej_bull"] = wick_rej_bull
-        result[f"{prefix}_wick_rej_bear"] = wick_rej_bear
-        result[f"{prefix}_body_acc"] = body_acc
-        result[f"{prefix}_ext_pct"] = ext_pct
-
-    return result
+    return result, filter_note
 
 
 def encode_session_time_vectors(df_1h: pd.DataFrame) -> pd.DataFrame:
@@ -1749,7 +1700,10 @@ if __name__ == "__main__":
 
     # Fetch Holographic Stacks
     tf_maps = {
-        "SPOT": bridge.fetch_holographic_stack(SYMBOL, PRIMARY_ASSET_CLASS),
+        "SPOT": bridge.fetch_holographic_stack(
+            SYMBOL,
+            PRIMARY_ASSET_CLASS,
+        ),
     }
 
     primary_frames, reference_frames = build_timeframe_selection(
@@ -1806,13 +1760,6 @@ if __name__ == "__main__":
     except ValueError:
         exit()
 
-    print("  [TOON] Preparing Fibonacci Structural Basis (1D→a, 1W→b, 1M→c)...")
-    df_1h = fib_structural_basis(
-        df_1h,
-        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
-        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
-    )
-
     # ── Step 1: Compute atr14 on 1H ONLY for labelling scaffold ──────────
     # atr14 is needed by add_target() to set barrier distances.
     # It is NEVER passed as a model input feature.
@@ -1833,6 +1780,18 @@ if __name__ == "__main__":
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
     print(f"  [TOON v5.2] SMC features injected: {len(smc_df.columns)} columns")
+
+    print("  [TOON v5.3] Building Kalman Structural Feature Family...")
+    kf_df = kalman_structural_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in kf_df.columns:
+        df_full[col] = kf_df[col].values
+    print(f"  [TOON v5.3] Kalman structural features injected: {len(kf_df.columns)} columns")
+
+    print("  [TOON v5.4] Building Realized Volatility Surface (Julia RV engine)...")
+    rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in rv_df.columns:
+        df_full[col] = rv_df[col].values
+    print(f"  [TOON v5.4] RV features injected: {len(rv_df.columns)} columns")
 
     # ── Step 3: ASOF-merge higher-TF timestamps for temporal alignment ────
     # merge_higher_tf now only brings in raw OHLCV columns with the look-ahead
@@ -2020,7 +1979,13 @@ if __name__ == "__main__":
         print(f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)")
 
         trail_str = "N/A"
-        filter_note = trade_plan["note"]
+        pred, filter_note = finalize_forecast_context(
+            pred,
+            timeframe="1H",
+            bar_time=last_row.get("time"),
+            confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+            base_note=trade_plan["note"],
+        )
         if pred["direction"] in {"UP", "DOWN"} and np.isfinite(trade_plan["sl"]):
             sl_str = f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
             tp1_str = (
@@ -2033,11 +1998,6 @@ if __name__ == "__main__":
         else:
             sl_str, tp1_str, tp2_str = "N/A", "N/A", "N/A"
 
-        if pred["signal_strength"] == "NO_TRADE":
-            filter_note = (
-                f"{filter_note} Filtered: confidence below "
-                f"{LIVE_CONFIDENCE_THRESHOLD:.2f}"
-            ).strip()
         if pred["direction"] in {"UP", "DOWN"}:
             print(f"  Stop Loss   : {sl_str}")
             print(f"  Target 1    : {tp1_str}")

@@ -1,6 +1,7 @@
 # --- DATA (Manual Feed) ---
 csv_data/*.csv
 data_vault/inbox/
+data_vault/custom_yahoo_instruments.json
 *.db
 *.db-wal
 *.db-shm

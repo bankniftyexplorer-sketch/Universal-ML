@@ -20,7 +20,6 @@ from universal_ml_engine import (
     EXEC_FEE_PCT,
     build_timeframe_selection,
     describe_selected_frame,
-    fib_structural_basis,
     simulate_trade_path_from_arrays,
     predict_trade_plan,
     prepare_intraday_thermodynamics,
@@ -30,6 +29,8 @@ from universal_ml_engine import (
 from julia_bridge import (
     compute_backtest_bar_state_fast,
     holographic_feature_engine_fast as holographic_feature_engine,
+    kalman_structural_engine_fast,
+    rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
 
@@ -564,7 +565,10 @@ def main():
 
     bridge = InferenceBridge(db_path=os.path.join(DATA_DIR, "data_vault", "ohlcv.db"))
     tf_maps = {
-        "SPOT": bridge.fetch_holographic_stack(SYMBOL, "SPOT"),
+        "SPOT": bridge.fetch_holographic_stack(
+            SYMBOL,
+            "SPOT",
+        ),
     }
 
     primary_frames, reference_frames = build_timeframe_selection(
@@ -629,12 +633,6 @@ def main():
     except ValueError:
         return
 
-    df_1h = fib_structural_basis(
-        df_1h,
-        htf_frames={"1D": df_1d, "1W": df_1w, "1M": df_1m},
-        pairs=[("1D", "a"), ("1W", "b"), ("1M", "c")],
-    )
-
     # Step 1: compute atr14 labelling scaffold (used for volatility gate only,
     #         not as a model input)
     df_1h_labelled = _compute_atr14(df_1h.copy())
@@ -651,6 +649,13 @@ def main():
     smc_df = smc_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     for col in smc_df.columns:
         df_full[col] = smc_df[col].values
+
+    kf_df = kalman_structural_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in kf_df.columns:
+        df_full[col] = kf_df[col].values
+    rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in rv_df.columns:
+        df_full[col] = rv_df[col].values
 
     # Step 3: ASOF-merge for temporal alignment
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
