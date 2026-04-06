@@ -15,6 +15,7 @@ Read this first if you want to understand the system before opening the large en
   - canonical market data DB: `data_vault/ohlcv.db`
   - per-symbol artifacts: `<PROJECT_ROOT>/<SYMBOL>/`
   - local accuracy baselines: `<PROJECT_ROOT>/.accuracy_baselines/<SYMBOL>.json`
+- Market data is now guarded by a sync-quality ledger plus a strict runtime gate at the bridge.
 - Feature space is now built from two Julia-driven families:
   - holographic geometry features
   - SMC institutional-intent features
@@ -29,9 +30,9 @@ Read this first if you want to understand the system before opening the large en
 
 | Path | Role | Read when |
 | --- | --- | --- |
-| `data_vault/vault_engine.py` | Yahoo `SPOT` sync entrypoint, DB schema, macro timeframe generation, trade ledger | You care about data entering the system |
+| `data_vault/vault_engine.py` | Yahoo `SPOT` sync entrypoint, DB schema, incremental/full-refresh logic, sync-quality ledger, macro timeframe generation, trade ledger | You care about data entering the system |
 | `vault_engine.py` | Root-level compatibility shim that re-exports `DataVault` | A root script imports `vault_engine` directly |
-| `inference_bridge.py` | Reads DB and returns timeframe-indexed pandas stacks | You care about how scripts fetch market data |
+| `inference_bridge.py` | Reads DB, attaches `data_quality`, and enforces the strict runtime gate on `FAIL` quality by default | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer | You care about the daily core |
 | `backtest_engine.py` | `1H` backtest/report generator | You care about intraday replay and equity curve |
@@ -53,7 +54,13 @@ Read this first if you want to understand the system before opening the large en
 1. `data_vault/vault_engine.py` syncs Yahoo `SPOT` history into `market_dna` for `1D` and `1H`, then forges `1W` and `1M` from `1D`.
    - `1D` uses Yahoo `max` history
    - `1H` asks Yahoo for the maximum available history, which Yahoo currently caps to roughly the last 730 days
+   - default sync mode is incremental merge with overlap windows
+   - `--full-refresh` forces a max-history rebuild for the requested symbol
+   - each run writes a `market_sync_quality` audit row per base timeframe
 2. `inference_bridge.py` fetches the `SPOT` stack by timeframe.
+   - `strict_gating=True` is the default
+   - if any fetched timeframe carries `data_quality.status == "FAIL"` or `quality_status == "FAIL"`, the bridge raises `DataIntegrityError` and blocks the runtime
+   - macro frames inherit the latest `1D` quality metadata
 3. `universal_ml_engine.build_timeframe_selection()` selects the active `SPOT` primary frames used by training, backtest, live inference, and meta selection.
 4. `universal_ml_engine.prepare_intraday_thermodynamics()` normalizes the shared intraday state:
    - `SPOT 1H` is the only active execution timeline
@@ -77,7 +84,9 @@ Read this first if you want to understand the system before opening the large en
 ### `1D` daily lane
 
 1. `data_vault/vault_engine.py` syncs Yahoo `SPOT 1D` bars and derives `1W`, `1M`, `3M`, `6M`, `12M` macro layers from them.
+   - daily syncs also record quality rows covering gaps, staleness, synthetic volume, and fetch-retention state
 2. `daily_ml_engine.py` uses `SPOT 1D` as the only active primary lane.
+   - the same strict `InferenceBridge` gate applies before the daily lane can train or infer
 3. `universal_ml_engine.inject_thermodynamic_basis()` preserves the historical basis columns as zeroed placeholders in SPOT-only mode.
 4. Daily session placeholders are inert:
    - `session_time_pos = 0`
@@ -106,20 +115,23 @@ Read this first if you want to understand the system before opening the large en
   - OHLCV payload plus `is_synthetic_vol`
 - `market_sync_quality`
   - one row per sync run, base symbol, and timeframe
-  - stores gap counts, synthetic-volume counts, staleness, fetch mode, and provider-retention status
+  - stores gap counts, synthetic-volume counts, staleness, fetch mode, refresh reason, and provider-retention status
+  - this is the authoritative upstream truth used by the runtime gate
 - `performance_ledger`
   - trade outcome log used by `shadow_brain.py`
   - written during live execution flow when a directional plan is queued
 
 ### In-memory market stack
 
-`InferenceBridge.fetch_holographic_stack(symbol, asset_class)` returns:
+`InferenceBridge.fetch_holographic_stack(symbol, asset_class, strict_gating=True)` returns:
 
 - `dict[str, pd.DataFrame]`
 - keys are timeframes like `1H`, `1D`, `1W`, `1M`, `3M`, `6M`, `12M`
 - each frame is normalized to:
   - `time`, `open`, `high`, `low`, `close`, `volume`, `is_synthetic_vol`
   - `df.attrs["data_quality"]` carries the latest sync audit for that timeframe when available
+  - `data_quality` exposes both `status` and `quality_status`
+  - if strict gating is left enabled, any timeframe with `FAIL` aborts the fetch with `DataIntegrityError`
 
 ## Artifact contracts
 
@@ -158,7 +170,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 
 - `data_vault/vault_engine.py` writes the database.
 - root scripts may import `vault_engine.py`, which is a compatibility shim over `data_vault/vault_engine.py`.
-- `inference_bridge.py` reads the database.
+- `inference_bridge.py` reads the database, materializes sync-quality metadata, and blocks `FAIL` frames by default.
 - `universal_ml_engine.py` and `daily_ml_engine.py` are the training roots.
 - `julia_bridge.py` is the only supported adapter into `ToonMath.jl`; Python code should not include or reference `ToonMath.jl` directly.
 - `holographic_engine.py` is a frozen legacy file whose only live exports are `feature_selection_pipeline`, `correlation_filter`, and `phase1_ranking`.
@@ -200,6 +212,9 @@ If you need:
 - The vault can sync curated aliases like `BTCUSDT` and raw Yahoo tickers such as `AAPL`, `^GDAXI`, and `EURUSD=X`.
 - The DB is the source of truth for market history.
 - `data_vault/ohlcv.db` is the canonical DB location; stray repo-root DB copies are not part of the intended design.
+- Normal Yahoo syncs are incremental for speed; `--full-refresh` is the repair path when the ledger or history needs a hard rebuild.
+- `market_sync_quality` is the machine-facing health ledger for base-lane history.
+- `InferenceBridge` now defaults to strict runtime gating, so `FAIL` quality is an operational firewall rather than a warning.
 - Julia does the heavy numerical work; Python orchestrates data flow, model training, reporting, and file management.
 - `ToonMath.jl` is the active holographic feature engine.
 - The live feature space now combines holographic geometry and SMC institutional-intent features in both active lanes.
