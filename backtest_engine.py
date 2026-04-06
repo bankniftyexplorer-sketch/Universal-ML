@@ -12,14 +12,14 @@ import matplotlib.gridspec as gridspec
 # Suppress lightgbm warnings locally if needed
 import warnings
 
-warnings.filterwarnings("ignore")
-
 from universal_ml_engine import (
     merge_higher_tf,
     _compute_atr14,
     BARRIER_HORIZON_BARS,
     LIVE_CONFIDENCE_THRESHOLD,
     EXEC_FEE_PCT,
+    build_timeframe_selection,
+    describe_selected_frame,
     fib_structural_basis,
     simulate_trade_path_from_arrays,
     predict_trade_plan,
@@ -32,6 +32,8 @@ from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
     smc_feature_engine_fast,
 )
+
+warnings.filterwarnings("ignore")
 
 EOD_GATE_HOUR = 14  # IST. Set to 24 for 24/7 crypto.
 SKIP_OK = 0
@@ -535,7 +537,7 @@ def main():
         "--symbol",
         type=str,
         required=True,
-        help="Target Base Symbol (e.g., BANKNIFTY, BTC)",
+        help="Target symbol (e.g., NIFTY, BTCUSDT, AAPL, ^GDAXI)",
     )
 
     args = parser.parse_args()
@@ -562,18 +564,25 @@ def main():
 
     bridge = InferenceBridge(db_path=os.path.join(DATA_DIR, "data_vault", "ohlcv.db"))
     tf_maps = {
-        "FUT": bridge.fetch_holographic_stack(SYMBOL, "FUT"),
         "SPOT": bridge.fetch_holographic_stack(SYMBOL, "SPOT"),
     }
 
-    df_1h = tf_maps["FUT"].get("1H")
-    df_1d = tf_maps["FUT"].get("1D")
-    df_1w = tf_maps["FUT"].get("1W")
-    df_1m = tf_maps["FUT"].get("1M")
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_maps, ("1H", "1D", "1W", "1M")
+    )
+    df_1h = primary_frames["1H"]
+    df_1d = primary_frames["1D"]
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
 
     if df_1h is None or df_1d is None or df_1w is None or df_1m is None:
-        print(f"[!] Missing 1H/1D/1W/1M FUT data for {SYMBOL} in database.")
+        print(f"[!] Missing required 1H/1D/1W/1M primary data for {SYMBOL} in database.")
         return
+
+    print(f"  [=] 1H primary lane: {describe_selected_frame(df_1h)}")
+    print(f"  [=] 1D primary lane: {describe_selected_frame(df_1d)}")
+    print(f"  [=] 1W primary lane: {describe_selected_frame(df_1w)}")
+    print(f"  [=] 1M primary lane: {describe_selected_frame(df_1m)}")
 
     model_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "model")
     feat_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "features")
@@ -611,9 +620,9 @@ def main():
             df_1d=df_1d,
             df_1w=df_1w,
             df_1m=df_1m,
-            spot_1h=tf_maps["SPOT"].get("1H"),
-            spot_1d=tf_maps["SPOT"].get("1D"),
-            spot_1w=tf_maps["SPOT"].get("1W"),
+            reference_1h=reference_frames["1H"],
+            reference_1d=reference_frames["1D"],
+            reference_1w=reference_frames["1W"],
             symbol=SYMBOL,
             logger=print,
         )

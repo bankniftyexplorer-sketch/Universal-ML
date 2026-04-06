@@ -28,6 +28,13 @@ def _init_julia():
     """
     Load juliacall and include ToonMath.jl exactly once per process.
     The returned `jl` object is cached as a module-level singleton.
+
+    Current production safety depends on the training and inference flows
+    calling the holographic bridge once per dataset before the Python-only
+    feature-selection stage. `feature_selection_pipeline()` operates on the
+    precomputed DataFrame and never re-enters Julia. If a future
+    multiprocessing worker pool is introduced, each worker will initialize its
+    own Julia runtime and must be capacity-planned accordingly.
     """
     import pathlib
 
@@ -38,6 +45,7 @@ def _init_julia():
         pass
 
     from juliacall import Main as jl  # type: ignore
+    # Cache scope is process-local; forked workers do not share this singleton.
 
     # Locate ToonMath.jl next to this bridge file
     _bridge_dir = pathlib.Path(__file__).parent.resolve()

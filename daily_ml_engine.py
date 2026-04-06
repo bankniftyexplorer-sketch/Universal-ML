@@ -33,12 +33,15 @@ from universal_ml_engine import (
     TRADE_PLAN_LABEL_COLS,
     _FIB_RAW_COLS,
     _compute_atr14,
+    build_timeframe_selection,
+    describe_selected_frame,
     fib_structural_basis,
     inject_thermodynamic_basis,
     migrate_legacy_artifacts,
     predict_next_bar,
     predict_trade_plan,
     save_report,
+    select_primary_timeframe,
     train_trade_plan_models,
 )
 
@@ -186,11 +189,10 @@ def inject_macro_regime(
 
 def add_daily_confluence(df: pd.DataFrame) -> pd.DataFrame:
     """Cross-TF confluence including regime alignment."""
-    g = lambda col, default=0.0: (
-        df[col].to_numpy(dtype=float)
-        if col in df.columns
-        else np.full(len(df), default, dtype=float)
-    )
+    def g(col: str, default: float = 0.0) -> np.ndarray:
+        if col in df.columns:
+            return df[col].to_numpy(dtype=float)
+        return np.full(len(df), default, dtype=float)
 
     daily_bias = np.sign(g("1d_w13_skel_smc_phase"))
     macro_bias = np.sign(g("6m_secular_trend") + g("12m_secular_trend"))
@@ -376,23 +378,11 @@ def walk_forward_daily(
 
 
 def _pick_primary_1d(tf_maps: dict) -> pd.DataFrame | None:
-    fut_1d = tf_maps["FUT"].get("1D")
-    if fut_1d is not None and not fut_1d.empty:
-        return fut_1d.sort_values("time").reset_index(drop=True).copy()
-    spot_1d = tf_maps["SPOT"].get("1D")
-    if spot_1d is not None and not spot_1d.empty:
-        return spot_1d.sort_values("time").reset_index(drop=True).copy()
-    return None
+    return select_primary_timeframe(tf_maps, "1D")
 
 
 def _get_tf(tf_maps: dict, label: str) -> pd.DataFrame | None:
-    fut_df = tf_maps["FUT"].get(label)
-    if fut_df is not None and not fut_df.empty:
-        return fut_df.sort_values("time").reset_index(drop=True).copy()
-    spot_df = tf_maps["SPOT"].get(label)
-    if spot_df is not None and not spot_df.empty:
-        return spot_df.sort_values("time").reset_index(drop=True).copy()
-    return None
+    return select_primary_timeframe(tf_maps, label)
 
 
 def _print_tf_span(label: str, df: pd.DataFrame | None) -> None:
@@ -415,7 +405,7 @@ def main() -> None:
         "--symbol",
         type=str,
         required=True,
-        help="Target Base Symbol (e.g., BSX, NIFTY)",
+        help="Target symbol (e.g., NIFTY, BTCUSDT, AAPL, ^GDAXI)",
     )
     args = parser.parse_args()
 
@@ -439,42 +429,47 @@ def main() -> None:
 
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     tf_maps = {
-        "FUT": bridge.fetch_holographic_stack(symbol, "FUT"),
         "SPOT": bridge.fetch_holographic_stack(symbol, "SPOT"),
     }
 
-    df_1d = _pick_primary_1d(tf_maps)
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_maps, ("1D", "1W", "1M", "3M", "6M", "12M")
+    )
+    df_1d = primary_frames["1D"]
     if df_1d is None or df_1d.empty:
-        print(f"  [!] FATAL: No usable 1D data found for {symbol} in FUT or SPOT.")
+        print(f"  [!] FATAL: No usable 1D primary data found for {symbol}.")
         raise SystemExit(1)
 
-    df_1w = _get_tf(tf_maps, "1W")
-    df_1m = _get_tf(tf_maps, "1M")
-    df_3m = _get_tf(tf_maps, "3M")
-    df_6m = _get_tf(tf_maps, "6M")
-    df_12m = _get_tf(tf_maps, "12M")
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
+    df_3m = primary_frames["3M"]
+    df_6m = primary_frames["6M"]
+    df_12m = primary_frames["12M"]
 
+    print(f"  1D primary lane : {describe_selected_frame(df_1d)}")
     _print_tf_span("1D", df_1d)
+    if df_1w is not None and not df_1w.empty:
+        print(f"  1W primary lane : {describe_selected_frame(df_1w)}")
     _print_tf_span("1W", df_1w)
+    if df_1m is not None and not df_1m.empty:
+        print(f"  1M primary lane : {describe_selected_frame(df_1m)}")
     _print_tf_span("1M", df_1m)
+    if df_3m is not None and not df_3m.empty:
+        print(f"  3M primary lane : {describe_selected_frame(df_3m)}")
     _print_tf_span("3M", df_3m)
+    if df_6m is not None and not df_6m.empty:
+        print(f"  6M primary lane : {describe_selected_frame(df_6m)}")
     _print_tf_span("6M", df_6m)
+    if df_12m is not None and not df_12m.empty:
+        print(f"  12M primary lane : {describe_selected_frame(df_12m)}")
     _print_tf_span("12M", df_12m)
 
-    print(
-        "\n  [TOON DAILY] Injecting Universal Spread Mechanics (Spot-to-Derivative)..."
+    print("\n  [TOON DAILY] Injecting Universal Basis Mechanics (Primary-to-Reference)...")
+    df_1d = inject_thermodynamic_basis(
+        df_1d,
+        reference_frames["1D"],
+        logger=print,
     )
-    spot_1d = tf_maps["SPOT"].get("1D")
-    if spot_1d is not None and not spot_1d.empty:
-        df_1d = inject_thermodynamic_basis(
-            df_1d, spot_1d.sort_values("time").reset_index(drop=True)
-        )
-    else:
-        print(
-            f"  [!] WARNING: No SPOT 1D data found for {symbol}. Thermodynamics will be zeroed."
-        )
-        for col in ["basis_pct", "basis_z_score", "basis_vel_5", "basis_vel_10"]:
-            df_1d[col] = 0.0
 
     # Daily bars do not carry intraday session meaning; keep inert placeholders.
     df_1d["session_time_pos"] = 0.0
@@ -651,6 +646,7 @@ def main() -> None:
         last_row,
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
     )
+    primary_asset_label = str(df_1d.attrs.get("selected_asset_class", "PRIMARY"))
     close_price = float(last_row["close"])
     atr_value = float(df_full["atr14"].iloc[-1]) if "atr14" in df_full.columns else 1.0
     trade_plan = predict_trade_plan(
@@ -689,7 +685,7 @@ def main() -> None:
     )
     print(f"  Signal      : {pred['signal_strength']}")
     print("----------------------------------------------------------------------")
-    print(f"  Entry Price : {close_price:,.2f} (Current Close)")
+    print(f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)")
     print(f"  Stop Loss   : {sl_str}")
     print(f"  Target 1    : {tp1_str}")
     print(f"  Target 2    : {tp2_str}")
@@ -705,7 +701,7 @@ def main() -> None:
         "dir": pred["direction"],
         "conf": f"{pred['confidence'] * 100:.1f}%",
         "signal": pred["signal_strength"],
-        "entry": f"{close_price:,.2f} (Current Close)",
+        "entry": f"{close_price:,.2f} (Current {primary_asset_label} Close)",
         "sl": sl_str,
         "tp1": tp1_str,
         "tp2": tp2_str,

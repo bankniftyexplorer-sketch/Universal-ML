@@ -3,7 +3,7 @@ ToonMath.jl — TOON v5.0 Julia Microservice
 ===========================================
 Bare-metal Julia port of:
   - holographic_engine.py  (_bbox, _dna, _grammar, _spectral, _skeleton, _confluence, _process_tf)
-  - universal_ml_engine.py  (simulate_trade_path_from_arrays_jit, _add_target_loop_jit)
+  - legacy universal_ml_engine.py kernels  (simulate_trade_path_from_arrays_jit, removed bulk-label target loop)
 
 Constraints enforced:
   R1  1-based Julia indexing; all Python entry_idx offsets converted (+1).
@@ -974,7 +974,7 @@ end
                     atr_mult, horizon, tp1_r_mult, tp2_r_mult, trail_r_mult,
                     fee_pct, slippage_bps, tp1_frac, tp2_frac, runner_frac)
 
-Exact Julia port of Python's _add_target_loop_jit.
+Exact Julia port of the removed Python _add_target_loop_jit bulk-label kernel.
 Returns a NamedTuple of 13 Float64 vectors.
 
 Index convention:

@@ -10,13 +10,15 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import warnings
-warnings.filterwarnings('ignore')
 
 from universal_ml_engine import parse_tv_log, walk_forward, _compute_atr14
 from julia_bridge import holographic_feature_engine_fast as holographic_feature_engine
 
+warnings.filterwarnings('ignore')
+
 def calculate_metrics(trades):
-    if not trades: return {}
+    if not trades:
+        return {}
     wins = [t for t in trades if t['pnl'] > 0]
     losses = [t for t in trades if t['pnl'] <= 0]
     gross_profit = sum([t['pnl'] for t in wins])
@@ -44,7 +46,6 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
     for i in range(len(df) - 1):
         m2m_equity = equity
         current_time = time_arr[i]
-        current_close = close_arr[i]
         current_atr = atr_arr[i]
         proba_up = prob_array[i]
         proba_down = 1.0 - proba_up
@@ -74,7 +75,8 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
 
                 if position['tp1_hit'] and not trade_closed:
                     new_sl = next_close - position['trail_dist']
-                    if new_sl > position['sl']: position['sl'] = new_sl
+                    if new_sl > position['sl']:
+                        position['sl'] = new_sl
             else:
                 if next_high >= p_sl:
                     exit_price = max(next_open, p_sl)
@@ -90,7 +92,8 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
                 
                 if position['tp1_hit'] and not trade_closed:
                     new_sl = next_close + position['trail_dist']
-                    if new_sl < position['sl']: position['sl'] = new_sl
+                    if new_sl < position['sl']:
+                        position['sl'] = new_sl
 
             if trade_closed:
                 equity += position['pnl']
@@ -125,7 +128,8 @@ def run_backtest(df, prob_array, initial_capital=10000.0, risk_pct=0.02, conf_th
                 unrealized = (next_close - position['entry_price']) * position['size'] * (0.5 if position['tp1_hit'] else 1.0)
             else:
                 unrealized = (position['entry_price'] - next_close) * position['size'] * (0.5 if position['tp1_hit'] else 1.0)
-            if position['tp1_hit']: m2m_equity += position['pnl']
+            if position['tp1_hit']:
+                m2m_equity += position['pnl']
             m2m_equity += unrealized
         
         peak_equity = max(peak_equity, m2m_equity)

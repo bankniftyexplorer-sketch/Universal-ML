@@ -1,11 +1,13 @@
 """
 Compatibility shim for the data-vault engine.
 
-The canonical implementation lives in ``data_vault/vault_engine.py``.
+The canonical implementation lives in ``data_vault/yfinance_vault.py``.
 Several root-level scripts still import ``vault_engine`` directly, so this
 module keeps those imports stable regardless of where ``--outdir`` points.
 """
 
-from data_vault.vault_engine import DataVault
+from data_vault.yfinance_vault import YFinanceVault
 
-__all__ = ["DataVault"]
+DataVault = YFinanceVault
+
+__all__ = ["DataVault", "YFinanceVault"]

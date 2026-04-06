@@ -129,6 +129,81 @@ NON_FEATURE_COLS_SET = frozenset(
         "m_volume",
     }
 ) | _FIB_RAW_COLS
+PRIMARY_ASSET_CLASS = "SPOT"
+
+
+def _sorted_timeframe_copy(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    result = df.sort_values("time").reset_index(drop=True).copy()
+    result.attrs.update(dict(getattr(df, "attrs", {})))
+    return result
+
+
+def _annotate_timeframe(df: pd.DataFrame | None, *, label: str) -> pd.DataFrame | None:
+    result = _sorted_timeframe_copy(df)
+    if result is None:
+        return None
+    result.attrs["selected_timeframe"] = label
+    result.attrs["selected_asset_class"] = PRIMARY_ASSET_CLASS
+    return result
+
+
+def describe_selected_frame(df: pd.DataFrame | None) -> str:
+    if df is None or df.empty:
+        return "MISSING"
+    asset_class = str(df.attrs.get("selected_asset_class", "UNKNOWN"))
+    source_exchange = df.attrs.get("resolved_source_exchange")
+    source_symbol = df.attrs.get("resolved_source_symbol")
+    if source_exchange and source_symbol:
+        return f"{asset_class} via {source_exchange}:{source_symbol}"
+    return asset_class
+
+
+def fetch_spot_timeframes(
+    bridge,
+    symbol: str,
+    labels: tuple[str, ...],
+) -> dict[str, pd.DataFrame | None]:
+    tf_map = bridge.fetch_holographic_stack(symbol, PRIMARY_ASSET_CLASS)
+    return build_spot_timeframe_selection(tf_map, labels)
+
+
+def build_spot_timeframe_selection(
+    tf_map: dict[str, pd.DataFrame],
+    labels: tuple[str, ...],
+) -> dict[str, pd.DataFrame | None]:
+    frames: dict[str, pd.DataFrame | None] = {}
+    for label in labels:
+        frames[label] = _annotate_timeframe(tf_map.get(label), label=label)
+    return frames
+
+
+def _extract_primary_tf_map(
+    tf_maps: dict[str, dict[str, pd.DataFrame]] | dict[str, pd.DataFrame] | None,
+) -> dict[str, pd.DataFrame]:
+    if not tf_maps:
+        return {}
+    if "SPOT" in tf_maps:
+        spot_map = tf_maps.get("SPOT")
+        return spot_map if isinstance(spot_map, dict) else {}
+    return tf_maps if isinstance(tf_maps, dict) else {}
+
+
+def select_primary_timeframe(
+    tf_maps: dict[str, dict[str, pd.DataFrame]] | dict[str, pd.DataFrame],
+    label: str,
+) -> pd.DataFrame | None:
+    return _annotate_timeframe(_extract_primary_tf_map(tf_maps).get(label), label=label)
+
+
+def build_timeframe_selection(
+    tf_maps: dict[str, dict[str, pd.DataFrame]] | dict[str, pd.DataFrame],
+    labels: tuple[str, ...],
+) -> tuple[dict[str, pd.DataFrame | None], dict[str, pd.DataFrame | None]]:
+    primary_frames = build_spot_timeframe_selection(_extract_primary_tf_map(tf_maps), labels)
+    reference_frames = {label: None for label in labels}
+    return primary_frames, reference_frames
 
 # ─────────────────────────────────────────────
 # 1. PARSER  (handles Indian comma-formatted numbers)
@@ -302,9 +377,12 @@ def _compute_atr14(df: pd.DataFrame) -> pd.DataFrame:
     """
     c = df["close"]
     h = df["high"]
-    l = df["low"]
+    low_series = df["low"]
     pc = c.shift(1).fillna(c)
-    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    tr = np.maximum(
+        h - low_series,
+        np.maximum(np.abs(h - pc), np.abs(low_series - pc)),
+    )
     df["atr14"] = tr.rolling(14).mean().fillna(tr)
     return df
 
@@ -711,276 +789,6 @@ def simulate_trade_path_from_arrays(
     }
 
 
-@njit(nopython=True)
-def _add_target_loop_jit(
-    opens: np.ndarray,
-    highs: np.ndarray,
-    lows: np.ndarray,
-    closes: np.ndarray,
-    atrs: np.ndarray,
-    atr_mult: float,
-    horizon: int,
-    tp1_r_mult: float,
-    tp2_r_mult: float,
-    trail_r_mult: float,
-    fee_pct: float,
-    slippage_bps: float,
-    tp1_frac: float,
-    tp2_frac: float,
-    runner_frac: float,
-):
-    n = len(opens)
-    last_start_idx = max(-1, n - horizon - 1)
-
-    target = np.full(n, np.nan, dtype=np.float64)
-    next_ret_pct = np.full(n, np.nan, dtype=np.float64)
-    bars_to_target = np.full(n, np.nan, dtype=np.float64)
-    entry_prices = np.full(n, np.nan, dtype=np.float64)
-    target_distances = np.full(n, np.nan, dtype=np.float64)
-    long_path_r = np.full(n, np.nan, dtype=np.float64)
-    short_path_r = np.full(n, np.nan, dtype=np.float64)
-    target_edge_r = np.full(n, np.nan, dtype=np.float64)
-    best_path_r = np.full(n, np.nan, dtype=np.float64)
-    long_mfe_atr = np.full(n, np.nan, dtype=np.float64)
-    long_mae_atr = np.full(n, np.nan, dtype=np.float64)
-    short_mfe_atr = np.full(n, np.nan, dtype=np.float64)
-    short_mae_atr = np.full(n, np.nan, dtype=np.float64)
-
-    for i in range(last_start_idx + 1):
-        entry_idx = i + 1
-        dist = atrs[i] * atr_mult
-        if not np.isfinite(dist) or dist <= 0:
-            continue
-
-        long_trade = simulate_trade_path_from_arrays_jit(
-            opens,
-            highs,
-            lows,
-            closes,
-            entry_idx,
-            True,
-            dist,
-            dist * tp1_r_mult,
-            dist * tp2_r_mult,
-            dist * trail_r_mult,
-            horizon,
-            fee_pct,
-            slippage_bps,
-            tp1_frac,
-            tp2_frac,
-            runner_frac,
-        )
-        short_trade = simulate_trade_path_from_arrays_jit(
-            opens,
-            highs,
-            lows,
-            closes,
-            entry_idx,
-            False,
-            dist,
-            dist * tp1_r_mult,
-            dist * tp2_r_mult,
-            dist * trail_r_mult,
-            horizon,
-            fee_pct,
-            slippage_bps,
-            tp1_frac,
-            tp2_frac,
-            runner_frac,
-        )
-
-        long_r = long_trade[0]
-        short_r = short_trade[0]
-        long_exit_idx = long_trade[1]
-        short_exit_idx = short_trade[1]
-        long_entry_price = long_trade[3]
-
-        if not np.isfinite(long_r) or not np.isfinite(short_r):
-            continue
-
-        long_path_r[i] = long_r
-        short_path_r[i] = short_r
-        best_path_r[i] = max(long_r, short_r)
-        target_edge_r[i] = abs(long_r - short_r)
-        entry_prices[i] = long_entry_price
-        target_distances[i] = dist
-
-        horizon_end = min(n, entry_idx + horizon)
-        if horizon_end > entry_idx and atrs[i] > 0:
-            entry_price = float(long_entry_price)
-            curr_atr = float(atrs[i])
-
-            # LONG MAE/MFE JIT natively
-            sl_dist_l = 2.0 * curr_atr
-            sl_price_l = entry_price - sl_dist_l
-
-            peak_high_l = entry_price
-            peak_low_l = entry_price
-            hit_l = False
-            for j in range(entry_idx, horizon_end):
-                val_high = float(highs[j])
-                val_low = float(lows[j])
-
-                if val_low <= sl_price_l:
-                    if val_high > peak_high_l:
-                        peak_high_l = val_high
-                    peak_low_l = sl_price_l
-                    hit_l = True
-                    break
-                else:
-                    if val_high > peak_high_l:
-                        peak_high_l = val_high
-                    if val_low < peak_low_l:
-                        peak_low_l = val_low
-
-            long_mfe_atr[i] = max(0.0, (peak_high_l - entry_price) / (curr_atr + 1e-9))
-            long_mae_atr[i] = max(0.0, (entry_price - peak_low_l) / (curr_atr + 1e-9))
-
-            # SHORT MAE/MFE JIT natively
-            sl_dist_s = 2.0 * curr_atr
-            sl_price_s = entry_price + sl_dist_s
-
-            peak_low_s = entry_price
-            peak_high_s = entry_price
-            hit_s = False
-            for j in range(entry_idx, horizon_end):
-                val_high = float(highs[j])
-                val_low = float(lows[j])
-
-                if val_high >= sl_price_s:
-                    if val_low < peak_low_s:
-                        peak_low_s = val_low
-                    peak_high_s = sl_price_s
-                    hit_s = True
-                    break
-                else:
-                    if val_low < peak_low_s:
-                        peak_low_s = val_low
-                    if val_high > peak_high_s:
-                        peak_high_s = val_high
-
-            short_mfe_atr[i] = max(0.0, (entry_price - peak_low_s) / (curr_atr + 1e-9))
-            short_mae_atr[i] = max(0.0, (peak_high_s - entry_price) / (curr_atr + 1e-9))
-
-        if horizon_end > entry_idx and atrs[i] > 0:
-            mfe_l = long_mfe_atr[i]
-            mae_l = long_mae_atr[i]
-            raw_long = mfe_l / (mfe_l + mae_l + 1e-9)
-            vel_l = 1.0 - ((long_exit_idx - i) / horizon)
-            long_kinscore = raw_long * max(0.01, vel_l)
-
-            mfe_s = short_mfe_atr[i]
-            mae_s = short_mae_atr[i]
-            raw_short = mfe_s / (mfe_s + mae_s + 1e-9)
-            vel_s = 1.0 - ((short_exit_idx - i) / horizon)
-            short_kinscore = raw_short * max(0.01, vel_s)
-
-            if long_kinscore > short_kinscore and long_kinscore > 0.15:
-                target[i] = 0.5 + (long_kinscore / 2.0)
-                next_ret_pct[i] = (long_r * dist / (entry_prices[i] + 1e-9)) * 100.0
-                bars_to_target[i] = long_exit_idx - i
-            elif short_kinscore > long_kinscore and short_kinscore > 0.15:
-                target[i] = 0.5 - (short_kinscore / 2.0)
-                next_ret_pct[i] = -(short_r * dist / (entry_prices[i] + 1e-9)) * 100.0
-                bars_to_target[i] = short_exit_idx - i
-            else:
-                target[i] = 0.5
-                next_ret_pct[i] = 0.0
-                bars_to_target[i] = horizon
-        else:
-            target[i] = 0.5
-            next_ret_pct[i] = 0.0
-            bars_to_target[i] = horizon
-
-    return (
-        target,
-        next_ret_pct,
-        bars_to_target,
-        entry_prices,
-        target_distances,
-        long_path_r,
-        short_path_r,
-        target_edge_r,
-        best_path_r,
-        long_mfe_atr,
-        long_mae_atr,
-        short_mfe_atr,
-        short_mae_atr,
-    )
-
-
-def _legacy_add_target_DEPRECATED(
-    df: pd.DataFrame,
-    atr_mult: float = BARRIER_ATR_MULT,
-    horizon: int = BARRIER_HORIZON_BARS,
-    atr_col: str = "atr14",
-    drop_unresolved: bool = True,
-) -> pd.DataFrame:
-    """
-    DEPRECATED: Replaced by ToonMath.jl. DO NOT use as fallback.
-    """
-    df = df.copy()
-    n = len(df)
-    opens = df["open"].to_numpy(dtype=float)
-    highs = df["high"].to_numpy(dtype=float)
-    lows = df["low"].to_numpy(dtype=float)
-    closes = df["close"].to_numpy(dtype=float)
-    times = df["time"].to_numpy() if "time" in df.columns else None
-    atrs = df[atr_col].to_numpy(dtype=float)
-
-    (
-        target,
-        next_ret_pct,
-        bars_to_target,
-        entry_prices,
-        target_distances,
-        long_path_r,
-        short_path_r,
-        target_edge_r,
-        best_path_r,
-        long_mfe_atr,
-        long_mae_atr,
-        short_mfe_atr,
-        short_mae_atr,
-    ) = _add_target_loop_jit(
-        opens,
-        highs,
-        lows,
-        closes,
-        atrs,
-        atr_mult,
-        horizon,
-        TP1_R_MULT,
-        TP2_R_MULT,
-        TRAIL_R_MULT,
-        EXEC_FEE_PCT,
-        EXEC_SLIPPAGE_BPS,
-        TP1_FRACTION,
-        TP2_FRACTION,
-        RUNNER_FRACTION,
-    )
-
-    df["target"] = target
-    df["next_ret_pct"] = next_ret_pct
-    df["bars_to_target"] = bars_to_target
-    df["entry_price_next_bar"] = entry_prices
-    df["target_distance"] = target_distances
-    df["long_path_r"] = long_path_r
-    df["short_path_r"] = short_path_r
-    df["target_edge_r"] = target_edge_r
-    df["best_path_r"] = best_path_r
-    df["long_mfe_atr"] = long_mfe_atr
-    df["long_mae_atr"] = long_mae_atr
-    df["short_mfe_atr"] = short_mfe_atr
-    df["short_mae_atr"] = short_mae_atr
-
-    if drop_unresolved:
-        df = df[df["target"] != 0.5].dropna(subset=["target"]).copy()
-    else:
-        df["target"] = df["target"].fillna(0.5)
-    return df
-
-
 # ─────────────────────────────────────────────
 # 4. WALK-FORWARD VALIDATION (Optimized for CPU)
 # ─────────────────────────────────────────────
@@ -1221,8 +1029,6 @@ def walk_forward(
 
     results = []
     feature_importance_sum = np.zeros(len(feature_cols))
-    all_test_preds = []
-    all_test_trues = []
     # UME-2 FIX: Genuine OOS probability map keyed by pd.Timestamp.
     # The backtest engine MUST use these — never batch-predict on this model.
     oos_proba_map: dict = {}
@@ -1361,8 +1167,7 @@ def save_report(
     if pred_info:
         bg_color = accent_color_2 if pred_info["dir"] == "UP" else accent_color_3
 
-        # Get dynamic symbol from pred_info or default to BANKNIFTY
-        symbol_display = pred_info.get("symbol", "BANKNIFTY").upper()
+        symbol_display = pred_info.get("symbol", symbol).upper()
         forecast_label = pred_info.get(
             "forecast_label", "1H FORECAST (EXECUTION-ALIGNED)"
         )
@@ -1459,7 +1264,7 @@ def save_report(
         fnames, fvals = zip(*top15)
         fnames = [str(n).replace("_", " ").upper() for n in fnames]
 
-        bars = ax3.barh(range(len(fnames)), fvals, color=accent_color_5, alpha=0.85)
+        ax3.barh(range(len(fnames)), fvals, color=accent_color_5, alpha=0.85)
         ax3.set_yticks(range(len(fnames)))
         ax3.set_yticklabels(fnames, color="#cccccc", fontsize=10)
         ax3.set_title(
@@ -1527,47 +1332,6 @@ def predict_next_bar(
 # ─────────────────────────────────────────────
 # 7. MAIN EXECUTION (Optimized for performance)
 # ─────────────────────────────────────────────
-
-
-def inject_thermodynamic_basis(
-    df_fut: pd.DataFrame, df_idx: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Universally aligns Spot/Index to Futures and computes thermodynamic basis mechanics.
-    Strict backward ASOF merge prevents forward-peeking.
-    """
-    if df_idx is None or df_idx.empty:
-        print("  [Basis] Warning: No Spot/Index provided. Basis mechanics disabled.")
-        return df_fut.copy()
-
-    # Ensure temporal sorting
-    fut = df_fut.sort_values("time").reset_index(drop=True)
-    idx = (
-        df_idx[["time", "close"]]
-        .rename(columns={"close": "spot_close"})
-        .sort_values("time")
-    )
-
-    # Align Spot to Future (Strict backward mapping)
-    merged = pd.merge_asof(fut, idx, on="time", direction="backward")
-
-    # Core Thermodynamics
-    merged["basis_pts"] = merged["close"] - merged["spot_close"]
-    merged["basis_pct"] = merged["basis_pts"] / (merged["spot_close"] + 1e-9)
-
-    # Cross-Sectional Extremes (Z-Score)
-    basis_pct = merged["basis_pct"]
-    basis_ema20 = basis_pct.ewm(span=20, adjust=False).mean()
-    basis_dev = (basis_pct - basis_ema20).abs().ewm(span=20, adjust=False).mean()
-    merged["basis_z_score"] = (basis_pct - basis_ema20) / (basis_dev + 1e-9)
-
-    # Temporal Physics (Velocity replaces DTE for universal Perp/Dated compatibility)
-    merged["basis_vel_5"] = merged["basis_pct"].diff(5)
-    merged["basis_vel_10"] = merged["basis_pct"].diff(10)
-
-    # Cleanup
-    merged = merged.drop(columns=["spot_close"]).fillna(0.0)
-    return merged
 
 
 def fib_structural_basis(
@@ -1707,41 +1471,9 @@ def fib_structural_basis(
     return result
 
 
-def analyze_reference_coverage(
-    df_primary: pd.DataFrame, df_reference: pd.DataFrame
-) -> dict:
-    """
-    Audits whether every primary timestamp has an exact reference timestamp.
-
-    This is stricter than the ASOF basis merge and is intended for the 1H
-    derivative execution layer, where reusing a stale prior SPOT bar would hide
-    a real market-data gap.
-    """
-    primary_times = pd.to_datetime(df_primary["time"])
-    reference_times = pd.to_datetime(df_reference["time"])
-
-    if primary_times.dt.tz is not None:
-        primary_times = primary_times.dt.tz_convert("UTC").dt.tz_localize(None)
-    if reference_times.dt.tz is not None:
-        reference_times = reference_times.dt.tz_convert("UTC").dt.tz_localize(None)
-
-    primary_set = set(primary_times)
-    reference_set = set(reference_times)
-    missing_reference = sorted(primary_set - reference_set)
-    extra_reference = sorted(reference_set - primary_set)
-
-    return {
-        "missing_reference_count": len(missing_reference),
-        "extra_reference_count": len(extra_reference),
-        "missing_reference_sample": missing_reference[:5],
-        "extra_reference_sample": extra_reference[:5],
-    }
-
-
 def encode_session_time_vectors(df_1h: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds session-position and end-of-day basis momentum columns used by the
-    intraday holographic bridge.
+    Adds session-position placeholders for the intraday holographic bridge.
     """
     encoded = df_1h.copy()
     if "time" not in encoded.columns or encoded.empty:
@@ -1757,13 +1489,81 @@ def encode_session_time_vectors(df_1h: pd.DataFrame) -> pd.DataFrame:
     encoded["session_time_pos"] = (minutes_from_midnight - min_val) / (
         max_val - min_val + 1e-9
     )
-    if "basis_pct" in encoded.columns:
-        encoded["eod_basis_momentum"] = (
-            encoded["basis_pct"].diff(3) * encoded["session_time_pos"]
-        )
-    else:
-        encoded["eod_basis_momentum"] = 0.0
+    encoded["eod_basis_momentum"] = 0.0
     return encoded
+
+
+def _zero_basis_columns(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    for col in (
+        "basis_pts",
+        "basis_pct",
+        "basis_z_score",
+        "basis_vel_5",
+        "basis_vel_10",
+    ):
+        result[col] = 0.0
+    return result
+
+
+def inject_thermodynamic_basis(
+    df_primary: pd.DataFrame,
+    df_reference: pd.DataFrame | None = None,
+    *,
+    logger=None,
+) -> pd.DataFrame:
+    """
+    Preserve the legacy helper surface while enforcing the SPOT-only contract.
+
+    Basis-derived columns remain in the feature contract, but in SPOT-only mode
+    they are neutralized to zero so saved-artifact consumers can rebuild frames
+    without requiring a futures/reference lane.
+    """
+    primary = _sorted_timeframe_copy(df_primary)
+    if primary is None:
+        return df_primary.copy()
+
+    if logger is not None and df_reference is not None and not df_reference.empty:
+        logger("  [Thermo] Reference basis lane ignored in SPOT-only mode; zeroing basis.")
+    return _zero_basis_columns(primary)
+
+
+def analyze_reference_coverage(
+    df_primary: pd.DataFrame,
+    df_reference: pd.DataFrame | None,
+) -> dict[str, int | list[pd.Timestamp]]:
+    """
+    Compatibility helper retained for callers that still import it.
+
+    SPOT-only runtime paths no longer require a reference lane, so a missing
+    reference frame is treated as a neutral, non-fatal state.
+    """
+    if df_reference is None or df_reference.empty:
+        return {
+            "missing_reference_count": 0,
+            "extra_reference_count": 0,
+            "missing_reference_sample": [],
+            "extra_reference_sample": [],
+        }
+
+    primary_times = pd.to_datetime(df_primary["time"])
+    reference_times = pd.to_datetime(df_reference["time"])
+
+    if primary_times.dt.tz is not None:
+        primary_times = primary_times.dt.tz_convert("UTC").dt.tz_localize(None)
+    if reference_times.dt.tz is not None:
+        reference_times = reference_times.dt.tz_convert("UTC").dt.tz_localize(None)
+
+    primary_set = set(primary_times)
+    reference_set = set(reference_times)
+    missing_reference = sorted(primary_set - reference_set)
+    extra_reference = sorted(reference_set - primary_set)
+    return {
+        "missing_reference_count": len(missing_reference),
+        "extra_reference_count": len(extra_reference),
+        "missing_reference_sample": missing_reference[:5],
+        "extra_reference_sample": extra_reference[:5],
+    }
 
 
 def prepare_intraday_thermodynamics(
@@ -1771,6 +1571,9 @@ def prepare_intraday_thermodynamics(
     df_1d: pd.DataFrame | None = None,
     df_1w: pd.DataFrame | None = None,
     df_1m: pd.DataFrame | None = None,
+    reference_1h: pd.DataFrame | None = None,
+    reference_1d: pd.DataFrame | None = None,
+    reference_1w: pd.DataFrame | None = None,
     spot_1h: pd.DataFrame | None = None,
     spot_1d: pd.DataFrame | None = None,
     spot_1w: pd.DataFrame | None = None,
@@ -1778,121 +1581,40 @@ def prepare_intraday_thermodynamics(
     logger=print,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
     """
-    Centralizes the intraday thermodynamic contract used by training, backtest,
-    live inference, and meta-strategy selection.
+    Centralize the shared 1H preprocessing contract for all runtime consumers.
 
-    Rules:
-      - 1H FUT bars are the primary execution timeline.
-      - Every 1H FUT bar must have an exact 1H SPOT match if SPOT is provided.
-      - Extra SPOT-only bars are informational and ignored.
-      - 1D/1W basis layers keep the existing backward-ASOF behavior.
-      - Session vectors are always encoded in exactly one place.
+    The active project contract is SPOT-only, so any legacy reference inputs
+    are accepted for compatibility but ignored.
     """
-    df_1h = df_1h.sort_values("time").reset_index(drop=True).copy()
-    df_1d = (
-        df_1d.sort_values("time").reset_index(drop=True).copy()
-        if df_1d is not None
-        else None
-    )
-    df_1w = (
-        df_1w.sort_values("time").reset_index(drop=True).copy()
-        if df_1w is not None
-        else None
-    )
-    df_1m = (
-        df_1m.sort_values("time").reset_index(drop=True).copy()
-        if df_1m is not None
-        else None
-    )
-    spot_1h = (
-        spot_1h.sort_values("time").reset_index(drop=True).copy()
-        if spot_1h is not None and not spot_1h.empty
-        else None
-    )
-    spot_1d = (
-        spot_1d.sort_values("time").reset_index(drop=True).copy()
-        if spot_1d is not None and not spot_1d.empty
-        else None
-    )
-    spot_1w = (
-        spot_1w.sort_values("time").reset_index(drop=True).copy()
-        if spot_1w is not None and not spot_1w.empty
-        else None
-    )
+    if df_1h is None or df_1h.empty:
+        label = symbol or "TARGET"
+        raise ValueError(f"No usable 1H primary data for {label}.")
 
-    label = symbol or "TARGET"
-    if spot_1h is not None:
-        coverage = analyze_reference_coverage(df_1h, spot_1h)
-        if coverage["missing_reference_count"] > 0:
-            overlap_start = max(df_1h["time"].min(), spot_1h["time"].min())
-            overlap_end = min(df_1h["time"].max(), spot_1h["time"].max())
-            trimmed_1h = df_1h[
-                (df_1h["time"] >= overlap_start) & (df_1h["time"] <= overlap_end)
-            ].reset_index(drop=True)
-            trimmed_spot_1h = spot_1h[
-                (spot_1h["time"] >= overlap_start) & (spot_1h["time"] <= overlap_end)
-            ].reset_index(drop=True)
-            trimmed_coverage = (
-                analyze_reference_coverage(trimmed_1h, trimmed_spot_1h)
-                if not trimmed_1h.empty and not trimmed_spot_1h.empty
-                else coverage
-            )
+    reference_inputs = (
+        reference_1h,
+        reference_1d,
+        reference_1w,
+        spot_1h,
+        spot_1d,
+        spot_1w,
+    )
+    if logger is not None and any(df is not None and not df.empty for df in reference_inputs):
+        logger("  [Thermo] SPOT-only mode active; skipping legacy reference-lane mechanics.")
 
-            if (
-                not trimmed_1h.empty
-                and trimmed_coverage["missing_reference_count"] == 0
-            ):
-                dropped_bars = len(df_1h) - len(trimmed_1h)
-                if logger is not None:
-                    logger(
-                        f"  [PAIR] Trimmed {dropped_bars} unsupported 1H FUT bars in {label} to the shared SPOT/FUT overlap window."
-                    )
-                    logger(
-                        f"  [PAIR] Overlap window: {overlap_start} -> {overlap_end}"
-                    )
-                df_1h = trimmed_1h
-                spot_1h = trimmed_spot_1h
-                coverage = trimmed_coverage
-            else:
-                if logger is not None:
-                    logger("\n" + "=" * 70)
-                    logger("  [!] FATAL ERROR: REFERENCE COVERAGE VIOLATION")
-                    logger("=" * 70)
-                    logger(
-                        f"  SPOT support is missing for {coverage['missing_reference_count']} tradable 1H FUT bars in {label}."
-                    )
-                    logger(
-                        f"  Sample missing timestamps: {coverage['missing_reference_sample']}"
-                    )
-                    logger(
-                        "  Thermodynamic state cannot be trusted on the execution timeline."
-                    )
-                    logger("  System locked to protect capital.")
-                raise ValueError(f"Missing 1H SPOT coverage for {label}.")
-
-        if logger is not None:
-            extra_count = coverage["extra_reference_count"]
-            if extra_count > 0:
-                logger(
-                    f"  [+] 1H coverage verified: every FUT bar has SPOT support. Ignoring {extra_count} SPOT-only bars outside the tradable FUT timeline."
-                )
-            else:
-                logger(
-                    "  [+] 1H coverage verified: exact SPOT <-> FUT alignment on the tradable timeline."
-                )
-    elif logger is not None:
-        logger(
-            f"  [!] WARNING: No SPOT 1H data found for {label}. Thermodynamics will be zeroed."
-        )
-
-    df_1h = inject_thermodynamic_basis(df_1h, spot_1h)
-    if df_1d is not None and spot_1d is not None:
-        df_1d = inject_thermodynamic_basis(df_1d, spot_1d)
-    if df_1w is not None and spot_1w is not None:
-        df_1w = inject_thermodynamic_basis(df_1w, spot_1w)
-
-    df_1h = encode_session_time_vectors(df_1h)
-    return df_1h, df_1d, df_1w, df_1m
+    primary_1h = inject_thermodynamic_basis(df_1h, None, logger=None)
+    primary_1h = encode_session_time_vectors(primary_1h)
+    primary_1d = (
+        inject_thermodynamic_basis(df_1d, None, logger=None)
+        if df_1d is not None and not df_1d.empty
+        else _sorted_timeframe_copy(df_1d)
+    )
+    primary_1w = (
+        inject_thermodynamic_basis(df_1w, None, logger=None)
+        if df_1w is not None and not df_1w.empty
+        else _sorted_timeframe_copy(df_1w)
+    )
+    primary_1m = _sorted_timeframe_copy(df_1m)
+    return primary_1h, primary_1d, primary_1w, primary_1m
 
 
 ARTIFACT_NAME_SCHEME = {
@@ -1995,7 +1717,7 @@ if __name__ == "__main__":
         "--symbol",
         type=str,
         required=True,
-        help="Target Base Symbol (e.g., BANKNIFTY, BTC)",
+        help="Target symbol (e.g., NIFTY, BTCUSDT, AAPL, ^GDAXI)",
     )
 
     args = parser.parse_args()
@@ -2027,34 +1749,39 @@ if __name__ == "__main__":
 
     # Fetch Holographic Stacks
     tf_maps = {
-        "FUT": bridge.fetch_holographic_stack(SYMBOL, "FUT"),
-        "SPOT": bridge.fetch_holographic_stack(SYMBOL, "SPOT"),
+        "SPOT": bridge.fetch_holographic_stack(SYMBOL, PRIMARY_ASSET_CLASS),
     }
 
-    # Enforce Derivative-First Architecture
-    df_1h = tf_maps["FUT"].get("1H")
-    df_1d = tf_maps["FUT"].get("1D")
-    df_1w = tf_maps["FUT"].get("1W")
-    df_1m = tf_maps["FUT"].get("1M")
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_maps, ("1H", "1D", "1W", "1M")
+    )
+    df_1h = primary_frames["1H"]
+    df_1d = primary_frames["1D"]
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
 
     if df_1h is None or df_1h.empty:
         print(
-            f"\n  [!] FATAL: No 1H FUT data for {SYMBOL} in database. Derivative execution layer missing."
+            f"\n  [!] FATAL: No usable 1H primary data for {SYMBOL} in database. SPOT-first execution layer unavailable."
         )
         exit()
 
+    print(f"  1H primary lane : {describe_selected_frame(df_1h)}")
     print(
         f"  1H bars : {len(df_1h):>7}  ({df_1h['time'].min().date()} → {df_1h['time'].max().date()})"
     )
     if df_1d is not None and not df_1d.empty:
+        print(f"  1D primary lane : {describe_selected_frame(df_1d)}")
         print(
             f"  1D bars : {len(df_1d):>7}  ({df_1d['time'].min().date()} → {df_1d['time'].max().date()})"
         )
     if df_1w is not None and not df_1w.empty:
+        print(f"  1W primary lane : {describe_selected_frame(df_1w)}")
         print(
             f"  1W bars : {len(df_1w):>7}  ({df_1w['time'].min().date()} → {df_1w['time'].max().date()})"
         )
     if df_1m is not None and not df_1m.empty:
+        print(f"  1M primary lane : {describe_selected_frame(df_1m)}")
         print(
             f"  1M bars : {len(df_1m):>7}  ({df_1m['time'].min().date()} → {df_1m['time'].max().date()})"
         )
@@ -2070,9 +1797,9 @@ if __name__ == "__main__":
             df_1d=df_1d,
             df_1w=df_1w,
             df_1m=df_1m,
-            spot_1h=tf_maps["SPOT"].get("1H"),
-            spot_1d=tf_maps["SPOT"].get("1D"),
-            spot_1w=tf_maps["SPOT"].get("1W"),
+            reference_1h=reference_frames["1H"],
+            reference_1d=reference_frames["1D"],
+            reference_1w=reference_frames["1W"],
             symbol=SYMBOL,
             logger=print,
         )
@@ -2267,6 +1994,7 @@ if __name__ == "__main__":
             last_row,
             confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
         )
+        primary_asset_label = str(df_1h.attrs.get("selected_asset_class", "PRIMARY"))
         close_price = float(last_row["close"])
         # atr14 excluded from model features; use last known value for trade plan display
         atr = float(df_full["atr14"].iloc[-1]) if "atr14" in df_full.columns else 150.0
@@ -2289,7 +2017,7 @@ if __name__ == "__main__":
         )
         print(f"  Signal      : {pred['signal_strength']}")
         print("----------------------------------------------------------------------")
-        print(f"  Entry Price : {close_price:,.2f} (Current Close)")
+        print(f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)")
 
         trail_str = "N/A"
         filter_note = trade_plan["note"]
@@ -2329,7 +2057,7 @@ if __name__ == "__main__":
             "dir": pred["direction"],
             "conf": f"{pred['confidence'] * 100:.1f}%",
             "signal": pred["signal_strength"],
-            "entry": f"{close_price:,.2f} (Current Close)",
+            "entry": f"{close_price:,.2f} (Current {primary_asset_label} Close)",
             "sl": sl_str,
             "tp1": tp1_str,
             "tp2": tp2_str,

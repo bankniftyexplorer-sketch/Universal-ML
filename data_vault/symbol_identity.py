@@ -7,7 +7,7 @@ from functools import lru_cache
 
 SYMBOL_PAYLOAD_RE = re.compile(r"SYMBOL:\s*(.*?)\s*,\s*OPEN:", re.DOTALL)
 MARKET_PREFIX_RE = re.compile(r"^(?P<exchange>[A-Z0-9_]+):(?P<symbol>.+)$")
-SOURCE_SYMBOL_CLEAN_RE = re.compile(r"[^A-Z0-9!._-]")
+SOURCE_SYMBOL_CLEAN_RE = re.compile(r"[^A-Z0-9!._^:-]")
 PAIR_SYMBOL_CLEAN_RE = re.compile(r"[^A-Z0-9]")
 EXCHANGE_CLEAN_RE = re.compile(r"[^A-Z0-9_]")
 CONTINUOUS_FUTURE_RE = re.compile(r"^(?P<root>.+?)(?P<ordinal>\d*)!$")
@@ -98,24 +98,24 @@ class ParsedSymbolIdentity:
 
 
 STRICT_INDEX_REGISTRY = (
-    InstrumentRegistryEntry("NIFTY", "SPOT", "NSE", "NIFTY", "SPOT", "INR"),
+    InstrumentRegistryEntry("NIFTY", "SPOT", "YAHOO", "^NSEI", "SPOT", "INR"),
     InstrumentRegistryEntry(
         "NIFTY", "FUT", "NSE", "NIFTY1!", "CONTINUOUS_FUTURE", "INR"
     ),
     InstrumentRegistryEntry(
-        "BANKNIFTY", "SPOT", "NSE", "BANKNIFTY", "SPOT", "INR"
+        "BANKNIFTY", "SPOT", "YAHOO", "^NSEBANK", "SPOT", "INR"
     ),
     InstrumentRegistryEntry(
         "BANKNIFTY", "FUT", "NSE", "BANKNIFTY1!", "CONTINUOUS_FUTURE", "INR"
     ),
     InstrumentRegistryEntry(
-        "FINNIFTY", "SPOT", "NSE", "CNXFINANCE", "SPOT", "INR"
+        "FINNIFTY", "SPOT", "YAHOO", "NIFTY_FIN_SERVICE.NS", "SPOT", "INR"
     ),
     InstrumentRegistryEntry(
         "FINNIFTY", "FUT", "NSE", "FINNIFTY1!", "CONTINUOUS_FUTURE", "INR"
     ),
     InstrumentRegistryEntry(
-        "MIDCPNIFTY", "SPOT", "NSE", "NIFTY_MID_SELECT", "SPOT", "INR"
+        "MIDCPNIFTY", "SPOT", "YAHOO", "NIFTY_MID_SELECT.NS", "SPOT", "INR"
     ),
     InstrumentRegistryEntry(
         "MIDCPNIFTY",
@@ -125,7 +125,11 @@ STRICT_INDEX_REGISTRY = (
         "CONTINUOUS_FUTURE",
         "INR",
     ),
-    InstrumentRegistryEntry("SENSEX", "SPOT", "BSE_DLY", "SENSEX", "SPOT", "INR"),
+    InstrumentRegistryEntry("SENSEX", "SPOT", "YAHOO", "^BSESN", "SPOT", "INR"),
+    InstrumentRegistryEntry(
+        "NIFTYNXT50", "SPOT", "YAHOO", "^NSMIDCP", "SPOT", "INR"
+    ),
+    InstrumentRegistryEntry("SPX500", "SPOT", "YAHOO", "^GSPC", "SPOT", "USD"),
     InstrumentRegistryEntry(
         "SENSEX", "FUT", "BSE_DLY", "BSX1!", "CONTINUOUS_FUTURE", "INR"
     ),
@@ -136,19 +140,19 @@ STRICT_INDEX_REGISTRY = (
 )
 
 STRICT_CRYPTO_REGISTRY = (
-    InstrumentRegistryEntry("BTC", "SPOT", "BINANCE", "BTCUSDT", "SPOT", "USDT"),
-    InstrumentRegistryEntry("ETH", "SPOT", "BINANCE", "ETHUSDT", "SPOT", "USDT"),
-    InstrumentRegistryEntry("BNB", "SPOT", "BINANCE", "BNBUSDT", "SPOT", "USDT"),
-    InstrumentRegistryEntry("XRP", "SPOT", "BINANCE", "XRPUSDT", "SPOT", "USDT"),
-    InstrumentRegistryEntry("SOL", "SPOT", "BINANCE", "SOLUSDT", "SPOT", "USDT"),
-    InstrumentRegistryEntry("TRX", "SPOT", "BINANCE", "TRXUSDT", "SPOT", "USDT"),
+    InstrumentRegistryEntry("BTC", "SPOT", "YAHOO", "BTC-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("ETH", "SPOT", "YAHOO", "ETH-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("BNB", "SPOT", "YAHOO", "BNB-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("XRP", "SPOT", "YAHOO", "XRP-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("SOL", "SPOT", "YAHOO", "SOL-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("TRX", "SPOT", "YAHOO", "TRX-USD", "SPOT", "USD"),
     InstrumentRegistryEntry(
-        "DOGE", "SPOT", "BINANCE", "DOGEUSDT", "SPOT", "USDT"
+        "DOGE", "SPOT", "YAHOO", "DOGE-USD", "SPOT", "USD"
     ),
-    InstrumentRegistryEntry("ADA", "SPOT", "BINANCE", "ADAUSDT", "SPOT", "USDT"),
-    InstrumentRegistryEntry("BCH", "SPOT", "BINANCE", "BCHUSDT", "SPOT", "USDT"),
+    InstrumentRegistryEntry("ADA", "SPOT", "YAHOO", "ADA-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("BCH", "SPOT", "YAHOO", "BCH-USD", "SPOT", "USD"),
     InstrumentRegistryEntry(
-        "LINK", "SPOT", "BINANCE", "LINKUSDT", "SPOT", "USDT"
+        "LINK", "SPOT", "YAHOO", "LINK-USD", "SPOT", "USD"
     ),
     InstrumentRegistryEntry(
         "BTC", "FUT", "BINANCE", "BTCUSDT.P", "PERPETUAL", "USDT"
@@ -201,6 +205,22 @@ UNIQUE_REGISTRY_BY_SOURCE_SYMBOL = {
     source_symbol: entries[0]
     for source_symbol, entries in _source_symbol_buckets.items()
     if len(entries) == 1
+}
+
+CANONICAL_SYMBOL_ALIASES = {
+    "CNXFINANCE": "FINNIFTY",
+    "NIFTYFINSERVICE": "FINNIFTY",
+    "NIFTYFINSERVICENS": "FINNIFTY",
+    "MIDCPNIFTY": "MIDCPNIFTY",
+    "NIFTYMIDSELECT": "MIDCPNIFTY",
+    "NIFTYMIDSELECTNS": "MIDCPNIFTY",
+    "NIFTYNXT50": "NIFTYNXT50",
+    "NIFTYNEXT50": "NIFTYNXT50",
+    "NIFTYJR": "NIFTYNXT50",
+    "NSMIDCP": "NIFTYNXT50",
+    "SP500": "SPX500",
+    "SPX500": "SPX500",
+    "GSPC": "SPX500",
 }
 
 
@@ -552,18 +572,25 @@ def canonical_pair_symbol(raw_symbol: str, asset_class: str | None = None) -> st
     try:
         parsed = parse_symbol_payload(payload)
         if asset_class is None or parsed.asset_class == asset_class:
-            return parsed.pair_symbol
+            parsed_pair = _normalize_pair_symbol(parsed.pair_symbol) or parsed.pair_symbol
+            return CANONICAL_SYMBOL_ALIASES.get(parsed_pair, parsed_pair)
     except ValueError:
         pass
 
     normalized_symbol = normalize_raw_symbol(payload)
+    normalized_alias_key = _normalize_pair_symbol(normalized_symbol)
+    if normalized_alias_key in CANONICAL_SYMBOL_ALIASES:
+        return CANONICAL_SYMBOL_ALIASES[normalized_alias_key]
+
     contract_kind, _, pair_core_symbol = _infer_contract_signature(normalized_symbol)
     pair_symbol, _ = _infer_pair_and_quote(pair_core_symbol)
     if pair_symbol:
-        return pair_symbol
+        alias_pair = CANONICAL_SYMBOL_ALIASES.get(pair_symbol)
+        return alias_pair or pair_symbol
     if asset_class == "FUT" and contract_kind != "SPOT":
         return _normalize_pair_symbol(pair_core_symbol) or normalized_symbol
-    return _normalize_pair_symbol(normalized_symbol) or normalized_symbol
+    fallback_pair = _normalize_pair_symbol(normalized_symbol) or normalized_symbol
+    return CANONICAL_SYMBOL_ALIASES.get(fallback_pair, fallback_pair)
 
 
 def lookup_registry_entry(

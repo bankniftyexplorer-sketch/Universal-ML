@@ -53,32 +53,38 @@ Environment truths:
 
 ## 2. How To Update The Database
 
-Put new TradingView CSV exports into:
-
-- `/home/km/Universal-ML/data_vault/inbox/`
-
-Then ingest them:
+Sync Yahoo `SPOT` history with:
 
 ```bash
 cd /home/km/Universal-ML
-uv run python data_vault/vault_engine.py
+uv run python data_vault/vault_engine.py --symbol NIFTY --pause-seconds 0
 ```
+
+Notes:
+
+- repeat `--symbol` to sync multiple instruments
+- omit `--symbol` to sync the core watchlist first (`NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50`, `SPX500`, `BTC`), then the rest of the curated Yahoo map
+- `--symbol` accepts curated aliases like `BTCUSDT` and raw Yahoo tickers like `AAPL`, `^GDAXI`, or `EURUSD=X`
+- normal syncs are incremental by default for speed; use `--full-refresh` when you want a max-history rebuild from Yahoo
+- `data_vault/vault_engine.py` is the canonical entrypoint
+- the root-level `vault_engine.py` remains an import-compatibility shim
 
 What this does:
 
-- reads all CSV files from `data_vault/inbox/`
-- parses `SPOT` vs `FUT`
-- writes data into `data_vault/ohlcv.db`
-- auto-builds macro layers like `1W`, `1M`, `3M`, `6M`, `12M`
-- removes successfully processed CSV files from `data_vault/inbox/`
+- fetches Yahoo `SPOT` history for `1D` and `1H`
+- merges incremental Yahoo refreshes onto the canonical rows in `data_vault/ohlcv.db`
+- falls back to a full rebuild when the audit trail is missing, stale, or explicitly forced
+- derives `1W`, `1M`, `3M`, `6M`, `12M` macro layers from `1D`
+- records per-timeframe sync quality into `market_sync_quality`
 
 Important:
 
-- Only ingest fully closed bars.
-- Do not ingest partial `1H` candles if you want clean predictions.
-- Do not ingest partial daily candles if you want clean `1D` predictions.
-- Use `data_vault/vault_engine.py` for ingestion.
-- The root-level `vault_engine.py` exists only to keep older imports stable in runtime scripts.
+- Only trust fully closed `1H` and `1D` bars.
+- The active project contract is Yahoo-fed `SPOT` only.
+- There is no CSV inbox in the current operating path.
+- `1D` requests use Yahoo `period=max`; `1H` requests ask for `period=max` too, but Yahoo currently returns only the last ~730 days for hourly data.
+- The sync loop is best-effort: if one Yahoo symbol returns no usable history, the run continues and reports a warning instead of aborting the whole refresh.
+- Quality rows now capture gap counts, synthetic-volume counts, staleness, fetch mode, and whether the engine had to retain old bars because Yahoo returned nothing.
 
 ---
 
@@ -252,7 +258,7 @@ Important limitation:
 
 ```bash
 cd /home/km/Universal-ML
-uv run python data_vault/vault_engine.py
+uv run python data_vault/vault_engine.py --symbol NIFTY --pause-seconds 0
 uv run python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 uv run python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 uv run python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
@@ -264,7 +270,7 @@ uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Uni
 
 ```bash
 cd /home/km/Universal-ML
-uv run python data_vault/vault_engine.py
+uv run python data_vault/vault_engine.py --symbol NIFTY --pause-seconds 0
 uv run python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ```
 
@@ -284,17 +290,16 @@ uv run python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
 For `1H`:
 
 - Do **not** retrain every `20m`
-- Do **not** ingest partial hourly candles
+- Do **not** sync partial hourly candles
 - Best practice is:
   - wait for the `1H` bar to close
-  - export/update the new closed `1H` data
-  - ingest with `vault_engine.py`
+  - sync Yahoo with `data_vault/vault_engine.py --symbol <SYMBOL>`
   - run `live_inference.py`
 
 For `1D`:
 
 - run once after market close when the final daily bar is fixed
-- ingest the new daily CSV
+- sync Yahoo daily history
 - run `daily_ml_engine.py`
 
 For retraining:
@@ -320,10 +325,12 @@ For retraining:
 
 ## 9. Symbol Example
 
-Replace `NIFTY` with any symbol already present in the database, for example:
+Replace `NIFTY` with any symbol mapped in `data_vault/yfinance_vault.py`, for example:
 
 - `NIFTY`
-- `BSX`
+- `BANKNIFTY`
+- `SENSEX`
+- `BTC`
 
 Example:
 
@@ -338,7 +345,7 @@ python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
 ## 10. Important Safety Notes
 
 - The `1H` model is built on closed `1H` bars, not `20m` bars.
-- Extra `SPOT` bars are ignored, but missing `SPOT` support for tradable `FUT 1H` bars is treated as a fatal data-quality issue.
+- The active data contract is Yahoo-fed `SPOT`; runtime consumers no longer require a `FUT` lane.
 - The project expects the active database to be:
   - `/home/km/Universal-ML/data_vault/ohlcv.db`
 - Keep the symbol folders:

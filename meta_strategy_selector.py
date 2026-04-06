@@ -9,8 +9,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import warnings
 
-warnings.filterwarnings("ignore")
-
 import universal_ml_engine as ume
 from universal_ml_engine import (
     merge_higher_tf,
@@ -19,6 +17,8 @@ from universal_ml_engine import (
     walk_forward,
     predict_next_bar,
     _compute_atr14,
+    build_timeframe_selection,
+    describe_selected_frame,
     fib_structural_basis,
     migrate_legacy_artifacts,
     resolve_artifact_path,
@@ -32,6 +32,8 @@ from julia_bridge import (
 )
 from holographic_engine import feature_selection_pipeline
 from backtest_engine import run_backtest, calculate_metrics
+
+warnings.filterwarnings("ignore")
 
 try:
     from universal_ml_engine import NON_FEATURE_COLS_SET
@@ -527,7 +529,7 @@ if __name__ == "__main__":
         "--symbol",
         type=str,
         required=True,
-        help="Target Base Symbol (e.g., BANKNIFTY, BTC)",
+        help="Target symbol (e.g., NIFTY, BTCUSDT, AAPL, ^GDAXI)",
     )
     args = parser.parse_args()
 
@@ -547,14 +549,16 @@ if __name__ == "__main__":
 
     bridge = InferenceBridge(db_path=os.path.join(outdir, "data_vault", "ohlcv.db"))
     tf_raw = {
-        "FUT": bridge.fetch_holographic_stack(SYMBOL, "FUT"),
         "SPOT": bridge.fetch_holographic_stack(SYMBOL, "SPOT"),
     }
 
-    df_1h = tf_raw["FUT"].get("1H")
-    df_1d = tf_raw["FUT"].get("1D")
-    df_1w = tf_raw["FUT"].get("1W")
-    df_1m = tf_raw["FUT"].get("1M")
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_raw, ("1H", "1D", "1W", "1M")
+    )
+    df_1h = primary_frames["1H"]
+    df_1d = primary_frames["1D"]
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
 
     missing = [
         tf
@@ -562,7 +566,7 @@ if __name__ == "__main__":
         if df is None or df.empty
     ]
     if missing:
-        print(f"  [Meta] Missing required FUT timeframes: {', '.join(missing)}")
+        print(f"  [Meta] Missing required primary timeframes: {', '.join(missing)}")
         raise SystemExit(1)
 
     symbol = SYMBOL
@@ -579,6 +583,7 @@ if __name__ == "__main__":
         print(f"  [Meta] Found baseline OOS probabilities: {baseline_oos_path}")
 
     print(f"  [Meta] Building feature frame for {symbol} ...")
+    print(f"  [Meta] 1H primary lane: {describe_selected_frame(df_1h)}")
     df_1h = df_1h.copy()
     df_1d = df_1d.copy()
     df_1w = df_1w.copy()
@@ -592,9 +597,9 @@ if __name__ == "__main__":
             df_1d=df_1d,
             df_1w=df_1w,
             df_1m=df_1m,
-            spot_1h=tf_raw["SPOT"].get("1H"),
-            spot_1d=tf_raw["SPOT"].get("1D"),
-            spot_1w=tf_raw["SPOT"].get("1W"),
+            reference_1h=reference_frames["1H"],
+            reference_1d=reference_frames["1D"],
+            reference_1w=reference_frames["1W"],
             symbol=SYMBOL,
             logger=print,
         )

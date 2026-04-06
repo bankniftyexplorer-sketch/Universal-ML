@@ -35,8 +35,6 @@ from daily_ml_engine import (
     NON_FEATURE_COLS_DAILY,
     PURGE_GAP_DAILY,
     TEST_SIZE_RATIO_DAILY,
-    _get_tf,
-    _pick_primary_1d,
     add_daily_confluence,
     compute_macro_regime,
     holographic_feature_engine_daily,
@@ -54,6 +52,7 @@ from universal_ml_engine import (
     NON_FEATURE_COLS_SET,
     TRADE_PLAN_LABEL_COLS,
     _compute_atr14,
+    build_timeframe_selection,
     fib_structural_basis,
     inject_thermodynamic_basis,
     merge_higher_tf,
@@ -264,28 +263,30 @@ def _inject_macro_regime(
 def _load_tf_maps(data_dir: str, symbol: str) -> dict[str, dict[str, pd.DataFrame]]:
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     return {
-        "FUT": bridge.fetch_holographic_stack(symbol, "FUT"),
         "SPOT": bridge.fetch_holographic_stack(symbol, "SPOT"),
     }
 
 
 def _build_1h_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     tf_maps = _load_tf_maps(data_dir, symbol)
-    df_1h = tf_maps["FUT"].get("1H")
-    df_1d = tf_maps["FUT"].get("1D")
-    df_1w = tf_maps["FUT"].get("1W")
-    df_1m = tf_maps["FUT"].get("1M")
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_maps, ("1H", "1D", "1W", "1M")
+    )
+    df_1h = primary_frames["1H"]
+    df_1d = primary_frames["1D"]
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
     if df_1h is None or df_1h.empty:
-        raise ValueError(f"No 1H FUT data available for {symbol}.")
+        raise ValueError(f"No 1H primary data available for {symbol}.")
 
     df_1h, df_1d, df_1w, df_1m = prepare_intraday_thermodynamics(
         df_1h=df_1h,
         df_1d=df_1d,
         df_1w=df_1w,
         df_1m=df_1m,
-        spot_1h=tf_maps["SPOT"].get("1H"),
-        spot_1d=tf_maps["SPOT"].get("1D"),
-        spot_1w=tf_maps["SPOT"].get("1W"),
+        reference_1h=reference_frames["1H"],
+        reference_1d=reference_frames["1D"],
+        reference_1w=reference_frames["1W"],
         symbol=symbol,
         logger=None,
     )
@@ -327,23 +328,23 @@ def _build_1h_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
 
 def _build_1d_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     tf_maps = _load_tf_maps(data_dir, symbol)
-    df_1d = _pick_primary_1d(tf_maps)
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_maps, ("1D", "1W", "1M", "3M", "6M", "12M")
+    )
+    df_1d = primary_frames["1D"]
     if df_1d is None or df_1d.empty:
-        raise ValueError(f"No usable 1D data found for {symbol}.")
-    df_1w = _get_tf(tf_maps, "1W")
-    df_1m = _get_tf(tf_maps, "1M")
-    df_3m = _get_tf(tf_maps, "3M")
-    df_6m = _get_tf(tf_maps, "6M")
-    df_12m = _get_tf(tf_maps, "12M")
+        raise ValueError(f"No usable 1D primary data found for {symbol}.")
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
+    df_3m = primary_frames["3M"]
+    df_6m = primary_frames["6M"]
+    df_12m = primary_frames["12M"]
 
-    spot_1d = tf_maps["SPOT"].get("1D")
-    if spot_1d is not None and not spot_1d.empty:
-        df_1d = inject_thermodynamic_basis(
-            df_1d, spot_1d.sort_values("time").reset_index(drop=True)
-        )
-    else:
-        for col in ["basis_pct", "basis_z_score", "basis_vel_5", "basis_vel_10"]:
-            df_1d[col] = 0.0
+    df_1d = inject_thermodynamic_basis(
+        df_1d,
+        reference_frames["1D"],
+        logger=None,
+    )
 
     df_1d["session_time_pos"] = 0.0
     df_1d["eod_basis_momentum"] = 0.0

@@ -8,16 +8,17 @@ Zero training. Zero backtesting. Pure live signal generation.
 
 import os
 import argparse
+import sys
 import numpy as np
 import pandas as pd
 import joblib
 import warnings
 
-warnings.filterwarnings("ignore")
-
 from universal_ml_engine import (
     prepare_intraday_thermodynamics,
     _compute_atr14,
+    build_timeframe_selection,
+    describe_selected_frame,
     merge_higher_tf,
     migrate_legacy_artifacts,
     fib_structural_basis,
@@ -32,15 +33,10 @@ from julia_bridge import (
     smc_feature_engine_fast,
 )
 from shadow_brain import ShadowBrain
-import sys
+
+warnings.filterwarnings("ignore")
 
 EOD_GATE_HOUR = 14  # IST. Set to 24 for 24/7 crypto.
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "data_vault"))
-try:
-    from vault_engine import DataVault
-except ImportError:
-    pass
 
 
 def main():
@@ -55,8 +51,6 @@ def main():
     file_prefix = SYMBOL.lower().replace(" ", "_")
     migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1H", logger=None)
 
-    import sys
-
     sys.path.append(os.path.join(PROJECT_ROOT, "data_vault"))
     try:
         from inference_bridge import InferenceBridge
@@ -70,20 +64,22 @@ def main():
     )
 
     tf_maps = {
-        "FUT": bridge.fetch_holographic_stack(SYMBOL, "FUT"),
         "SPOT": bridge.fetch_holographic_stack(SYMBOL, "SPOT"),
     }
 
-    df_1h = tf_maps["FUT"].get("1H")
-    df_1d = tf_maps["FUT"].get("1D")
-    df_1w = tf_maps["FUT"].get("1W")
-    df_1m = tf_maps["FUT"].get("1M")
+    primary_frames, reference_frames = build_timeframe_selection(
+        tf_maps, ("1H", "1D", "1W", "1M")
+    )
+    df_1h = primary_frames["1H"]
+    df_1d = primary_frames["1D"]
+    df_1w = primary_frames["1W"]
+    df_1m = primary_frames["1M"]
 
     if df_1h is None or df_1h.empty:
-        print(
-            f"  [!] FATAL: Execution engine requires 1H Derivative data for {SYMBOL}."
-        )
+        print(f"  [!] FATAL: Execution engine requires usable 1H primary data for {SYMBOL}.")
         return
+
+    print(f"  [Live] 1H primary lane: {describe_selected_frame(df_1h)}")
 
     # Load Models from the isolated Symbol Directory
     mod_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "model")
@@ -107,9 +103,9 @@ def main():
             df_1d=df_1d,
             df_1w=df_1w,
             df_1m=df_1m,
-            spot_1h=tf_maps["SPOT"].get("1H"),
-            spot_1d=tf_maps["SPOT"].get("1D"),
-            spot_1w=tf_maps["SPOT"].get("1W"),
+            reference_1h=reference_frames["1H"],
+            reference_1d=reference_frames["1D"],
+            reference_1w=reference_frames["1W"],
             symbol=SYMBOL,
             logger=print,
         )
