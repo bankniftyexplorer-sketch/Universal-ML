@@ -125,3 +125,7 @@ patch_*.py
 .DS_Store
 *.swp
 *.log
+
+# --- MARKDOWN DOCUMENTS ---
+*.md
+!PROJECT_MAP.md
