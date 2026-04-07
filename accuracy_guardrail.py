@@ -31,6 +31,7 @@ import pandas as pd
 from daily_ml_engine import (
     BARRIER_ATR_MULT_DAILY,
     BARRIER_HORIZON_BARS_DAILY,
+    LIVE_CONFIDENCE_THRESHOLD_DAILY,
     MIN_TRAIN_BARS_DAILY,
     NON_FEATURE_COLS_DAILY,
     PURGE_GAP_DAILY,
@@ -56,6 +57,7 @@ from universal_ml_engine import (
     NON_FEATURE_COLS_SET,
     TRADE_PLAN_LABEL_COLS,
     _compute_atr14,
+    apply_calibrator_to_prob_array,
     build_timeframe_selection,
     inject_thermodynamic_basis,
     merge_higher_tf,
@@ -69,6 +71,7 @@ HASH_KEYS = (
     "model",
     "features",
     "oos_proba",
+    "calibrator",
     "trade_plan_models",
     "ml_report",
     "backtest_report",
@@ -157,6 +160,8 @@ def _score_saved_oos(
     feature_cols: list[str],
     oos_proba_map: dict[Any, float],
     *,
+    calibrator=None,
+    confidence_threshold: float,
     min_train_bars: int,
     test_size_ratio: float,
     n_splits: int,
@@ -181,6 +186,7 @@ def _score_saved_oos(
         preds = np.array(
             [oos_map.get(pd.Timestamp(ts), np.nan) for ts in test_times], dtype=float
         )
+        preds = apply_calibrator_to_prob_array(preds, calibrator)
         valid_mask = np.isfinite(preds)
         missing = int((~valid_mask).sum())
         total_missing += missing
@@ -191,8 +197,8 @@ def _score_saved_oos(
         pred_binary = (preds > 0.5).astype(int)
         acc = float((true_binary[valid_mask] == pred_binary[valid_mask]).mean())
         high_conf_mask = valid_mask & (
-            (preds >= LIVE_CONFIDENCE_THRESHOLD)
-            | (preds <= (1.0 - LIVE_CONFIDENCE_THRESHOLD))
+            (preds >= confidence_threshold)
+            | (preds <= (1.0 - confidence_threshold))
         )
         conf_acc = (
             float((pred_binary[high_conf_mask] == true_binary[high_conf_mask]).mean())
@@ -415,12 +421,20 @@ def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, A
 
     feature_cols = _read_feature_cols(features_path)
     oos_map = joblib.load(oos_path)
+    calibrator_path = artifact_paths.get("calibrator")
+    calibrator = (
+        joblib.load(calibrator_path)
+        if calibrator_path and os.path.exists(calibrator_path)
+        else None
+    )
     if lane == "1H":
         df_model_ready = _build_1h_model_ready(data_dir, symbol)
         metrics = _score_saved_oos(
             df_model_ready,
             feature_cols,
             oos_map,
+            calibrator=calibrator,
+            confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
             min_train_bars=2500,
             test_size_ratio=0.15,
             n_splits=10,
@@ -431,6 +445,8 @@ def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, A
             df_model_ready,
             feature_cols,
             oos_map,
+            calibrator=calibrator,
+            confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
             min_train_bars=MIN_TRAIN_BARS_DAILY,
             test_size_ratio=TEST_SIZE_RATIO_DAILY,
             n_splits=10,

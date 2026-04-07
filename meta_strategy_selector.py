@@ -13,6 +13,9 @@ import universal_ml_engine as ume
 from universal_ml_engine import (
     merge_higher_tf,
     add_target,
+    apply_calibrator_to_prob_array,
+    calibrate_oos_probabilities,
+    fold_consensus_feature_selection,
     train_trade_plan_models,
     walk_forward,
     predict_next_bar,
@@ -31,7 +34,6 @@ from julia_bridge import (
     rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
-from holographic_engine import feature_selection_pipeline
 from backtest_engine import run_backtest, calculate_metrics
 
 warnings.filterwarnings("ignore")
@@ -135,6 +137,7 @@ def run_strategy_zoo(
     walk_forward_fn=walk_forward,
     symbol: str = "",
 ) -> dict:
+    del walk_forward_fn
     print(
         f"  [Meta] Strategy zoo starting for {symbol or 'UNKNOWN'} with MODEL_N_JOBS={MODEL_N_JOBS}"
     )
@@ -189,37 +192,23 @@ def run_strategy_zoo(
             df_copy[col] = df_copy[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
         try:
-            feature_cols, _ = feature_selection_pipeline(
+            feature_cols, wf_result = fold_consensus_feature_selection(
                 df_copy.copy(),
                 all_holo_cols,
-                walk_forward_fn=walk_forward_fn,
-                target_col="target",
-                min_train_bars=2500,
-                test_size_ratio=0.15,
-                n_splits=10,
-            )
-        except Exception as exc:
-            print(f"  [Meta] [Zoo] Feature selection failed for {key}: {exc}")
-            zoo_results[key] = {"oos_proba_map": {}, "feature_cols": [], "df": df_copy}
-            continue
-
-        if not feature_cols:
-            print(f"  [Meta] [Zoo] {key} ended with zero selected features.")
-            zoo_results[key] = {"oos_proba_map": {}, "feature_cols": [], "df": df_copy}
-            continue
-
-        try:
-            wf_result = walk_forward_fn(
-                df_copy.copy(),
-                feature_cols,
                 n_splits=10,
                 min_train_bars=2500,
                 test_size_ratio=0.15,
                 purge_gap=24,
             )
         except Exception as exc:
-            print(f"  [Meta] [Zoo] Walk-forward failed for {key}: {exc}")
+            print(f"  [Meta] [Zoo] Nested selection failed for {key}: {exc}")
             wf_result = {}
+            feature_cols = []
+
+        if not feature_cols:
+            print(f"  [Meta] [Zoo] {key} ended with zero selected features.")
+            zoo_results[key] = {"oos_proba_map": {}, "feature_cols": [], "df": df_copy}
+            continue
 
         if not wf_result:
             wf_result = {
@@ -243,6 +232,10 @@ def run_strategy_zoo(
                         f"  [Meta] [Zoo] Trade-plan model training failed for {key}: {exc}"
                     )
             wf_result["trade_plan_models"] = trade_plan_models
+            wf_result["calibrator"] = calibrate_oos_probabilities(
+                wf_result.get("oos_proba_map", {}),
+                strategy_df,
+            )
 
         zoo_results[key] = wf_result
 
@@ -265,6 +258,7 @@ def meta_select_strategy(
         feature_cols = wf_result.get("feature_cols", [])
         oos_proba_map = wf_result.get("oos_proba_map") or {}
         trade_plan_models = wf_result.get("trade_plan_models", {})
+        calibrator = wf_result.get("calibrator")
 
         if (
             not isinstance(strategy_df, pd.DataFrame)
@@ -288,6 +282,7 @@ def meta_select_strategy(
             continue
 
         prob_array = _build_prob_array(strategy_df, oos_proba_map)
+        prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
         oos_bars = int(np.isfinite(prob_array).sum())
         if oos_bars == 0:
             metrics[key] = {
@@ -434,6 +429,7 @@ def verdict_output(
     model = winning_wf.get("final_model")
     feature_cols = winning_wf.get("feature_cols", [])
     winning_df = winning_wf.get("df")
+    calibrator = winning_wf.get("calibrator")
     last_row = (
         winning_df.iloc[-1].copy()
         if isinstance(winning_df, pd.DataFrame) and not winning_df.empty
@@ -442,7 +438,11 @@ def verdict_output(
 
     if model is not None and feature_cols and not last_row.empty:
         pred = predict_next_bar(
-            model, feature_cols, last_row, LIVE_CONFIDENCE_THRESHOLD
+            model,
+            feature_cols,
+            last_row,
+            LIVE_CONFIDENCE_THRESHOLD,
+            calibrator=calibrator,
         )
     else:
         pred = {

@@ -14,6 +14,7 @@ import pandas as pd
 import joblib
 import warnings
 
+from universal_ml_engine import EnsembleModel  # noqa: F401
 from universal_ml_engine import (
     prepare_intraday_thermodynamics,
     _compute_atr14,
@@ -100,6 +101,8 @@ def main():
         feature_cols_to_use = [line.strip() for line in f.readlines() if line.strip()]
 
     trade_plan_models = joblib.load(tp_path) if os.path.exists(tp_path) else {}
+    cal_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "calibrator")
+    calibrator = joblib.load(cal_path) if os.path.exists(cal_path) else None
 
     # ── 3. BUILD SHARED INTRADAY THERMODYNAMIC STATE ──────────────────────
     try:
@@ -192,6 +195,7 @@ def main():
         feature_cols_to_use,
         last_row,
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+        calibrator=calibrator,
     )
     close_price = float(last_row["close"])
     atr = float(last_row["atr14"]) if "atr14" in last_row else 150.0
@@ -250,7 +254,8 @@ def main():
         print(f"  Bar time    : {last_row['time']}")
     print(f"  Direction   : {pred['direction']}")
     print(
-        f"  Confidence  : {pred['confidence']:.1%} (Regressor Score: {pred['raw_score']:.3f})"
+        f"  Confidence  : {pred['confidence']:.1%} "
+        f"(Raw: {pred['raw_score']:.3f} | Cal: {pred['calibrated_score']:.3f})"
     )
     print(f"  Signal      : {pred['signal_strength']}")
     print("----------------------------------------------------------------------")

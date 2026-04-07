@@ -17,14 +17,17 @@ import numpy as np
 import pandas as pd
 
 from backtest_engine import calculate_metrics, generate_report, run_backtest
+from daily_ml_engine import LIVE_CONFIDENCE_THRESHOLD_DAILY
 from julia_bridge import (
     holographic_feature_engine_daily,
     kalman_structural_engine_daily,
     rv_feature_engine_daily,
     smc_feature_engine_daily,
 )
+from universal_ml_engine import EnsembleModel  # noqa: F401
 from universal_ml_engine import (
     _compute_atr14,
+    apply_calibrator_to_prob_array,
     build_report_data_lines,
     build_timeframe_selection,
     describe_selected_frame,
@@ -37,7 +40,6 @@ from universal_ml_engine import (
 warnings.filterwarnings("ignore")
 
 BARRIER_HORIZON_BARS_DAILY = 10
-LIVE_CONFIDENCE_THRESHOLD_DAILY = 0.56
 EOD_GATE_HOUR_DAILY = 24
 
 
@@ -123,6 +125,7 @@ def main() -> None:
 
     model_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "model")
     feat_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "features")
+    calibrator_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "calibrator")
     trade_plan_path = resolve_artifact_path(
         symbol_dir, file_prefix, "1D", "trade_plan_models"
     )
@@ -134,6 +137,9 @@ def main() -> None:
         return
 
     model = joblib.load(model_path)
+    calibrator = (
+        joblib.load(calibrator_path) if os.path.exists(calibrator_path) else None
+    )
     with open(feat_path, "r") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
     trade_plan_models = (
@@ -210,12 +216,16 @@ def main() -> None:
                 for ts in df_backtest["time"]
             ]
         )
+        prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
         print(
             f"  [=] OOS proba loaded. {np.isfinite(prob_array).sum()} honest OOS bars."
         )
+        if calibrator is not None:
+            print("  [=] Applied saved 1D calibrator to OOS probabilities.")
     else:
         print("  [!] No OOS map. Using in-sample (unreliable).")
         prob_array = model.predict(df_backtest[feature_cols])
+        prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
 
     prob_array_1d = np.full(len(df_backtest), np.nan)
 

@@ -12,7 +12,9 @@ import matplotlib.gridspec as gridspec
 # Suppress lightgbm warnings locally if needed
 import warnings
 
+from universal_ml_engine import EnsembleModel  # noqa: F401
 from universal_ml_engine import (
+    apply_calibrator_to_prob_array,
     merge_higher_tf,
     _compute_atr14,
     BARRIER_HORIZON_BARS,
@@ -599,6 +601,7 @@ def main():
     trade_plan_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "trade_plan_models"
     )
+    calibrator_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "calibrator")
     # NOTE: 1D conflict gating via separate model is not implemented.
 
     if not os.path.exists(model_path) or not os.path.exists(feat_path):
@@ -613,6 +616,9 @@ def main():
 
     trade_plan_models = (
         joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
+    )
+    calibrator = (
+        joblib.load(calibrator_path) if os.path.exists(calibrator_path) else None
     )
     if trade_plan_models:
         print(
@@ -707,21 +713,27 @@ def main():
                 for t in df_backtest["time"]
             ]
         )
+        prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
         print(
             f"  [=] OOS proba map loaded. {np.isfinite(prob_array).sum()} honest OOS prediction bars aligned to the full timeline."
         )
+        if calibrator is not None:
+            print("  [=] Applied saved 1H calibrator to OOS probabilities.")
     else:
         print(
             "  [!] WARNING: No OOS proba map found. Backtest uses in-sample predictions."
         )
         print("      Re-run universal_ml_engine.py to generate a clean OOS map.")
         X = df_backtest[feature_cols]
-        prob_array = model.predict_proba(X)[:, 1]
+        prob_array = np.clip(model.predict(X), 0.0, 1.0)
+        prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
 
     # ── E3 FIX: Use genuine OOS 1D probabilities for conflict gating ──
     # Load the saved 1D OOS proba map. Only bars with OOS 1D predictions use
     # the genuine probability. Bars without OOS data remain NaN and do not gate.
     oos_1d_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1D", "oos_proba")
+    cal_1d_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1D", "calibrator")
+    calibrator_1d = joblib.load(cal_1d_path) if os.path.exists(cal_1d_path) else None
     if os.path.exists(oos_1d_path):
         oos_proba_map_1d = joblib.load(oos_1d_path)
         date_to_prob_1d = {}
@@ -733,9 +745,12 @@ def main():
                 for t in df_backtest["time"]
             ]
         )
+        prob_array_1d = apply_calibrator_to_prob_array(prob_array_1d, calibrator_1d)
         print(
             f"  [=] 1D OOS proba map loaded. {len(date_to_prob_1d)} honest OOS days available for gating."
         )
+        if calibrator_1d is not None:
+            print("  [=] Applied saved 1D calibrator to conflict-gating probabilities.")
     else:
         print("  [!] WARNING: No 1D OOS proba map found. 1D filtering disabled.")
         prob_array_1d = np.full(len(df_backtest), np.nan)

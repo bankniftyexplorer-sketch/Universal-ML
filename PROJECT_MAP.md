@@ -29,7 +29,8 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 - Feature math lives in Julia kernels, called from Python bridges.
 - `julia_bridge.py` is the only supported Python interface to `ToonMath.jl`, and it shifts higher-timeframe timestamps to bar-close availability before Julia dispatch or Python-side HTF projection mapping.
 - `holographic_engine.py` is a frozen legacy module; only its feature-selection helpers remain live.
-- LightGBM is the model layer.
+- LightGBM now trains as a 3-member ensemble in both active lanes.
+- OOS probability maps are isotonic-calibrated and the fitted calibrators are saved as artifacts.
 - Backtests and live inference reuse saved artifacts instead of rebuilding everything from scratch.
 - Saved-artifact accuracy can be checked without retraining via `accuracy_guardrail.py`.
 
@@ -42,14 +43,14 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `ops/systemd/user/universal-ml-vault-autosync.service` | User-level systemd unit template for starting the vault auto-sync supervisor at login | You want the auto-sync loop to come up automatically with the system session |
 | `vault_engine.py` | Root-level compatibility shim that re-exports `DataVault` | A root script imports `vault_engine` directly |
 | `inference_bridge.py` | Reads DB, attaches `data_quality`, and enforces the strict runtime gate on `FAIL` quality by default | You care about how scripts fetch market data |
-| `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants | You care about the intraday core |
-| `daily_ml_engine.py` | Main `1D` trainer | You care about the daily core |
+| `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants, nested consensus feature selection, ensemble model wrapper, and probability calibration | You care about the intraday core |
+| `daily_ml_engine.py` | Main `1D` trainer with the same nested-selection, ensemble, and calibration contract | You care about the daily core |
 | `backtest_engine.py` | `1H` backtest/report generator | You care about intraday replay and equity curve |
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
 | `live_inference.py` | Fast `1H` signal path without retraining | You care about current live signal |
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
 | `accuracy_guardrail.py` | Rebuilds model-ready frames, replays saved OOS maps, compares against a local baseline | You care about proving an update did or did not change saved-artifact accuracy |
-| `holographic_engine.py` | Frozen legacy module; only `feature_selection_pipeline`, `correlation_filter`, and `phase1_ranking` remain live | You care about feature selection or legacy context |
+| `holographic_engine.py` | Frozen legacy module; only the selection helpers (`feature_selection_pipeline`, `correlation_filter`, `phase1_ranking`) remain live | You care about feature selection or legacy context |
 | `julia_bridge.py` | Only supported Python-to-Julia adapter for holographic, SMC, Kalman, realized-volatility, target, and backtest helper kernels; it also enforces higher-timeframe close-availability alignment | You care about bridge contracts or array prep |
 | `ToonMath.jl` | Fast holographic, SMC, Kalman, and realized-volatility extraction plus target-generation and replay kernels | You care about core math/performance |
 | `shadow_brain.py` | Optional meta-model trained from prior trade outcomes and used as a veto layer in live inference | You care about veto/approval overlay |
@@ -97,14 +98,17 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 10. `universal_ml_engine.merge_higher_tf()` aligns higher-timeframe raw context onto the `1H` frame.
 11. `julia_bridge.add_target_fast()` creates labels from forward trade simulation.
    - directional trade-plan regressors treat targets as continuous kinetic scores and split direction with `target > 0.5` for long and `target < 0.5` for short
-12. `holographic_engine.feature_selection_pipeline()` reduces the combined feature set; it is the only live production export from that frozen legacy module.
-13. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation.
-14. `train_trade_plan_models()` fits the six `1H` exit quantile regressors with an inner validation slice, a `24`-bar purge gap, and LightGBM early stopping before saving them under the standard trade-plan artifact.
-15. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme.
-16. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV` SPOT-only feature-prep contract before consuming saved artifacts.
-17. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
-18. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
-19. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map without retraining.
+12. `universal_ml_engine.fold_consensus_feature_selection()` runs nested feature selection inside each walk-forward fold using `holographic_engine.correlation_filter()` and `phase1_ranking()`, then keeps the consensus feature set.
+13. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation with the shared ensemble trainer.
+14. `calibrate_oos_probabilities()` fits an isotonic calibrator from the saved OOS map and persists it beside the model artifact.
+15. `train_trade_plan_models()` fits the six `1H` exit quantile regressors with an inner validation slice, a `24`-bar purge gap, and dynamic minimum-sample guards before saving them under the standard trade-plan artifact.
+16. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme, now including the calibrator artifact.
+17. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV` SPOT-only feature-prep contract before consuming saved artifacts.
+18. `backtest_engine.py` and `meta_strategy_selector.py` now apply the saved calibrator to OOS probabilities before confidence gating or strategy ranking, so historical simulation matches the calibrated runtime path.
+19. `live_inference.py` applies the saved calibrator to the latest prediction, and `predict_next_bar()` also applies regime-aware confidence penalties from RV vol-of-vol and Kalman flat-regime checks.
+20. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
+21. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
+22. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
 
 ### `1D` daily lane
 
@@ -133,11 +137,13 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 10. `daily_ml_engine.compute_macro_regime()` adds compact `6M` and `12M` regime overlays.
 11. `daily_ml_engine.add_daily_confluence()` adds daily confluence terms.
 12. `julia_bridge.add_target_fast()` creates daily labels with the daily horizon settings.
-13. `feature_selection_pipeline()` plus `walk_forward_daily()` validate and train the final `1D` model.
-14. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme.
-15. Weak-confidence or stale latest-bar `1D` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
-16. `daily_backtest_engine.py` reconstructs the same `1D + RV + SMC + Kalman + macro-regime` feature space and replays the saved `1D` model.
-17. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map without retraining.
+13. `fold_consensus_feature_selection_daily()` performs the same nested consensus-selection contract as the `1H` lane before `walk_forward_daily()` trains the ensemble final model.
+14. `calibrate_oos_probabilities()` fits and saves a `1D` isotonic calibrator from the saved daily OOS map.
+15. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme, now including the calibrator artifact.
+16. The daily lane now uses its own calibrated confidence gate (`0.72` at present) instead of the intraday threshold because calibrated daily probabilities were too dense around the old shared gate.
+17. Weak-confidence or stale latest-bar `1D` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
+18. `daily_backtest_engine.py` reconstructs the same `1D + RV + SMC + Kalman + macro-regime` feature space, applies the saved daily calibrator to the OOS map, and replays the saved `1D` model.
+19. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
 
 ## Data contracts
 
@@ -185,6 +191,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1H_model.pkl`
 - `{symbol}_1H_features.txt`
 - `{symbol}_1H_oos_proba.pkl`
+- `{symbol}_1H_calibrator.pkl`
 - `{symbol}_1H_trade_plan_models.pkl`
 - `{symbol}_1H_ml_report.png`
 - `{symbol}_1H_backtest_report.png`
@@ -194,6 +201,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1D_model.pkl`
 - `{symbol}_1D_features.txt`
 - `{symbol}_1D_oos_proba.pkl`
+- `{symbol}_1D_calibrator.pkl`
 - `{symbol}_1D_trade_plan_models.pkl`
 - `{symbol}_1D_ml_report.png`
 - `{symbol}_1D_backtest_report.png`
@@ -215,8 +223,9 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - root scripts may import `vault_engine.py`, which is a compatibility shim over `data_vault/vault_engine.py`.
 - `inference_bridge.py` reads the database, materializes sync-quality metadata, and blocks `FAIL` frames by default.
 - `universal_ml_engine.py` and `daily_ml_engine.py` are the training roots.
+- `universal_ml_engine.py` also defines the ensemble wrapper used by saved model pickles.
 - `julia_bridge.py` is the only supported adapter into `ToonMath.jl`; Python code should not include or reference `ToonMath.jl` directly.
-- `holographic_engine.py` is a frozen legacy file whose only live exports are `feature_selection_pipeline`, `correlation_filter`, and `phase1_ranking`.
+- `holographic_engine.py` is a frozen legacy file whose only live selection helpers are `feature_selection_pipeline`, `correlation_filter`, and `phase1_ranking`.
 - `backtest_engine.py` and `daily_backtest_engine.py` depend on saved model artifacts.
 - `live_inference.py` depends on saved `1H` artifacts, the latest DB state, and optionally `shadow_brain.py`.
 - `meta_strategy_selector.py` depends on the same reconstructed `1H` feature space as the training lane.

@@ -15,6 +15,7 @@ import argparse
 import os
 import subprocess
 import sys
+from sklearn.isotonic import IsotonicRegression
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -28,12 +29,12 @@ from julia_bridge import (
     add_target_fast as add_target,
 )
 from data_vault.symbol_identity import extract_symbol_payload, parse_symbol_payload
-from holographic_engine import (
-    feature_selection_pipeline,
-)
 from numba import njit
 
 warnings.filterwarnings("ignore")
+
+if __name__ == "__main__":
+    sys.modules.setdefault("universal_ml_engine", sys.modules[__name__])
 
 # Execution/training alignment constants
 BARRIER_ATR_MULT = 1.25
@@ -62,6 +63,12 @@ TIME_COL_CANDIDATES = (
 )
 MESSAGE_COL_CANDIDATES = ("Message", "message")
 MODEL_N_JOBS = 4
+FINAL_FEAT_BUDGET = 40  # Max features in final model
+# Regime gating thresholds (tunable — calibrate per-instrument if needed)
+REGIME_VOV_PENALTY_THRESHOLD = 2.0
+REGIME_VOV_PENALTY_VALUE = 0.03
+REGIME_KF_FLAT_THRESHOLD = 0.1
+REGIME_KF_FLAT_PENALTY_VALUE = 0.02
 TRADE_PLAN_LABEL_COLS = (
     "long_mfe_atr",
     "long_mae_atr",
@@ -134,6 +141,31 @@ FORECAST_STALE_THRESHOLDS = {
     "1D": pd.Timedelta(days=4),
 }
 PRIMARY_ASSET_CLASS = "SPOT"
+
+
+class EnsembleModel:
+    """Drop-in LightGBM ensemble wrapper used by saved artifacts."""
+
+    def __init__(self, models: list, weights: list[float] | None = None):
+        self.models = models
+        self.weights = (
+            [w / sum(weights) for w in weights]
+            if weights
+            else [1.0 / len(models)] * len(models)
+        )
+
+    def predict(self, X):
+        preds = np.stack([model.predict(X) for model in self.models], axis=0)
+        return (preds * np.array(self.weights, dtype=float).reshape(-1, 1)).sum(axis=0)
+
+    @property
+    def feature_importances_(self):
+        return np.stack(
+            [model.feature_importances_ for model in self.models], axis=0
+        ).mean(axis=0)
+
+
+EnsembleModel.__module__ = "universal_ml_engine"
 
 
 def _sorted_timeframe_copy(df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -804,24 +836,61 @@ def simulate_trade_path_from_arrays(
 # ─────────────────────────────────────────────
 
 
-def _build_lgbm_model() -> lgb.LGBMRegressor:
-    return lgb.LGBMRegressor(
-        n_estimators=800,
-        learning_rate=0.02,
-        num_leaves=31,
-        max_depth=5,
-        min_child_samples=40,
-        subsample=0.75,
-        subsample_freq=1,
-        colsample_bytree=0.75,
-        reg_alpha=0.15,
-        reg_lambda=0.15,
-        random_state=42,
-        n_jobs=MODEL_N_JOBS,
-        verbose=-1,
-        objective="regression",
-        metric="mae",
-    )
+def _build_lgbm_ensemble() -> list[lgb.LGBMRegressor]:
+    """Three complementary LightGBM configurations."""
+    return [
+        lgb.LGBMRegressor(
+            n_estimators=800,
+            learning_rate=0.02,
+            num_leaves=31,
+            max_depth=5,
+            min_child_samples=40,
+            subsample=0.75,
+            subsample_freq=1,
+            colsample_bytree=0.75,
+            reg_alpha=0.15,
+            reg_lambda=0.15,
+            random_state=42,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            objective="regression",
+            metric="mae",
+        ),
+        lgb.LGBMRegressor(
+            n_estimators=600,
+            learning_rate=0.03,
+            num_leaves=15,
+            max_depth=3,
+            min_child_samples=60,
+            subsample=0.70,
+            subsample_freq=1,
+            colsample_bytree=0.65,
+            reg_alpha=0.30,
+            reg_lambda=0.30,
+            random_state=123,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            objective="regression",
+            metric="mae",
+        ),
+        lgb.LGBMRegressor(
+            n_estimators=500,
+            learning_rate=0.015,
+            num_leaves=63,
+            max_depth=7,
+            min_child_samples=30,
+            subsample=0.80,
+            subsample_freq=1,
+            colsample_bytree=0.80,
+            reg_alpha=0.10,
+            reg_lambda=0.10,
+            random_state=7,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            objective="regression",
+            metric="mae",
+        ),
+    ]
 
 
 def _build_lgbm_regressor(alpha: float) -> lgb.LGBMRegressor:
@@ -846,7 +915,7 @@ def _build_lgbm_regressor(alpha: float) -> lgb.LGBMRegressor:
 
 def _fit_lgbm_with_inner_validation(
     X_train_full: pd.DataFrame, y_train_full: pd.Series
-) -> tuple[lgb.LGBMRegressor, pd.DataFrame, pd.Series]:
+) -> tuple[EnsembleModel, pd.DataFrame, pd.Series]:
     inner_val_size = max(100, int(len(X_train_full) * 0.15))
     inner_val_size = min(inner_val_size, len(X_train_full) - 1)
     if inner_val_size <= 0:
@@ -871,18 +940,20 @@ def _fit_lgbm_with_inner_validation(
     X_val_inner = X_train_full.iloc[-inner_val_size:]
     y_val_inner = y_train_full.iloc[-inner_val_size:]
 
-    model = _build_lgbm_model()
-    model.fit(
-        X_train_inner,
-        y_train_inner,
-        eval_set=[(X_val_inner, y_val_inner)],
-        eval_metric="mae",
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=60, verbose=False),
-            lgb.log_evaluation(period=10000),
-        ],
-    )
-    return model, X_val_inner, y_val_inner
+    fitted_models: list[lgb.LGBMRegressor] = []
+    for model in _build_lgbm_ensemble():
+        model.fit(
+            X_train_inner,
+            y_train_inner,
+            eval_set=[(X_val_inner, y_val_inner)],
+            eval_metric="mae",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=60, verbose=False),
+                lgb.log_evaluation(period=10000),
+            ],
+        )
+        fitted_models.append(model)
+    return EnsembleModel(fitted_models), X_val_inner, y_val_inner
 
 
 def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
@@ -906,10 +977,14 @@ def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
             .dropna(subset=feature_cols + [label_col])
             .copy()
         )
-        if len(train_df) < 300:
+        min_samples = max(100, min(300, int(len(df) * 0.05)))
+        if len(train_df) < min_samples:
+            print(
+                f"    [Trade Plan] {key}: {len(train_df)} samples < {min_samples}. Skipping."
+            )
             continue
 
-        inner_val_size = max(60, int(len(train_df) * 0.15))
+        inner_val_size = max(30, int(len(train_df) * 0.15))
         purge_gap = BARRIER_HORIZON_BARS
         purged_end = -(inner_val_size + purge_gap)
         if abs(purged_end) >= len(train_df):
@@ -1146,6 +1221,204 @@ def walk_forward(
         "overall_baseline_up": np.mean([r["baseline_up"] for r in results]),
         "oos_proba_map": oos_proba_map,
     }
+
+
+def fold_consensus_feature_selection(
+    df: pd.DataFrame,
+    candidate_feature_cols: list,
+    n_splits: int = 10,
+    min_train_bars: int = 2000,
+    test_size_ratio: float = 0.15,
+    purge_gap: int = 24,
+    consensus_threshold: float = 0.50,
+    target_col: str = "target",
+) -> tuple[list, dict]:
+    """
+    Nested feature selection: select features inside each walk-forward fold
+    using only train data. Keep features appearing in the consensus set.
+    """
+    from holographic_engine import correlation_filter, phase1_ranking
+
+    df = df.dropna(
+        subset=[c for c in candidate_feature_cols if c in df.columns] + [target_col]
+    ).reset_index(drop=True)
+    n = len(df)
+
+    if n < min_train_bars:
+        print(f"  [Nested] Not enough data. Need {min_train_bars}, got {n}.")
+        return [], {}
+
+    split_points = []
+    current_train_end = min_train_bars
+    while current_train_end < n:
+        test_window_size = max(int(n * test_size_ratio), 100)
+        test_end = min(current_train_end + test_window_size, n)
+        if test_end <= current_train_end or (test_end - current_train_end) < 50:
+            break
+        split_points.append((current_train_end, test_end))
+        current_train_end = test_end
+        if len(split_points) >= n_splits:
+            break
+
+    if not split_points:
+        print("  [Nested] No valid split points.")
+        return [], {}
+
+    valid_candidates = [c for c in candidate_feature_cols if c in df.columns]
+    print(f"\n  [Nested] {len(split_points)} folds, {len(valid_candidates)} candidates")
+
+    feature_votes: dict[str, int] = {}
+    fold_results = []
+
+    for i, (train_end, test_end) in enumerate(split_points):
+        purged_train_end = max(0, train_end - purge_gap)
+        train_df = df.iloc[:purged_train_end]
+        test_df = df.iloc[train_end:test_end]
+
+        if len(test_df) == 0 or len(train_df) < 200:
+            continue
+
+        try:
+            fold_features = correlation_filter(train_df, valid_candidates)
+            fold_features = phase1_ranking(
+                train_df, fold_features, target_col=target_col
+            )
+            fold_features = fold_features[:FINAL_FEAT_BUDGET]
+        except Exception as exc:
+            print(f"  [Nested] Fold {i + 1} feature selection failed: {exc}")
+            continue
+
+        if not fold_features:
+            continue
+
+        for feat in fold_features:
+            feature_votes[feat] = feature_votes.get(feat, 0) + 1
+
+        X_train = train_df[fold_features]
+        y_train = train_df[target_col]
+        try:
+            model, _, _ = _fit_lgbm_with_inner_validation(X_train, y_train)
+        except Exception as exc:
+            print(f"  [Nested] Fold {i + 1} training failed: {exc}")
+            continue
+
+        X_test = test_df[fold_features]
+        y_test = test_df[target_col]
+        preds = model.predict(X_test)
+        true_binary = (y_test > 0.5).astype(int)
+        pred_binary = (preds > 0.5).astype(int)
+        acc = float((true_binary == pred_binary).mean())
+        high_conf_mask = (preds >= LIVE_CONFIDENCE_THRESHOLD) | (
+            preds <= (1.0 - LIVE_CONFIDENCE_THRESHOLD)
+        )
+        conf_acc = (
+            float((pred_binary[high_conf_mask] == true_binary[high_conf_mask]).mean())
+            if high_conf_mask.sum() > 0
+            else float("nan")
+        )
+
+        print(
+            f"  [Nested] Fold {i + 1:>2} | Train:{len(X_train):>5} Test:{len(X_test):>5} | "
+            f"Acc:{acc:.3f} ConfAcc:{conf_acc:.3f} | Feats:{len(fold_features)}"
+        )
+        fold_results.append(
+            {
+                "split": i + 1,
+                "train_bars": len(X_train),
+                "test_bars": len(X_test),
+                "accuracy": acc,
+                "acc_high_conf": conf_acc,
+                "high_conf_pct": float(high_conf_mask.sum() / len(preds)),
+                "baseline_up": float(true_binary.mean()),
+            }
+        )
+
+    min_votes = max(1, int(len(split_points) * consensus_threshold))
+    consensus_features = [
+        feat
+        for feat, votes in sorted(feature_votes.items(), key=lambda item: -item[1])
+        if votes >= min_votes
+    ][:FINAL_FEAT_BUDGET]
+
+    print(
+        f"\n  [Nested] Consensus: {len(consensus_features)} features "
+        f"(voted in >={min_votes}/{len(split_points)} folds)"
+    )
+
+    if not consensus_features:
+        print("  [Nested] FATAL: No features survived consensus vote.")
+        return [], {}
+
+    print("  [Nested] Final walk-forward with consensus features...")
+    final_wf = walk_forward(
+        df,
+        consensus_features,
+        n_splits=n_splits,
+        min_train_bars=min_train_bars,
+        test_size_ratio=test_size_ratio,
+        purge_gap=purge_gap,
+    )
+    if final_wf:
+        final_wf["nested_fold_results"] = fold_results
+        final_wf["feature_votes"] = feature_votes
+    return consensus_features, final_wf
+
+
+def calibrate_oos_probabilities(
+    oos_proba_map: dict,
+    df: pd.DataFrame,
+    target_col: str = "target",
+) -> IsotonicRegression | None:
+    """Fit isotonic regression on OOS predictions vs actual outcomes."""
+    if not oos_proba_map or "time" not in df.columns:
+        return None
+
+    matched_raw: list[float] = []
+    matched_true: list[float] = []
+    for _, row in df.iterrows():
+        ts = pd.Timestamp(row["time"])
+        if ts in oos_proba_map:
+            matched_raw.append(float(oos_proba_map[ts]))
+            matched_true.append(1.0 if row[target_col] > 0.5 else 0.0)
+
+    if len(matched_raw) < 100:
+        print(f"  [Calibration] Only {len(matched_raw)} OOS bars — skipping.")
+        return None
+
+    raw = np.array(matched_raw, dtype=float)
+    true = np.array(matched_true, dtype=float)
+    calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+    calibrator.fit(raw, true)
+
+    cal_preds = calibrator.predict(raw)
+    raw_brier = float(np.mean((raw - true) ** 2))
+    cal_brier = float(np.mean((cal_preds - true) ** 2))
+    print(
+        f"  [Calibration] Brier: raw={raw_brier:.4f} → calibrated={cal_brier:.4f} "
+        f"({len(matched_raw)} OOS bars)"
+    )
+    return calibrator
+
+
+def apply_calibrator_to_prob_array(
+    prob_array: np.ndarray,
+    calibrator=None,
+) -> np.ndarray:
+    """Apply a saved calibrator to finite probabilities while preserving NaNs."""
+    result = np.asarray(prob_array, dtype=float).copy()
+    if calibrator is None:
+        return result
+
+    finite_mask = np.isfinite(result)
+    if not finite_mask.any():
+        return result
+
+    result[finite_mask] = np.clip(
+        calibrator.predict(result[finite_mask]),
+        0.0,
+        1.0,
+    )
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -1419,17 +1692,31 @@ def save_report(
 
 
 def predict_next_bar(
-    model: lgb.LGBMRegressor,
+    model,
     feature_cols: list,
     row: pd.Series,
     confidence_threshold: float = LIVE_CONFIDENCE_THRESHOLD,
+    calibrator=None,
 ) -> dict:
     X_inf = row[feature_cols].to_frame().T.astype(float)
-    proba_up = float(np.clip(model.predict(X_inf)[0], 0.0, 1.0))
+    raw_score = float(np.clip(model.predict(X_inf)[0], 0.0, 1.0))
+    if calibrator is not None:
+        proba_up = float(np.clip(calibrator.predict([raw_score])[0], 0.0, 1.0))
+    else:
+        proba_up = raw_score
 
     direction = "UP" if proba_up > 0.5 else "DOWN"
-    # Confidence in Regressor: distance from 0.5 mapped to 0-100% equivalent
-    confidence = max(proba_up, 1.0 - proba_up)
+    base_confidence = max(proba_up, 1.0 - proba_up)
+
+    regime_penalty = 0.0
+    if "rv_1h_vov" in row.index and np.isfinite(row["rv_1h_vov"]):
+        if abs(float(row["rv_1h_vov"])) > REGIME_VOV_PENALTY_THRESHOLD:
+            regime_penalty += REGIME_VOV_PENALTY_VALUE
+    if "kf_regime" in row.index and np.isfinite(row["kf_regime"]):
+        if abs(float(row["kf_regime"])) < REGIME_KF_FLAT_THRESHOLD:
+            regime_penalty += REGIME_KF_FLAT_PENALTY_VALUE
+
+    confidence = max(0.50, base_confidence - regime_penalty)
 
     if confidence >= confidence_threshold:
         signal = "STRONG"
@@ -1440,7 +1727,9 @@ def predict_next_bar(
         "direction": direction,
         "confidence": confidence,
         "signal_strength": signal,
-        "raw_score": proba_up,
+        "raw_score": raw_score,
+        "calibrated_score": proba_up,
+        "regime_penalty": regime_penalty,
     }
 
 
@@ -1678,6 +1967,7 @@ ARTIFACT_NAME_SCHEME = {
         "model": "{prefix}_1H_model.pkl",
         "features": "{prefix}_1H_features.txt",
         "oos_proba": "{prefix}_1H_oos_proba.pkl",
+        "calibrator": "{prefix}_1H_calibrator.pkl",
         "trade_plan_models": "{prefix}_1H_trade_plan_models.pkl",
         "ml_report": "{prefix}_1H_ml_report.png",
         "backtest_report": "{prefix}_1H_backtest_report.png",
@@ -1686,6 +1976,7 @@ ARTIFACT_NAME_SCHEME = {
         "model": "{prefix}_1D_model.pkl",
         "features": "{prefix}_1D_features.txt",
         "oos_proba": "{prefix}_1D_oos_proba.pkl",
+        "calibrator": "{prefix}_1D_calibrator.pkl",
         "trade_plan_models": "{prefix}_1D_trade_plan_models.pkl",
         "ml_report": "{prefix}_1D_ml_report.png",
         "backtest_report": "{prefix}_1D_backtest_report.png",
@@ -1698,6 +1989,7 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "model": "{prefix}_ultimate_model.pkl",
         "features": "{prefix}_ultimate_features.txt",
         "oos_proba": "{prefix}_oos_proba.pkl",
+        "calibrator": "{prefix}_1H_calibrator.pkl",
         "trade_plan_models": "{prefix}_trade_plan_models.pkl",
         "ml_report": "{prefix}_ml_report_ultimate.png",
         "backtest_report": "{prefix}_backtest_report.png",
@@ -1706,6 +1998,7 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "model": "{prefix}_daily_model.pkl",
         "features": "{prefix}_daily_features.txt",
         "oos_proba": "{prefix}_daily_oos_proba.pkl",
+        "calibrator": "{prefix}_1D_calibrator.pkl",
         "trade_plan_models": "{prefix}_daily_trade_plan_models.pkl",
         "ml_report": "{prefix}_daily_ml_report.png",
         "backtest_report": "{prefix}_daily_backtest_report.png",
@@ -1943,7 +2236,7 @@ if __name__ == "__main__":
         f"  [TOON v4.0] Target (UP=1) distribution : {df_model_ready['target'].mean():.1%}"
     )
 
-    # ── Step 6: Feature selection pipeline (1800 → 40) ────────────────────
+    # ── Step 6+7: Nested feature selection + walk-forward ─────────────────
     MIN_TRAIN_BARS = 2500
     TEST_SIZE_RATIO = 0.15
 
@@ -1952,32 +2245,23 @@ if __name__ == "__main__":
         print(f"\n  Error: Not enough {SYMBOL} data for walk-forward validation.")
         exit()
 
-    feature_cols, sel_meta = feature_selection_pipeline(
+    feature_cols, wf_results = fold_consensus_feature_selection(
         df_model_ready,
         all_holo_cols,
-        walk_forward_fn=walk_forward,
-        target_col="target",
+        n_splits=10,
         min_train_bars=MIN_TRAIN_BARS,
         test_size_ratio=TEST_SIZE_RATIO,
-        n_splits=10,
     )
 
-    print(
-        f"\n  [TOON v4.0] Final feature count into walk_forward : {len(feature_cols)}"
-    )
+    if not feature_cols or not wf_results:
+        print("  [TOON] Nested feature selection failed. Aborting.")
+        exit()
 
-    # ── Step 7: Final walk-forward validation ─────────────────────────────
+    print(f"\n  [TOON v6.0] Consensus feature count: {len(feature_cols)}")
+
     print("\n" + "=" * 70)
     print("  Walk-Forward Validation — TOON v4.0 Holographic Model")
     print("=" * 70)
-
-    wf_results = walk_forward(
-        df_model_ready,
-        feature_cols,
-        n_splits=10,
-        min_train_bars=MIN_TRAIN_BARS,
-        test_size_ratio=TEST_SIZE_RATIO,
-    )
 
     if wf_results:
         splits_df = pd.DataFrame(wf_results["splits"])
@@ -2036,6 +2320,13 @@ if __name__ == "__main__":
         print(
             f"  OOS proba map saved to '{oos_path}' ({len(wf_results['oos_proba_map'])} bars)"
         )
+        calibrator = calibrate_oos_probabilities(
+            wf_results["oos_proba_map"], df_model_ready
+        )
+        if calibrator is not None:
+            cal_path = artifact_paths_1h["calibrator"]
+            joblib.dump(calibrator, cal_path)
+            print(f"  Calibrator saved → '{cal_path}'")
 
         model = wf_results["final_model"]
         feature_cols_to_use = wf_results["feature_cols"]
@@ -2057,6 +2348,7 @@ if __name__ == "__main__":
             feature_cols_to_use,
             last_row,
             confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+            calibrator=calibrator,
         )
         primary_asset_label = str(df_1h.attrs.get("selected_asset_class", "PRIMARY"))
         close_price = float(last_row["close"])
@@ -2077,7 +2369,8 @@ if __name__ == "__main__":
             print(f"  Bar time    : {last_row['time']}")
         print(f"  Direction   : {pred['direction']}")
         print(
-            f"  Confidence  : {pred['confidence']:.1%} (Regressor Score: {pred['raw_score']:.3f})"
+            f"  Confidence  : {pred['confidence']:.1%} "
+            f"(Raw: {pred['raw_score']:.3f} | Cal: {pred['calibrated_score']:.3f})"
         )
         print(f"  Signal      : {pred['signal_strength']}")
         print("----------------------------------------------------------------------")

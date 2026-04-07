@@ -21,7 +21,6 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from holographic_engine import feature_selection_pipeline
 from julia_bridge import (
     add_target_fast,
     holographic_feature_engine_daily,
@@ -30,12 +29,13 @@ from julia_bridge import (
     smc_feature_engine_daily,
 )
 from universal_ml_engine import (
-    LIVE_CONFIDENCE_THRESHOLD,
+    EnsembleModel,
     MODEL_N_JOBS,
     TRADE_PLAN_LABEL_COLS,
     _compute_atr14,
     build_report_data_lines,
     build_timeframe_selection,
+    calibrate_oos_probabilities,
     describe_selected_frame,
     inject_thermodynamic_basis,
     migrate_legacy_artifacts,
@@ -52,8 +52,10 @@ warnings.filterwarnings("ignore")
 BARRIER_HORIZON_BARS_DAILY = 10
 BARRIER_ATR_MULT_DAILY = 1.25
 PURGE_GAP_DAILY = 5
+FINAL_FEAT_BUDGET = 40  # Max features in final model
 MIN_TRAIN_BARS_DAILY = 500
 TEST_SIZE_RATIO_DAILY = 0.15
+LIVE_CONFIDENCE_THRESHOLD_DAILY = 0.72
 
 NON_FEATURE_COLS_DAILY = {
     "time",
@@ -203,30 +205,66 @@ def add_daily_confluence(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _build_lgbm_model_daily() -> lgb.LGBMRegressor:
-    return lgb.LGBMRegressor(
-        n_estimators=800,
-        learning_rate=0.02,
-        num_leaves=31,
-        max_depth=5,
-        min_child_samples=40,
-        subsample=0.75,
-        subsample_freq=1,
-        colsample_bytree=0.75,
-        reg_alpha=0.15,
-        reg_lambda=0.15,
-        random_state=42,
-        n_jobs=MODEL_N_JOBS,
-        verbose=-1,
-        objective="regression",
-        metric="mae",
-    )
+def _build_lgbm_ensemble_daily() -> list[lgb.LGBMRegressor]:
+    return [
+        lgb.LGBMRegressor(
+            n_estimators=800,
+            learning_rate=0.02,
+            num_leaves=31,
+            max_depth=5,
+            min_child_samples=40,
+            subsample=0.75,
+            subsample_freq=1,
+            colsample_bytree=0.75,
+            reg_alpha=0.15,
+            reg_lambda=0.15,
+            random_state=42,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            objective="regression",
+            metric="mae",
+        ),
+        lgb.LGBMRegressor(
+            n_estimators=600,
+            learning_rate=0.03,
+            num_leaves=15,
+            max_depth=3,
+            min_child_samples=60,
+            subsample=0.70,
+            subsample_freq=1,
+            colsample_bytree=0.65,
+            reg_alpha=0.30,
+            reg_lambda=0.30,
+            random_state=123,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            objective="regression",
+            metric="mae",
+        ),
+        lgb.LGBMRegressor(
+            n_estimators=500,
+            learning_rate=0.015,
+            num_leaves=63,
+            max_depth=7,
+            min_child_samples=30,
+            subsample=0.80,
+            subsample_freq=1,
+            colsample_bytree=0.80,
+            reg_alpha=0.10,
+            reg_lambda=0.10,
+            random_state=7,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            objective="regression",
+            metric="mae",
+        ),
+    ]
 
 
 def _fit_lgbm_with_inner_validation_daily(
     X_train_full: pd.DataFrame,
     y_train_full: pd.Series,
-) -> tuple[lgb.LGBMRegressor, pd.DataFrame, pd.Series]:
+) -> tuple[EnsembleModel, pd.DataFrame, pd.Series]:
     inner_val_size = max(100, int(len(X_train_full) * 0.15))
     inner_val_size = min(inner_val_size, len(X_train_full) - 1)
     if inner_val_size <= 0:
@@ -249,18 +287,20 @@ def _fit_lgbm_with_inner_validation_daily(
     X_val_inner = X_train_full.iloc[-inner_val_size:]
     y_val_inner = y_train_full.iloc[-inner_val_size:]
 
-    model = _build_lgbm_model_daily()
-    model.fit(
-        X_train_inner,
-        y_train_inner,
-        eval_set=[(X_val_inner, y_val_inner)],
-        eval_metric="mae",
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=60, verbose=False),
-            lgb.log_evaluation(period=10000),
-        ],
-    )
-    return model, X_val_inner, y_val_inner
+    fitted_models: list[lgb.LGBMRegressor] = []
+    for model in _build_lgbm_ensemble_daily():
+        model.fit(
+            X_train_inner,
+            y_train_inner,
+            eval_set=[(X_val_inner, y_val_inner)],
+            eval_metric="mae",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=60, verbose=False),
+                lgb.log_evaluation(period=10000),
+            ],
+        )
+        fitted_models.append(model)
+    return EnsembleModel(fitted_models), X_val_inner, y_val_inner
 
 
 def walk_forward_daily(
@@ -326,8 +366,8 @@ def walk_forward_daily(
         pred_binary = (preds > 0.5).astype(int)
         acc = float((true_binary == pred_binary).mean())
 
-        high_conf_mask = (preds >= LIVE_CONFIDENCE_THRESHOLD) | (
-            preds <= (1.0 - LIVE_CONFIDENCE_THRESHOLD)
+        high_conf_mask = (preds >= LIVE_CONFIDENCE_THRESHOLD_DAILY) | (
+            preds <= (1.0 - LIVE_CONFIDENCE_THRESHOLD_DAILY)
         )
         if high_conf_mask.sum() > 0:
             conf_acc = float(
@@ -341,7 +381,7 @@ def walk_forward_daily(
 
         print(
             f"  Split {i + 1:>2} | Train: {len(X_train_full):>5} | Test: {len(X_test):>5} | "
-            f"Acc:{acc:.3f} | ConfAcc(>={LIVE_CONFIDENCE_THRESHOLD:.2f}):{conf_acc:.3f} | "
+            f"Acc:{acc:.3f} | ConfAcc(>={LIVE_CONFIDENCE_THRESHOLD_DAILY:.2f}):{conf_acc:.3f} | "
             f"ConfBars: {fraction_conf * 100:>4.1f}% | Baseline(UP):{baseline:.3f}"
         )
 
@@ -378,6 +418,145 @@ def walk_forward_daily(
         "overall_baseline_up": np.mean([r["baseline_up"] for r in results]),
         "oos_proba_map": oos_proba_map,
     }
+
+
+def fold_consensus_feature_selection_daily(
+    df: pd.DataFrame,
+    candidate_feature_cols: list,
+    n_splits: int = 10,
+    min_train_bars: int = MIN_TRAIN_BARS_DAILY,
+    test_size_ratio: float = TEST_SIZE_RATIO_DAILY,
+    purge_gap: int = PURGE_GAP_DAILY,
+    consensus_threshold: float = 0.50,
+    target_col: str = "target",
+) -> tuple[list, dict]:
+    from holographic_engine import correlation_filter, phase1_ranking
+
+    df = df.dropna(
+        subset=[c for c in candidate_feature_cols if c in df.columns] + [target_col]
+    ).reset_index(drop=True)
+    n = len(df)
+
+    if n < min_train_bars:
+        print(f"  [Nested Daily] Not enough data. Need {min_train_bars}, got {n}.")
+        return [], {}
+
+    split_points: list[tuple[int, int]] = []
+    current_train_end = min_train_bars
+    while current_train_end < n:
+        test_window_size = max(int(n * test_size_ratio), 100)
+        test_end = min(current_train_end + test_window_size, n)
+        if test_end <= current_train_end or (test_end - current_train_end) < 50:
+            break
+        split_points.append((current_train_end, test_end))
+        current_train_end = test_end
+        if len(split_points) >= n_splits:
+            break
+
+    if not split_points:
+        print("  [Nested Daily] No valid split points.")
+        return [], {}
+
+    valid_candidates = [c for c in candidate_feature_cols if c in df.columns]
+    print(
+        f"\n  [Nested Daily] {len(split_points)} folds, {len(valid_candidates)} candidates"
+    )
+
+    feature_votes: dict[str, int] = {}
+    fold_results = []
+
+    for i, (train_end, test_end) in enumerate(split_points):
+        purged_train_end = max(0, train_end - purge_gap)
+        train_df = df.iloc[:purged_train_end]
+        test_df = df.iloc[train_end:test_end]
+
+        if len(test_df) == 0 or len(train_df) < 200:
+            continue
+
+        try:
+            fold_features = correlation_filter(train_df, valid_candidates)
+            fold_features = phase1_ranking(
+                train_df, fold_features, target_col=target_col
+            )
+            fold_features = fold_features[:FINAL_FEAT_BUDGET]
+        except Exception as exc:
+            print(f"  [Nested Daily] Fold {i + 1} feature selection failed: {exc}")
+            continue
+
+        if not fold_features:
+            continue
+
+        for feat in fold_features:
+            feature_votes[feat] = feature_votes.get(feat, 0) + 1
+
+        X_train = train_df[fold_features]
+        y_train = train_df[target_col]
+        try:
+            model, _, _ = _fit_lgbm_with_inner_validation_daily(X_train, y_train)
+        except Exception as exc:
+            print(f"  [Nested Daily] Fold {i + 1} training failed: {exc}")
+            continue
+
+        X_test = test_df[fold_features]
+        y_test = test_df[target_col]
+        preds = model.predict(X_test)
+        true_binary = (y_test > 0.5).astype(int)
+        pred_binary = (preds > 0.5).astype(int)
+        acc = float((true_binary == pred_binary).mean())
+        high_conf_mask = (preds >= LIVE_CONFIDENCE_THRESHOLD_DAILY) | (
+            preds <= (1.0 - LIVE_CONFIDENCE_THRESHOLD_DAILY)
+        )
+        conf_acc = (
+            float((pred_binary[high_conf_mask] == true_binary[high_conf_mask]).mean())
+            if high_conf_mask.sum() > 0
+            else float("nan")
+        )
+
+        print(
+            f"  [Nested Daily] Fold {i + 1:>2} | Train:{len(X_train):>5} "
+            f"Test:{len(X_test):>5} | Acc:{acc:.3f} ConfAcc:{conf_acc:.3f} | "
+            f"Feats:{len(fold_features)}"
+        )
+        fold_results.append(
+            {
+                "split": i + 1,
+                "train_bars": len(X_train),
+                "test_bars": len(X_test),
+                "accuracy": acc,
+                "acc_high_conf": conf_acc,
+                "high_conf_pct": float(high_conf_mask.sum() / len(preds)),
+                "baseline_up": float(true_binary.mean()),
+            }
+        )
+
+    min_votes = max(1, int(len(split_points) * consensus_threshold))
+    consensus_features = [
+        feat
+        for feat, votes in sorted(feature_votes.items(), key=lambda item: -item[1])
+        if votes >= min_votes
+    ][:FINAL_FEAT_BUDGET]
+
+    print(
+        f"\n  [Nested Daily] Consensus: {len(consensus_features)} features "
+        f"(voted in >={min_votes}/{len(split_points)} folds)"
+    )
+    if not consensus_features:
+        print("  [Nested Daily] FATAL: No features survived consensus vote.")
+        return [], {}
+
+    print("  [Nested Daily] Final walk-forward with consensus features...")
+    final_wf = walk_forward_daily(
+        df,
+        consensus_features,
+        n_splits=n_splits,
+        min_train_bars=min_train_bars,
+        test_size_ratio=test_size_ratio,
+        purge_gap=purge_gap,
+    )
+    if final_wf:
+        final_wf["nested_fold_results"] = fold_results
+        final_wf["feature_votes"] = feature_votes
+    return consensus_features, final_wf
 
 
 def _pick_primary_1d(tf_maps: dict) -> pd.DataFrame | None:
@@ -555,31 +734,22 @@ def main() -> None:
         print(f"\n  Error: Not enough {symbol} daily data for walk-forward validation.")
         raise SystemExit(1)
 
-    feature_cols, _ = feature_selection_pipeline(
+    feature_cols, wf_results = fold_consensus_feature_selection_daily(
         df_model_ready,
         all_holo_cols,
-        walk_forward_fn=walk_forward_daily,
-        target_col="target",
+        n_splits=10,
         min_train_bars=MIN_TRAIN_BARS_DAILY,
         test_size_ratio=TEST_SIZE_RATIO_DAILY,
-        n_splits=10,
     )
 
-    print(
-        f"\n  [TOON DAILY] Final feature count into walk_forward : {len(feature_cols)}"
-    )
+    if not feature_cols or not wf_results:
+        print("  [TOON DAILY] Nested feature selection failed. Aborting.")
+        raise SystemExit(1)
+
+    print(f"\n  [TOON DAILY v6.0] Consensus feature count: {len(feature_cols)}")
     print("\n" + "=" * 70)
     print("  Walk-Forward Validation — TOON v5.1 Daily Holographic Model")
     print("=" * 70)
-
-    wf_results = walk_forward_daily(
-        df_model_ready,
-        feature_cols,
-        n_splits=10,
-        min_train_bars=MIN_TRAIN_BARS_DAILY,
-        test_size_ratio=TEST_SIZE_RATIO_DAILY,
-        purge_gap=PURGE_GAP_DAILY,
-    )
     if not wf_results:
         print(
             "\nDaily walk-forward validation did not produce results. Please check errors above."
@@ -594,7 +764,7 @@ def main() -> None:
         f"  Overall Accuracy (All Signals)      : {wf_results['overall_accuracy']:.3f}"
     )
     print(
-        f"  Overall High-Conf Accuracy (>={LIVE_CONFIDENCE_THRESHOLD:.2f}) : "
+        f"  Overall High-Conf Accuracy (>={LIVE_CONFIDENCE_THRESHOLD_DAILY:.2f}) : "
         f"{splits_df['acc_high_conf'].mean():.3f}"
     )
     print(
@@ -632,6 +802,11 @@ def main() -> None:
         for col in wf_results["feature_cols"]:
             handle.write(f"{col}\n")
     joblib.dump(wf_results["oos_proba_map"], oos_path)
+    calibrator = calibrate_oos_probabilities(wf_results["oos_proba_map"], df_model_ready)
+    if calibrator is not None:
+        cal_path = artifact_paths_1d["calibrator"]
+        joblib.dump(calibrator, cal_path)
+        print(f"  1D calibrator saved to '{cal_path}'")
 
     tp_train_end = len(df_model_ready) - int(
         len(df_model_ready) * TEST_SIZE_RATIO_DAILY
@@ -656,7 +831,8 @@ def main() -> None:
         wf_results["final_model"],
         wf_results["feature_cols"],
         last_row,
-        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
+        calibrator=calibrator,
     )
     primary_asset_label = str(df_1d.attrs.get("selected_asset_class", "PRIMARY"))
     close_price = float(last_row["close"])
@@ -674,7 +850,7 @@ def main() -> None:
         pred,
         timeframe="1D",
         bar_time=last_row.get("time"),
-        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
         base_note=trade_plan["note"],
     )
     if pred["direction"] in {"UP", "DOWN"} and np.isfinite(trade_plan["sl"]):
@@ -699,7 +875,8 @@ def main() -> None:
     print(f"  Bar time    : {last_row['time']}")
     print(f"  Direction   : {pred['direction']}")
     print(
-        f"  Confidence  : {pred['confidence']:.1%} (Regressor Score: {pred['raw_score']:.3f})"
+        f"  Confidence  : {pred['confidence']:.1%} "
+        f"(Raw: {pred['raw_score']:.3f} | Cal: {pred['calibrated_score']:.3f})"
     )
     print(f"  Signal      : {pred['signal_strength']}")
     print("----------------------------------------------------------------------")
