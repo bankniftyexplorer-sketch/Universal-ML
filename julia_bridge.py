@@ -76,6 +76,49 @@ def _to_i64(arr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.int64)
 
 
+_HTF_FIXED_CLOSE_SHIFTS = {
+    "1D": pd.Timedelta(days=1),
+    "1W": pd.Timedelta(weeks=1),
+}
+_HTF_CALENDAR_CLOSE_SHIFTS = {
+    "1M": pd.DateOffset(months=1),
+    "3M": pd.DateOffset(months=3),
+    "6M": pd.DateOffset(months=6),
+    "12M": pd.DateOffset(months=12),
+}
+
+
+def _shift_htf_times_to_close(
+    series: pd.Series,
+    timeframe_label: str | None,
+) -> pd.Series:
+    """
+    Shift HTF origin timestamps to the moment the bar becomes fully observable.
+
+    The vault stores higher-timeframe bars at period origin. The 1H/1D lanes
+    must only see a higher-timeframe bar after that bar closes, so all bridge
+    alignments use close-availability timestamps rather than origin timestamps.
+    """
+    times = pd.to_datetime(series).reset_index(drop=True)
+    label = str(timeframe_label).strip().upper() if timeframe_label is not None else ""
+
+    fixed_shift = _HTF_FIXED_CLOSE_SHIFTS.get(label)
+    if fixed_shift is not None:
+        return times + fixed_shift
+
+    calendar_shift = _HTF_CALENDAR_CLOSE_SHIFTS.get(label)
+    if calendar_shift is not None:
+        next_times = times.shift(-1)
+        fallback = times + calendar_shift
+        return next_times.where(next_times.notna(), fallback)
+
+    return times
+
+
+def _htf_close_times_ns(src: pd.DataFrame, timeframe_label: str | None) -> np.ndarray:
+    return _times_to_ns(_shift_htf_times_to_close(src["time"], timeframe_label))
+
+
 def _compute_atr14_array(
     highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14
 ) -> np.ndarray:
@@ -215,7 +258,12 @@ def _prepare_kalman_frame(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return df.sort_values("time").reset_index(drop=True).copy()
 
 
-def _extract_kalman_inputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
+def _extract_kalman_inputs(
+    df: pd.DataFrame,
+    *,
+    timeframe_label: str | None = None,
+    align_to_close: bool = False,
+) -> dict[str, np.ndarray]:
     src = _prepare_kalman_frame(df)
     if src is None:
         raise ValueError("Kalman frame is missing or empty.")
@@ -241,8 +289,14 @@ def _extract_kalman_inputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
         atr = atr.copy()
         atr[invalid] = 1.0
 
+    time_ns = (
+        _htf_close_times_ns(src, timeframe_label)
+        if align_to_close
+        else _times_to_ns(src["time"])
+    )
+
     return {
-        "time": _times_to_ns(src["time"]),
+        "time": time_ns,
         "open": opens,
         "high": highs,
         "low": lows,
@@ -515,7 +569,11 @@ def _kalman_structural_engine(
         if frame is None:
             htf_states[label] = None
             continue
-        inputs = _extract_kalman_inputs(frame)
+        inputs = _extract_kalman_inputs(
+            frame,
+            timeframe_label=label,
+            align_to_close=True,
+        )
         state = _materialize_kalman_state(
             TM.compute_kalman_tf_state(
                 inputs["open"],
@@ -699,19 +757,19 @@ def holographic_feature_engine_fast(
     thermo_1h = _build_thermo(df_1h, len(df_1h))
 
     # Higher-TF arrays — pass empty sentinel vectors if not provided
-    def _htf(df: pd.DataFrame | None):
+    def _htf(df: pd.DataFrame | None, timeframe_label: str):
         if df is None or len(df) < 3:
             empty_f = np.empty(0, dtype=np.float64)
             empty_i = np.empty(0, dtype=np.int64)
             return empty_i, empty_f, empty_f, empty_f, empty_f, empty_f
         src = df.sort_values("time").reset_index(drop=True)
-        t = _times_to_ns(src["time"])
+        t = _htf_close_times_ns(src, timeframe_label)
         o, h, lo, c, v = _extract_ohlcv(src)
         return t, o, h, lo, c, v
 
-    t_1d, o_1d, h_1d, l_1d, c_1d, v_1d = _htf(df_1d)
-    t_1w, o_1w, h_1w, l_1w, c_1w, v_1w = _htf(df_1w)
-    t_1m, o_1m, h_1m, l_1m, c_1m, v_1m = _htf(df_1m)
+    t_1d, o_1d, h_1d, l_1d, c_1d, v_1d = _htf(df_1d, "1D")
+    t_1w, o_1w, h_1w, l_1w, c_1w, v_1w = _htf(df_1w, "1W")
+    t_1m, o_1m, h_1m, l_1m, c_1m, v_1m = _htf(df_1m, "1M")
 
     # Dispatch to Julia — arrays cross the bridge as PyArray (zero-copy)
     jl_result = TM.compute_holographic_features(
@@ -762,17 +820,17 @@ def holographic_feature_engine_daily(
     o_1d, h_1d, l_1d, c_1d, v_1d = _extract_ohlcv(df_1d)
     thermo_1d = _build_thermo(df_1d, len(df_1d))
 
-    def _htf(df: pd.DataFrame | None):
+    def _htf(df: pd.DataFrame | None, timeframe_label: str):
         if df is None or len(df) < 3:
             empty_f = np.empty(0, dtype=np.float64)
             empty_i = np.empty(0, dtype=np.int64)
             return empty_i, empty_f, empty_f, empty_f, empty_f, empty_f
         src = df.sort_values("time").reset_index(drop=True)
-        return (_times_to_ns(src["time"]), *_extract_ohlcv(src))
+        return (_htf_close_times_ns(src, timeframe_label), *_extract_ohlcv(src))
 
-    t_1w, o_1w, h_1w, l_1w, c_1w, v_1w = _htf(df_1w)
-    t_1m, o_1m, h_1m, l_1m, c_1m, v_1m = _htf(df_1m)
-    t_3m, o_3m, h_3m, l_3m, c_3m, v_3m = _htf(df_3m)
+    t_1w, o_1w, h_1w, l_1w, c_1w, v_1w = _htf(df_1w, "1W")
+    t_1m, o_1m, h_1m, l_1m, c_1m, v_1m = _htf(df_1m, "1M")
+    t_3m, o_3m, h_3m, l_3m, c_3m, v_3m = _htf(df_3m, "3M")
 
     jl_result = TM.compute_holographic_features_daily(
         base_times_ns,
@@ -916,13 +974,13 @@ def smc_feature_engine_fast(
     result = pd.DataFrame(smc_cols, index=df_1h.index)
 
     htf_pairs = [
-        (df_1d, "htf1"),
-        (df_1w, "htf2"),
-        (df_1m, "htf3"),
+        (df_1d, "htf1", "1D"),
+        (df_1w, "htf2", "1W"),
+        (df_1m, "htf3", "1M"),
     ]
     base_times_ns = _times_to_ns(df_1h["time"])
 
-    for htf_df, htf_label in htf_pairs:
+    for htf_df, htf_label, timeframe_label in htf_pairs:
         if htf_df is None or len(htf_df) < 3:
             result[f"smc_{htf_label}_structure_trend_score"] = 0.0
             result[f"smc_{htf_label}_amd_phase"] = 0.0
@@ -935,16 +993,17 @@ def smc_feature_engine_fast(
         hc = _to_f64(src["close"].to_numpy())
         hv = _to_f64(src["volume"].to_numpy())
         ha = _to_f64(_compute_atr14_array(hh, hl, hc))
+        htf_times_ns = _htf_close_times_ns(src, timeframe_label)
 
         htf_jl = TM.compute_smc_htf_features(ho, hh, hl, hc, hv, ha)
 
-        htf_times_ns = _times_to_ns(src["time"])
-        idx_map = np.searchsorted(htf_times_ns, base_times_ns, side="right") - 1
-        idx_map = np.clip(idx_map, 0, len(src) - 1)
-
         for feat_name in ["structure_trend_score", "amd_phase"]:
             htf_vals = np.array(htf_jl[feat_name], dtype=np.float64)
-            result[f"smc_{htf_label}_{feat_name}"] = htf_vals[idx_map]
+            result[f"smc_{htf_label}_{feat_name}"] = _map_htf_series_to_primary(
+                base_times_ns,
+                htf_times_ns,
+                htf_vals,
+            )
 
     result["smc_sweep_disp_sync"] = (
         (
@@ -1038,13 +1097,13 @@ def smc_feature_engine_daily(
     result = pd.DataFrame(smc_cols, index=df_1d.index)
 
     htf_pairs = [
-        (df_1w, "htf1"),
-        (df_1m, "htf2"),
-        (df_6m, "htf3"),
+        (df_1w, "htf1", "1W"),
+        (df_1m, "htf2", "1M"),
+        (df_6m, "htf3", "6M"),
     ]
     base_times_ns = _times_to_ns(df_1d["time"])
 
-    for htf_df, htf_label in htf_pairs:
+    for htf_df, htf_label, timeframe_label in htf_pairs:
         if htf_df is None or len(htf_df) < 3:
             result[f"smc_{htf_label}_structure_trend_score"] = 0.0
             result[f"smc_{htf_label}_amd_phase"] = 0.0
@@ -1057,16 +1116,17 @@ def smc_feature_engine_daily(
         hc = _to_f64(src["close"].to_numpy())
         hv = _to_f64(src["volume"].to_numpy())
         ha = _to_f64(_compute_atr14_array(hh, hl, hc))
+        htf_times_ns = _htf_close_times_ns(src, timeframe_label)
 
         htf_jl = TM.compute_smc_htf_features(ho, hh, hl, hc, hv, ha)
 
-        htf_times_ns = _times_to_ns(src["time"])
-        idx_map = np.searchsorted(htf_times_ns, base_times_ns, side="right") - 1
-        idx_map = np.clip(idx_map, 0, len(src) - 1)
-
         for feat_name in ["structure_trend_score", "amd_phase"]:
             htf_vals = np.array(htf_jl[feat_name], dtype=np.float64)
-            result[f"smc_{htf_label}_{feat_name}"] = htf_vals[idx_map]
+            result[f"smc_{htf_label}_{feat_name}"] = _map_htf_series_to_primary(
+                base_times_ns,
+                htf_times_ns,
+                htf_vals,
+            )
 
     result["smc_sweep_disp_sync"] = (
         (
@@ -1227,6 +1287,7 @@ def _rv_htf_layer(
     primary_log_col: str,
     htf_df: pd.DataFrame | None,
     htf_label: str,
+    timeframe_label: str,
     htf_ann: float,
     TM,
 ) -> pd.DataFrame:
@@ -1247,13 +1308,15 @@ def _rv_htf_layer(
         annualization=htf_ann,
     )
 
-    htf_times_ns = _times_to_ns(src["time"])
-    idx_map = np.searchsorted(htf_times_ns, base_times_ns, side="right") - 1
-    idx_map = np.clip(idx_map, 0, len(src) - 1)
+    htf_times_ns = _htf_close_times_ns(src, timeframe_label)
 
     for feat_key in _RV_FEAT_KEYS:
         htf_vals = np.array(htf_jl[feat_key], dtype=np.float64)
-        result[f"rv_{htf_label}_{feat_key}"] = htf_vals[idx_map]
+        result[f"rv_{htf_label}_{feat_key}"] = _map_htf_series_to_primary(
+            base_times_ns,
+            htf_times_ns,
+            htf_vals,
+        )
 
     result[term_col] = (
         result[f"rv_{htf_label}_yz_log"] - result[primary_log_col]
@@ -1288,15 +1351,15 @@ def rv_feature_engine_fast(
     primary_log_col = "rv_1h_yz_log"
 
     htf_layers = [
-        (df_1d, "1d", 252.0),
-        (df_1w, "1w", 52.0),
-        (df_1m, "1m", 12.0),
+        (df_1d, "1d", "1D", 252.0),
+        (df_1w, "1w", "1W", 52.0),
+        (df_1m, "1m", "1M", 12.0),
     ]
-    if any(htf_df is not None for htf_df, _, _ in htf_layers):
-        for htf_df, htf_label, htf_ann in htf_layers:
+    if any(htf_df is not None for htf_df, _, _, _ in htf_layers):
+        for htf_df, htf_label, timeframe_label, htf_ann in htf_layers:
             result = _rv_htf_layer(
                 result, base_times_ns, primary_log_col,
-                htf_df, htf_label, htf_ann, TM,
+                htf_df, htf_label, timeframe_label, htf_ann, TM,
             )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -1331,17 +1394,17 @@ def rv_feature_engine_daily(
     primary_log_col = "rv_1d_yz_log"
 
     htf_layers = [
-        (df_1w, "1w", 52.0),
-        (df_1m, "1m", 12.0),
-        (df_3m, "3m", 4.0),
-        (df_6m, "6m", 2.0),
-        (df_12m, "12m", 1.0),
+        (df_1w, "1w", "1W", 52.0),
+        (df_1m, "1m", "1M", 12.0),
+        (df_3m, "3m", "3M", 4.0),
+        (df_6m, "6m", "6M", 2.0),
+        (df_12m, "12m", "12M", 1.0),
     ]
-    if any(htf_df is not None for htf_df, _, _ in htf_layers):
-        for htf_df, htf_label, htf_ann in htf_layers:
+    if any(htf_df is not None for htf_df, _, _, _ in htf_layers):
+        for htf_df, htf_label, timeframe_label, htf_ann in htf_layers:
             result = _rv_htf_layer(
                 result, base_times_ns, primary_log_col,
-                htf_df, htf_label, htf_ann, TM,
+                htf_df, htf_label, timeframe_label, htf_ann, TM,
             )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)

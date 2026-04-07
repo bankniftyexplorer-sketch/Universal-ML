@@ -27,7 +27,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 - Both active lanes now inject Julia-native realized-volatility surfaces through `julia_bridge.py`.
 - The raw `realized_volatility` series from the vault remains state only and is excluded from feature selection.
 - Feature math lives in Julia kernels, called from Python bridges.
-- `julia_bridge.py` is the only supported Python interface to `ToonMath.jl`.
+- `julia_bridge.py` is the only supported Python interface to `ToonMath.jl`, and it shifts higher-timeframe timestamps to bar-close availability before Julia dispatch or Python-side HTF projection mapping.
 - `holographic_engine.py` is a frozen legacy module; only its feature-selection helpers remain live.
 - LightGBM is the model layer.
 - Backtests and live inference reuse saved artifacts instead of rebuilding everything from scratch.
@@ -50,7 +50,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
 | `accuracy_guardrail.py` | Rebuilds model-ready frames, replays saved OOS maps, compares against a local baseline | You care about proving an update did or did not change saved-artifact accuracy |
 | `holographic_engine.py` | Frozen legacy module; only `feature_selection_pipeline`, `correlation_filter`, and `phase1_ranking` remain live | You care about feature selection or legacy context |
-| `julia_bridge.py` | Only supported Python-to-Julia adapter for holographic, SMC, Kalman, realized-volatility, target, and backtest helper kernels | You care about bridge contracts or array prep |
+| `julia_bridge.py` | Only supported Python-to-Julia adapter for holographic, SMC, Kalman, realized-volatility, target, and backtest helper kernels; it also enforces higher-timeframe close-availability alignment | You care about bridge contracts or array prep |
 | `ToonMath.jl` | Fast holographic, SMC, Kalman, and realized-volatility extraction plus target-generation and replay kernels | You care about core math/performance |
 | `shadow_brain.py` | Optional meta-model trained from prior trade outcomes and used as a veto layer in live inference | You care about veto/approval overlay |
 | `run_daily_model.py` | Legacy script | Ignore unless debugging old behavior |
@@ -82,17 +82,18 @@ After any bugfix, modification, or addition that changes repo behavior or contra
    - session-position vectors are encoded in exactly one place
 5. `universal_ml_engine._compute_atr14()` adds ATR for labelling and execution logic.
 6. `julia_bridge.holographic_feature_engine_fast()` calls `ToonMath.jl` to build `1H` geometry features using `1H + 1D + 1W + 1M`.
+   - higher-timeframe timestamps are shifted to close-availability before Julia alignment, so intraday bars cannot see incomplete `1D/1W/1M` candles
 7. `julia_bridge.smc_feature_engine_fast()` adds 47 institutional-intent features:
    - 34 primary `1H` SMC features
-   - 6 higher-timeframe projection features from `1D/1W/1M`
+   - 6 higher-timeframe projection features from `1D/1W/1M`, mapped with the same close-availability contract
    - 7 confluence features
 8. `julia_bridge.kalman_structural_engine_fast()` adds the `1H` Kalman structural family:
    - primary Kalman state
    - 7-ratio fib observation ladders
-   - mapped higher-timeframe Kalman state from `1D/1W/1M`
+   - mapped higher-timeframe Kalman state from `1D/1W/1M`, aligned to completed bars only
 9. `julia_bridge.rv_feature_engine_fast()` adds a 47-column `1H` realized-volatility surface:
    - 11 primary `1H` RV features
-   - 12 columns each from `1D/1W/1M` (11 HTF RV features + 1 term-structure column)
+   - 12 columns each from `1D/1W/1M` (11 HTF RV features + 1 term-structure column), aligned to completed bars only
 10. `universal_ml_engine.merge_higher_tf()` aligns higher-timeframe raw context onto the `1H` frame.
 11. `julia_bridge.add_target_fast()` creates labels from forward trade simulation.
    - directional trade-plan regressors treat targets as continuous kinetic scores and split direction with `target > 0.5` for long and `target < 0.5` for short
@@ -117,17 +118,18 @@ After any bugfix, modification, or addition that changes repo behavior or contra
    - `eod_basis_momentum = 0`
 5. The raw vault-side `realized_volatility` series remains state only and is excluded from feature selection.
 6. `julia_bridge.holographic_feature_engine_daily()` builds daily geometry features from `1D + 1W + 1M + 3M`.
+   - higher-timeframe timestamps are shifted to close-availability before Julia alignment, so daily bars cannot see incomplete macro candles
 7. `julia_bridge.smc_feature_engine_daily()` adds 47 institutional-intent features for the daily lane:
    - 34 primary `1D` SMC features
-   - 6 higher-timeframe projection features from `1W/1M/6M`
+   - 6 higher-timeframe projection features from `1W/1M/6M`, mapped with the same close-availability contract
    - 7 confluence features
 8. `julia_bridge.kalman_structural_engine_daily()` adds the `1D` Kalman structural family:
    - primary Kalman state
    - 7-ratio fib observation ladders
-   - mapped higher-timeframe Kalman state from `1W/1M/6M`
+   - mapped higher-timeframe Kalman state from `1W/1M/6M`, aligned to completed bars only
 9. `julia_bridge.rv_feature_engine_daily()` adds a 71-column daily realized-volatility surface:
    - 11 primary `1D` RV features
-   - 12 columns each from `1W/1M/3M/6M/12M` (11 HTF RV features + 1 term-structure column)
+   - 12 columns each from `1W/1M/3M/6M/12M` (11 HTF RV features + 1 term-structure column), aligned to completed bars only
 10. `daily_ml_engine.compute_macro_regime()` adds compact `6M` and `12M` regime overlays.
 11. `daily_ml_engine.add_daily_confluence()` adds daily confluence terms.
 12. `julia_bridge.add_target_fast()` creates daily labels with the daily horizon settings.
