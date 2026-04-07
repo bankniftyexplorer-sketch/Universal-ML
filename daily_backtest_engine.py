@@ -25,6 +25,7 @@ from julia_bridge import (
 )
 from universal_ml_engine import (
     _compute_atr14,
+    build_report_data_lines,
     build_timeframe_selection,
     describe_selected_frame,
     inject_thermodynamic_basis,
@@ -252,7 +253,13 @@ def main() -> None:
     print("=" * 60)
 
     report_path = artifact_paths_1d["backtest_report"]
-    generate_report(results, metrics, f"{symbol} (DAILY)", report_path)
+    generate_report(
+        results,
+        metrics,
+        f"{symbol} (DAILY)",
+        report_path,
+        data_update_lines=build_report_data_lines({"1D": df_1d}),
+    )
     print(f"\n  [✓] Report saved to {report_path}")
 
 

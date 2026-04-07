@@ -66,7 +66,10 @@ After any bugfix, modification, or addition that changes repo behavior or contra
    - default sync mode is incremental merge with overlap windows
    - `--full-refresh` forces a max-history rebuild for the requested symbol
    - `--auto-sync` keeps the vault alive and only starts a sync cycle when sampled CPU usage and Yahoo probe throughput pass the configured thresholds
+   - the default wrapper now uses a `45%` CPU ceiling so the auto-sync loop can still run on the target workstation during normal activity
    - `--import-index ALIAS=YAHOO_TICKER` lets operators register and sync a new Yahoo-backed index without editing code
+   - non-finite OHLC provider rows are dropped before audit/save so one broken upstream bar does not poison runtime quality
+   - when a session-market `1D` bar is missing or broken but a completed `1H` session exists, the vault backfills the daily bar from hourly aggregation before writing quality
    - each run writes a `market_sync_quality` audit row per base timeframe
 2. `inference_bridge.py` fetches the `SPOT` stack by timeframe.
    - `strict_gating=True` is the default
@@ -92,13 +95,15 @@ After any bugfix, modification, or addition that changes repo behavior or contra
    - 12 columns each from `1D/1W/1M` (11 HTF RV features + 1 term-structure column)
 10. `universal_ml_engine.merge_higher_tf()` aligns higher-timeframe raw context onto the `1H` frame.
 11. `julia_bridge.add_target_fast()` creates labels from forward trade simulation.
+   - directional trade-plan regressors treat targets as continuous kinetic scores and split direction with `target > 0.5` for long and `target < 0.5` for short
 12. `holographic_engine.feature_selection_pipeline()` reduces the combined feature set; it is the only live production export from that frozen legacy module.
 13. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation.
-14. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme.
-15. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV` SPOT-only feature-prep contract before consuming saved artifacts.
-16. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
-17. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
-18. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map without retraining.
+14. `train_trade_plan_models()` fits the six `1H` exit quantile regressors with an inner validation slice, a `24`-bar purge gap, and LightGBM early stopping before saving them under the standard trade-plan artifact.
+15. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme.
+16. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV` SPOT-only feature-prep contract before consuming saved artifacts.
+17. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
+18. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
+19. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map without retraining.
 
 ### `1D` daily lane
 

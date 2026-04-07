@@ -34,6 +34,7 @@ from universal_ml_engine import (
     MODEL_N_JOBS,
     TRADE_PLAN_LABEL_COLS,
     _compute_atr14,
+    build_report_data_lines,
     build_timeframe_selection,
     describe_selected_frame,
     inject_thermodynamic_basis,
@@ -726,7 +727,13 @@ def main() -> None:
         "note": filter_note,
     }
     report_path = artifact_paths_1d["ml_report"]
-    save_report(wf_results, report_path, pred_info=pred_info, symbol=symbol)
+    save_report(
+        wf_results,
+        report_path,
+        pred_info=pred_info,
+        symbol=symbol,
+        data_update_lines=build_report_data_lines({"1D": df_1d}),
+    )
 
     fi_sorted = sorted(
         wf_results["feature_importance"].items(), key=lambda x: x[1], reverse=True

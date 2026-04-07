@@ -18,6 +18,7 @@ from universal_ml_engine import (
     BARRIER_HORIZON_BARS,
     LIVE_CONFIDENCE_THRESHOLD,
     EXEC_FEE_PCT,
+    build_report_data_lines,
     build_timeframe_selection,
     describe_selected_frame,
     simulate_trade_path_from_arrays,
@@ -267,22 +268,10 @@ def run_backtest(
             float(current_atr),
         )
 
-        # [TOON v4.2] Regime-Resistant Asymmetry Matrix
-        # Capitalizes on the 56% ML Win Rate by harvesting risk at 1:1.
-        stop_dist = float(current_atr * 2.0)  # Catastrophic stop (2 ATR)
-        tp1_dist = float(
-            current_atr * 2.0
-        )  # Realize 50% at 2 ATR (1:1 R/R to lock in the edge)
-        tp2_dist = float(current_atr * 4.0)  # Realize 25% at 4 ATR
-        trail_dist = float(
-            current_atr * 1.0
-        )  # Aggressive trailing to prevent runner bleed
-
-        if np.isfinite(trade_plan.get("stop_atr", np.nan)):
-            stop_dist = float(current_atr * trade_plan["stop_atr"])
-            tp1_dist = float(current_atr * trade_plan["tp1_atr"])
-            tp2_dist = float(current_atr * trade_plan["tp2_atr"])
-            trail_dist = float(current_atr * trade_plan["trail_r"])
+        stop_dist = float(current_atr * trade_plan["stop_atr"])
+        tp1_dist = float(current_atr * trade_plan["tp1_atr"])
+        tp2_dist = float(current_atr * trade_plan["tp2_atr"])
+        trail_dist = float(current_atr * trade_plan["trail_r"])
 
         trade_path = simulate_trade_path_from_arrays(
             open_arr,
@@ -448,7 +437,13 @@ def calculate_metrics(trades, equity_curve=None, time_curve=None):
     }
 
 
-def generate_report(results, metrics, symbol, save_path):
+def generate_report(
+    results,
+    metrics,
+    symbol,
+    save_path,
+    data_update_lines: list[str] | None = None,
+):
     fig = plt.figure(figsize=(14, 10), facecolor="#0d0d0d")
     gs = gridspec.GridSpec(2, 1, figure=fig, hspace=0.3, height_ratios=[2, 1])
 
@@ -521,7 +516,18 @@ def generate_report(results, metrics, symbol, save_path):
         ),
     )
 
-    plt.tight_layout()
+    if data_update_lines:
+        fig.text(
+            0.5,
+            0.985,
+            "\n".join(data_update_lines),
+            color="#b0bec5",
+            fontsize=9,
+            fontfamily="monospace",
+            ha="center",
+            va="top",
+        )
+    plt.tight_layout(rect=[0, 0, 1, 0.94 if data_update_lines else 1])
     plt.savefig(save_path, dpi=120, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close()
 
@@ -774,7 +780,13 @@ def main():
     print("=" * 60)
 
     report_path = artifact_paths_1h["backtest_report"]
-    generate_report(results, metrics, SYMBOL, report_path)
+    generate_report(
+        results,
+        metrics,
+        SYMBOL,
+        report_path,
+        data_update_lines=build_report_data_lines({"1H": df_1h, "1D": df_1d}),
+    )
     print(f"\n  [✓] Report visually packaged and saved to {report_path}")
 
     # -- Seed the Performance Ledger

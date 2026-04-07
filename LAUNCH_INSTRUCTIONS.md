@@ -128,7 +128,7 @@ cd /home/km/Universal-ML
 uv run python data_vault/vault_engine.py \
   --auto-sync \
   --pause-seconds 0 \
-  --auto-max-cpu-percent 20 \
+  --auto-max-cpu-percent 45 \
   --auto-min-download-kbps 32 \
   --auto-check-interval-seconds 300 \
   --auto-min-sync-gap-seconds 3600
@@ -139,7 +139,7 @@ This mode:
 - keeps the vault process alive
 - samples CPU usage before each decision
 - probes Yahoo throughput before each decision
-- waits until `cpu <= 20%` and the download probe clears the configured KB/s floor
+- waits until `cpu <= 45%` and the download probe clears the configured KB/s floor
 - only then starts the next sync cycle
 
 Check why auto-sync is waiting:

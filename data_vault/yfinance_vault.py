@@ -130,7 +130,7 @@ FULL_REFRESH_CADENCE = {
 CUSTOM_YAHOO_INSTRUMENTS_FILENAME = "custom_yahoo_instruments.json"
 DEFAULT_AUTO_SYNC_CHECK_INTERVAL_SECONDS = 300.0
 DEFAULT_AUTO_SYNC_MIN_GAP_SECONDS = 3600.0
-DEFAULT_AUTO_SYNC_MAX_CPU_PERCENT = 20.0
+DEFAULT_AUTO_SYNC_MAX_CPU_PERCENT = 45.0
 DEFAULT_AUTO_SYNC_CPU_SAMPLE_SECONDS = 1.0
 DEFAULT_AUTO_SYNC_MIN_DOWNLOAD_KBPS = 32.0
 DEFAULT_AUTO_SYNC_PROBE_TIMEOUT_SECONDS = 10.0
@@ -1346,6 +1346,9 @@ class YFinanceVault:
             "continuity_mode": "continuous" if self._is_continuous_market(instrument) else "session",
             "source_timezone": source_timezone,
         }
+        dropped_invalid_ohlc_rows = int(df.attrs.get("dropped_invalid_ohlc_rows", 0))
+        if dropped_invalid_ohlc_rows > 0:
+            payload["dropped_invalid_ohlc_rows"] = dropped_invalid_ohlc_rows
         if self._is_continuous_market(instrument):
             expected_bar_count, missing_bar_count, max_gap_bars = self._audit_continuous_gap_metrics(
                 timestamps_utc, timeframe=timeframe
@@ -1556,6 +1559,155 @@ class YFinanceVault:
         result["low"] = result[["open", "close", "low"]].min(axis=1)
         return self._copy_attrs(df, result)
 
+    def _drop_invalid_ohlc_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        price_values = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
+        finite_mask = np.isfinite(price_values).all(axis=1)
+        if finite_mask.all():
+            return df
+
+        result = df.loc[finite_mask].reset_index(drop=True).copy()
+        result = self._copy_attrs(df, result)
+        result.attrs["dropped_invalid_ohlc_rows"] = int((~finite_mask).sum())
+        return result
+
+    def _session_midnight_utc(
+        self,
+        session_date: pd.Timestamp,
+        *,
+        source_timezone: str,
+    ) -> pd.Timestamp:
+        ts = pd.Timestamp(session_date)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(source_timezone)
+        else:
+            ts = ts.tz_convert(source_timezone)
+        return ts.normalize().tz_convert("UTC")
+
+    def _repair_session_daily_from_hourly(
+        self,
+        daily_df: pd.DataFrame | None,
+        hourly_df: pd.DataFrame | None,
+        *,
+        instrument: YahooInstrument,
+    ) -> tuple[pd.DataFrame | None, dict[str, object]]:
+        if (
+            daily_df is None
+            or hourly_df is None
+            or daily_df.empty
+            or hourly_df.empty
+            or self._is_continuous_market(instrument)
+        ):
+            return daily_df, {}
+
+        source_timezone = str(
+            hourly_df.attrs.get(
+                "source_timezone",
+                daily_df.attrs.get("source_timezone", "UTC"),
+            )
+        )
+        hourly = hourly_df.copy().sort_values("timestamp").reset_index(drop=True)
+        hourly_ts = pd.DatetimeIndex(
+            pd.to_datetime(hourly["timestamp"], utc=True, errors="coerce")
+        )
+        valid_mask = ~pd.isna(hourly_ts)
+        if not valid_mask.any():
+            return daily_df, {}
+        if not valid_mask.all():
+            hourly = hourly.loc[valid_mask].reset_index(drop=True)
+            hourly_ts = hourly_ts[valid_mask]
+
+        hourly_local = hourly_ts.tz_convert(source_timezone)
+        hourly["session_date"] = hourly_local.normalize()
+        hourly["slot"] = hourly_local.hour * 60 + hourly_local.minute
+
+        last_slot_by_date = hourly.groupby("session_date")["slot"].max()
+        if last_slot_by_date.empty:
+            return daily_df, {}
+        closing_slot_mode = last_slot_by_date.mode()
+        closing_slot = int(
+            closing_slot_mode.iloc[-1]
+            if not closing_slot_mode.empty
+            else last_slot_by_date.max()
+        )
+        complete_session_dates = {
+            pd.Timestamp(session_date)
+            for session_date, slot in last_slot_by_date.items()
+            if int(slot) >= closing_slot
+        }
+        if not complete_session_dates:
+            return daily_df, {}
+
+        daily_ts = pd.DatetimeIndex(
+            pd.to_datetime(daily_df["timestamp"], utc=True, errors="coerce")
+        )
+        daily_local_dates = {
+            pd.Timestamp(session_date)
+            for session_date in daily_ts.tz_convert(source_timezone).normalize()
+        }
+
+        repair_rows: list[dict[str, object]] = []
+        repaired_session_dates: list[str] = []
+        for session_date, group in hourly.groupby("session_date", sort=True):
+            session_date = pd.Timestamp(session_date)
+            if (
+                session_date in daily_local_dates
+                or session_date not in complete_session_dates
+            ):
+                continue
+            group = group.sort_values("timestamp")
+            repair_rows.append(
+                {
+                    "base_symbol": instrument.base_symbol,
+                    "pair_symbol": instrument.base_symbol,
+                    "asset_class": "SPOT",
+                    "source_exchange": instrument.source_exchange,
+                    "source_symbol": instrument.ticker,
+                    "symbol_payload_json": self._symbol_payload_json(instrument, "1D"),
+                    "contract_kind": "SPOT",
+                    "quote_asset": instrument.quote_asset,
+                    "expiry_code": None,
+                    "timeframe": "1D",
+                    "timestamp": self._session_midnight_utc(
+                        session_date, source_timezone=source_timezone
+                    ),
+                    "open": float(group["open"].iloc[0]),
+                    "high": float(group["high"].max()),
+                    "low": float(group["low"].min()),
+                    "close": float(group["close"].iloc[-1]),
+                    "volume": float(group["volume"].sum()),
+                    "is_synthetic_vol": bool(
+                        group["is_synthetic_vol"].fillna(False).astype(bool).any()
+                    ),
+                    "realized_volatility": np.nan,
+                }
+            )
+            repaired_session_dates.append(session_date.strftime("%Y-%m-%d"))
+
+        if not repair_rows:
+            return daily_df, {}
+
+        repaired_daily = pd.DataFrame(repair_rows, columns=MARKET_DNA_COLUMNS)
+        repaired_daily.attrs["source_timezone"] = source_timezone
+
+        merged = pd.concat([daily_df, repaired_daily], ignore_index=True)
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
+        merged = merged.dropna(subset=["timestamp"])
+        merged = merged.sort_values("timestamp").drop_duplicates(
+            subset=["timestamp"], keep="last"
+        )
+        merged = merged.reset_index(drop=True).loc[:, list(MARKET_DNA_COLUMNS)]
+        merged = self._copy_attrs(daily_df, merged)
+        merged.attrs["source_timezone"] = source_timezone
+        merged.attrs["repaired_from_hourly_sessions"] = len(repair_rows)
+
+        repair_payload = {
+            "repaired_from_hourly_sessions": len(repair_rows),
+            "repair_source": "session_hourly_aggregation",
+            "repair_closing_slot": closing_slot,
+            "repaired_session_dates": repaired_session_dates,
+        }
+        return merged, repair_payload
+
     def _interpolate_volume(self, df: pd.DataFrame) -> pd.DataFrame:
         result = df.copy()
         result["TR"] = result["high"] - result["low"]
@@ -1733,6 +1885,20 @@ class YFinanceVault:
                     """,
                     (pair_symbol, *timeframes_to_replace),
                 )
+                cursor.execute(
+                    f"""
+                    DELETE FROM market_dna
+                    WHERE pair_symbol = ?
+                      AND timeframe IN ({placeholders})
+                      AND (
+                          source_exchange IS NULL
+                          OR source_symbol IS NULL
+                          OR asset_class IS NULL
+                          OR asset_class = ''
+                      )
+                    """,
+                    (pair_symbol, *timeframes_to_replace),
+                )
                 cursor.execute("DROP TABLE IF EXISTS temp_market_data")
                 cursor.execute(
                     """
@@ -1771,10 +1937,12 @@ class YFinanceVault:
 
         run_id = uuid4().hex
         synced_at = self._sync_now_utc()
-        frames: list[pd.DataFrame] = []
+        frames_by_timeframe: dict[str, pd.DataFrame] = {}
+        fetch_context_by_timeframe: dict[str, dict[str, object]] = {}
+        quality_rows_by_timeframe: dict[str, dict[str, object]] = {}
         df_1d: pd.DataFrame | None = None
+        df_1h: pd.DataFrame | None = None
         daily_updated = False
-        quality_rows: list[dict] = []
         for timeframe in FETCH_TIMEFRAMES:
             existing_frame = self._load_existing_timeframe_frame(
                 instrument=instrument,
@@ -1818,30 +1986,26 @@ class YFinanceVault:
                         synced_at=synced_at,
                         daily_reference=df_1d if timeframe == "1H" else None,
                     )
-                    quality_rows.append(
-                        self._decorate_quality_row(
-                            quality_row=retained_quality,
-                            fetch_mode=fetch_mode,
-                            fetch_status=f"provider_exception:{type(exc).__name__}",
-                            existing_row_count=len(existing_frame),
-                            fetched_row_count=0,
-                            merged_row_count=len(existing_frame),
-                            retained_row_count=len(existing_frame),
-                            minimum_status=QUALITY_STATUS_WARN,
-                            extra_payload={"refresh_reason": refresh_reason},
-                        )
+                    quality_rows_by_timeframe[timeframe] = self._decorate_quality_row(
+                        quality_row=retained_quality,
+                        fetch_mode=fetch_mode,
+                        fetch_status=f"provider_exception:{type(exc).__name__}",
+                        existing_row_count=len(existing_frame),
+                        fetched_row_count=0,
+                        merged_row_count=len(existing_frame),
+                        retained_row_count=len(existing_frame),
+                        minimum_status=QUALITY_STATUS_WARN,
+                        extra_payload={"refresh_reason": refresh_reason},
                     )
                     if timeframe == "1D":
                         df_1d = existing_frame
                 else:
-                    quality_rows.append(
-                        self._build_missing_quality_row(
-                            instrument=instrument,
-                            timeframe=timeframe,
-                            run_id=run_id,
-                            synced_at=synced_at,
-                            reason=f"provider_exception:{type(exc).__name__}",
-                        )
+                    quality_rows_by_timeframe[timeframe] = self._build_missing_quality_row(
+                        instrument=instrument,
+                        timeframe=timeframe,
+                        run_id=run_id,
+                        synced_at=synced_at,
+                        reason=f"provider_exception:{type(exc).__name__}",
                     )
                 continue
             if fetched.empty:
@@ -1855,30 +2019,26 @@ class YFinanceVault:
                         synced_at=synced_at,
                         daily_reference=df_1d if timeframe == "1H" else None,
                     )
-                    quality_rows.append(
-                        self._decorate_quality_row(
-                            quality_row=retained_quality,
-                            fetch_mode=fetch_mode,
-                            fetch_status="provider_returned_empty_frame",
-                            existing_row_count=len(existing_frame),
-                            fetched_row_count=0,
-                            merged_row_count=len(existing_frame),
-                            retained_row_count=len(existing_frame),
-                            minimum_status=QUALITY_STATUS_WARN,
-                            extra_payload={"refresh_reason": refresh_reason},
-                        )
+                    quality_rows_by_timeframe[timeframe] = self._decorate_quality_row(
+                        quality_row=retained_quality,
+                        fetch_mode=fetch_mode,
+                        fetch_status="provider_returned_empty_frame",
+                        existing_row_count=len(existing_frame),
+                        fetched_row_count=0,
+                        merged_row_count=len(existing_frame),
+                        retained_row_count=len(existing_frame),
+                        minimum_status=QUALITY_STATUS_WARN,
+                        extra_payload={"refresh_reason": refresh_reason},
                     )
                     if timeframe == "1D":
                         df_1d = existing_frame
                 else:
-                    quality_rows.append(
-                        self._build_missing_quality_row(
-                            instrument=instrument,
-                            timeframe=timeframe,
-                            run_id=run_id,
-                            synced_at=synced_at,
-                            reason="provider_returned_empty_frame",
-                        )
+                    quality_rows_by_timeframe[timeframe] = self._build_missing_quality_row(
+                        instrument=instrument,
+                        timeframe=timeframe,
+                        run_id=run_id,
+                        synced_at=synced_at,
+                        reason="provider_returned_empty_frame",
                     )
                 continue
 
@@ -1904,12 +2064,23 @@ class YFinanceVault:
                 refresh_reason = "incremental_regressed_latest_timestamp"
 
             merged = self._compute_realized_volatility(
-                self._interpolate_volume(self._enforce_physics(merged))
+                self._interpolate_volume(
+                    self._drop_invalid_ohlc_rows(self._enforce_physics(merged))
+                )
             )
-            frames.append(merged)
+            frames_by_timeframe[timeframe] = merged
+            fetch_context_by_timeframe[timeframe] = {
+                "fetch_mode": fetch_mode,
+                "fetch_status": "fetched",
+                "existing_row_count": len(existing_frame),
+                "fetched_row_count": len(fetched),
+                "refresh_reason": refresh_reason,
+            }
             if timeframe == "1D":
                 df_1d = merged
                 daily_updated = True
+            elif timeframe == "1H":
+                df_1h = merged
             quality_row = self._audit_fetched_frame(
                 merged,
                 instrument=instrument,
@@ -1930,7 +2101,7 @@ class YFinanceVault:
                 retained_row_count=retained_row_count,
                 extra_payload={"refresh_reason": refresh_reason},
             )
-            quality_rows.append(quality_row)
+            quality_rows_by_timeframe[timeframe] = quality_row
             print(
                 f"  [+] {timeframe} rows: {len(merged)} "
                 f"({merged['timestamp'].min()} -> {merged['timestamp'].max()})"
@@ -1944,15 +2115,76 @@ class YFinanceVault:
                 f"synthetic_vol={quality_row['synthetic_volume_rows']}"
             )
 
+        if df_1d is not None and df_1h is not None:
+            repaired_1d, repair_payload = self._repair_session_daily_from_hourly(
+                df_1d,
+                df_1h,
+                instrument=instrument,
+            )
+            if repaired_1d is not None and repair_payload:
+                df_1d = self._compute_realized_volatility(repaired_1d)
+                frames_by_timeframe["1D"] = df_1d
+                daily_updated = True
+                context_1d = fetch_context_by_timeframe.get("1D")
+                if context_1d is not None:
+                    repaired_quality = self._audit_fetched_frame(
+                        df_1d,
+                        instrument=instrument,
+                        timeframe="1D",
+                        run_id=run_id,
+                        synced_at=synced_at,
+                        payload_extra={
+                            "refresh_reason": str(context_1d["refresh_reason"]),
+                            **repair_payload,
+                        },
+                    )
+                    quality_rows_by_timeframe["1D"] = self._decorate_quality_row(
+                        quality_row=repaired_quality,
+                        fetch_mode=str(context_1d["fetch_mode"]),
+                        fetch_status=str(context_1d["fetch_status"]),
+                        existing_row_count=int(context_1d["existing_row_count"]),
+                        fetched_row_count=int(context_1d["fetched_row_count"]),
+                        merged_row_count=len(df_1d),
+                        retained_row_count=max(
+                            len(df_1d) - int(context_1d["fetched_row_count"]),
+                            0,
+                        ),
+                        extra_payload={
+                            "refresh_reason": str(context_1d["refresh_reason"]),
+                            **repair_payload,
+                        },
+                    )
+                print(
+                    "  [fix] 1D repaired from 1H sessions: "
+                    f"{repair_payload.get('repaired_from_hourly_sessions', 0)} "
+                    "synthetic daily bar(s) inserted."
+                )
+                repaired_quality = quality_rows_by_timeframe.get("1D")
+                if repaired_quality is not None:
+                    print(
+                        "        "
+                        f"quality={repaired_quality['quality_status']} "
+                        f"missing={repaired_quality['missing_bar_count']}/{repaired_quality['expected_bar_count']} "
+                        f"({repaired_quality['missing_bar_ratio']:.2%}) "
+                        f"last={repaired_quality['last_timestamp']}"
+                    )
+
         if daily_updated and df_1d is not None and not df_1d.empty:
             macro_df = self._generate_macro_layers(df_1d)
             if not macro_df.empty:
                 macro_df = self._compute_realized_volatility(macro_df)
-                frames.append(macro_df)
+                frames_by_timeframe["MACRO"] = macro_df
                 print(
                     f"  [+] Macro rows forged: {len(macro_df)} "
                     f"({', '.join(MACRO_TIMEFRAMES)})"
                 )
+
+        frames = list(frames_by_timeframe.values())
+        quality_rows = [
+            quality_rows_by_timeframe[timeframe]
+            for timeframe in FETCH_TIMEFRAMES
+            if timeframe in quality_rows_by_timeframe
+        ]
 
         if not frames:
             self._replace_symbol_history_atomic(

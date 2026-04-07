@@ -892,23 +892,49 @@ def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
             "long_mae_atr",
             0.40,
         ),  # Tightened: 40th percentile (Pro-Trader SL)
-        "up_tp1_atr": (1, "long_mfe_atr", 0.50),
-        "up_tp2_atr": (1, "long_mfe_atr", 0.80),
+        "up_tp1_atr": (1, "long_mfe_atr", 0.55),
+        "up_tp2_atr": (1, "long_mfe_atr", 0.75),
         "down_stop_atr": (0, "short_mae_atr", 0.40),  # Tightened
-        "down_tp1_atr": (0, "short_mfe_atr", 0.50),
-        "down_tp2_atr": (0, "short_mfe_atr", 0.80),
+        "down_tp1_atr": (0, "short_mfe_atr", 0.55),
+        "down_tp2_atr": (0, "short_mfe_atr", 0.75),
     }
     models = {}
     for key, (target_value, label_col, alpha) in specs.items():
+        directional_mask = df["target"] > 0.5 if target_value == 1 else df["target"] < 0.5
         train_df = (
-            df[df["target"] == target_value]
+            df[directional_mask]
             .dropna(subset=feature_cols + [label_col])
             .copy()
         )
         if len(train_df) < 300:
             continue
+
+        inner_val_size = max(60, int(len(train_df) * 0.15))
+        purge_gap = BARRIER_HORIZON_BARS
+        purged_end = -(inner_val_size + purge_gap)
+        if abs(purged_end) >= len(train_df):
+            purged_end = 0
+
+        if purged_end != 0:
+            X_tr = train_df[feature_cols].iloc[:purged_end]
+            y_tr = train_df[label_col].iloc[:purged_end]
+        else:
+            X_tr = train_df[feature_cols].iloc[:-inner_val_size]
+            y_tr = train_df[label_col].iloc[:-inner_val_size]
+        X_val = train_df[feature_cols].iloc[-inner_val_size:]
+        y_val = train_df[label_col].iloc[-inner_val_size:]
+
         model = _build_lgbm_regressor(alpha)
-        model.fit(train_df[feature_cols], train_df[label_col])
+        model.fit(
+            X_tr,
+            y_tr,
+            eval_set=[(X_val, y_val)],
+            eval_metric="quantile",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=40, verbose=False),
+                lgb.log_evaluation(period=10000),
+            ],
+        )
         models[key] = model
     return models
 
@@ -942,10 +968,9 @@ def predict_trade_plan(
     X = latest_row[feature_cols].values.reshape(1, -1)
 
     if all(key in plan_models for key in required):
-        # STRUCTURAL LIMITS: Never allow Sl beyond 1.25x ATR or TP beyond 5.00x ATR
-        stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 1.25))
-        tp1_atr = float(np.clip(plan_models[required[1]].predict(X)[0], 0.25, 3.00))
-        tp2_atr = float(np.clip(plan_models[required[2]].predict(X)[0], 0.50, 5.00))
+        stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 1.50))
+        tp1_atr = float(np.clip(plan_models[required[1]].predict(X)[0], 0.50, 4.00))
+        tp2_atr = float(np.clip(plan_models[required[2]].predict(X)[0], 1.00, 7.00))
 
         # Ensure Reward/Risk logic: TP1 should be at least 1x Stop
         tp1_atr = max(tp1_atr, stop_atr * 1.00)
@@ -1128,8 +1153,76 @@ def walk_forward(
 # ─────────────────────────────────────────────
 
 
+def _coerce_report_timestamp(
+    value: object,
+    *,
+    target_tz=None,
+) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    if target_tz is not None:
+        try:
+            ts = ts.tz_convert(target_tz)
+        except (TypeError, ValueError):
+            pass
+    return ts
+
+
+def _format_report_timestamp(
+    value: object,
+    *,
+    target_tz=None,
+) -> str:
+    ts = _coerce_report_timestamp(value, target_tz=target_tz)
+    if ts is None:
+        return "N/A"
+    return ts.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def build_report_data_lines(frame_map: dict[str, pd.DataFrame | None]) -> list[str]:
+    lines: list[str] = []
+    for label, df in frame_map.items():
+        if df is None or df.empty or "time" not in df.columns:
+            continue
+        last_bar = _coerce_report_timestamp(df["time"].iloc[-1])
+        target_tz = last_bar.tzinfo if last_bar is not None else None
+        quality = (
+            df.attrs.get("data_quality", {})
+            if isinstance(getattr(df, "attrs", None), dict)
+            else {}
+        )
+        status = "N/A"
+        synced_at = None
+        if isinstance(quality, dict):
+            status = str(
+                quality.get("quality_status")
+                or quality.get("status")
+                or "N/A"
+            ).upper()
+            synced_at = quality.get("synced_at")
+        lines.append(
+            f"DB {str(label).upper()}: "
+            f"last bar {_format_report_timestamp(last_bar, target_tz=target_tz)} | "
+            f"last sync {_format_report_timestamp(synced_at, target_tz=target_tz)} | "
+            f"quality {status}"
+        )
+    return lines
+
+
 def save_report(
-    wf_results: dict, save_path: str, pred_info: dict = None, symbol: str = "UNKNOWN"
+    wf_results: dict,
+    save_path: str,
+    pred_info: dict = None,
+    symbol: str = "UNKNOWN",
+    data_update_lines: list[str] | None = None,
 ):
     if not wf_results or "splits" not in wf_results or not wf_results["splits"]:
         print("  No walk-forward results to plot.")
@@ -1300,9 +1393,21 @@ def save_report(
         color="white",
         fontsize=18,
         fontweight="bold",
-        y=0.98,
+        y=0.985,
     )
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    if data_update_lines:
+        fig.text(
+            0.5,
+            0.955,
+            "\n".join(data_update_lines),
+            color="#b0bec5",
+            fontsize=9,
+            fontfamily="monospace",
+            ha="center",
+            va="top",
+        )
+    top_rect = 0.93 if data_update_lines else 0.96
+    plt.tight_layout(rect=[0, 0, 1, top_rect])
     plt.savefig(save_path, dpi=120, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close()
     print(f"\n  Report saved → {save_path}")
@@ -2026,7 +2131,12 @@ if __name__ == "__main__":
         }
 
         report_file = artifact_paths_1h["ml_report"]
-        save_report(wf_results, report_file, pred_info=pred_info)
+        save_report(
+            wf_results,
+            report_file,
+            pred_info=pred_info,
+            data_update_lines=build_report_data_lines({"1H": df_1h, "1D": df_1d}),
+        )
 
         fi_sorted = sorted(
             wf_results["feature_importance"].items(), key=lambda x: x[1], reverse=True
