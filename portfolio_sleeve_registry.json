@@ -1,0 +1,307 @@
+{
+  "generated_at_utc": "2026-04-08T23:01:13+00:00",
+  "criteria": {
+    "min_profit_factor": 1.25,
+    "min_sharpe": 0.3,
+    "max_drawdown": 0.2,
+    "min_trades": 8
+  },
+  "sleeves": {
+    "NIFTY_1H": {
+      "sleeve_id": "NIFTY_1H",
+      "symbol": "NIFTY",
+      "lane": "1H",
+      "variant": "policy",
+      "selected_variant": "policy",
+      "enabled": true,
+      "sharpe": 0.43995104692199655,
+      "profit_factor": 1.8891040054129102,
+      "max_drawdown": 0.038931935984039524,
+      "total_trades": 8,
+      "final_equity": 10815.254335769274,
+      "generated_at_utc": "2026-04-08T22:59:36+00:00",
+      "reason": "Selected policy by Sharpe/equity.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 0.30325068980938397,
+          "profit_factor": 1.4798938108580486,
+          "max_drawdown": 0.05246432907626751,
+          "total_trades": 9,
+          "final_equity": 10553.542276781816,
+          "generated_at_utc": "2026-04-08T22:59:36+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 0.43995104692199655,
+          "profit_factor": 1.8891040054129102,
+          "max_drawdown": 0.038931935984039524,
+          "total_trades": 8,
+          "final_equity": 10815.254335769274,
+          "generated_at_utc": "2026-04-08T22:59:36+00:00"
+        }
+      }
+    },
+    "NIFTY_1D": {
+      "sleeve_id": "NIFTY_1D",
+      "symbol": "NIFTY",
+      "lane": "1D",
+      "variant": null,
+      "selected_variant": null,
+      "enabled": false,
+      "sharpe": null,
+      "profit_factor": null,
+      "max_drawdown": null,
+      "total_trades": 0,
+      "final_equity": null,
+      "generated_at_utc": "2026-04-08T22:59:47+00:00",
+      "reason": "No variant met admission criteria.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 0.19716811327421588,
+          "profit_factor": 1.6021111796510292,
+          "max_drawdown": 0.07415182750903915,
+          "total_trades": 28,
+          "final_equity": 11693.990461320738,
+          "generated_at_utc": "2026-04-08T22:59:46+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 0.17069044317883722,
+          "profit_factor": 1.6350478228385739,
+          "max_drawdown": 0.07608007695542622,
+          "total_trades": 22,
+          "final_equity": 11184.834717509571,
+          "generated_at_utc": "2026-04-08T22:59:47+00:00"
+        }
+      }
+    },
+    "BANKNIFTY_1H": {
+      "sleeve_id": "BANKNIFTY_1H",
+      "symbol": "BANKNIFTY",
+      "lane": "1H",
+      "variant": "policy",
+      "selected_variant": "policy",
+      "enabled": true,
+      "sharpe": 0.3674595340242153,
+      "profit_factor": 1.3979163772216414,
+      "max_drawdown": 0.11649377150750563,
+      "total_trades": 18,
+      "final_equity": 11203.568057756473,
+      "generated_at_utc": "2026-04-08T22:59:55+00:00",
+      "reason": "Selected policy by Sharpe/equity.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 0.2606614521326753,
+          "profit_factor": 1.2357830061972634,
+          "max_drawdown": 0.12060159844274379,
+          "total_trades": 19,
+          "final_equity": 10771.645570386681,
+          "generated_at_utc": "2026-04-08T22:59:55+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 0.3674595340242153,
+          "profit_factor": 1.3979163772216414,
+          "max_drawdown": 0.11649377150750563,
+          "total_trades": 18,
+          "final_equity": 11203.568057756473,
+          "generated_at_utc": "2026-04-08T22:59:55+00:00"
+        }
+      }
+    },
+    "BANKNIFTY_1D": {
+      "sleeve_id": "BANKNIFTY_1D",
+      "symbol": "BANKNIFTY",
+      "lane": "1D",
+      "variant": null,
+      "selected_variant": null,
+      "enabled": false,
+      "sharpe": null,
+      "profit_factor": null,
+      "max_drawdown": null,
+      "total_trades": 0,
+      "final_equity": null,
+      "generated_at_utc": "2026-04-08T23:00:06+00:00",
+      "reason": "No variant met admission criteria.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 0.22736620779175665,
+          "profit_factor": 1.6415999150165512,
+          "max_drawdown": 0.08910881313251913,
+          "total_trades": 33,
+          "final_equity": 12421.444270634873,
+          "generated_at_utc": "2026-04-08T23:00:05+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 0.22435958197234665,
+          "profit_factor": 1.6415999150165512,
+          "max_drawdown": 0.06029998331773151,
+          "total_trades": 33,
+          "final_equity": 11573.93877591267,
+          "generated_at_utc": "2026-04-08T23:00:06+00:00"
+        }
+      }
+    },
+    "SENSEX_1H": {
+      "sleeve_id": "SENSEX_1H",
+      "symbol": "SENSEX",
+      "lane": "1H",
+      "variant": "base",
+      "selected_variant": "base",
+      "enabled": true,
+      "sharpe": 1.136640422532775,
+      "profit_factor": 1.8906418524945794,
+      "max_drawdown": 0.10370718229272037,
+      "total_trades": 45,
+      "final_equity": 12364.3223482221,
+      "generated_at_utc": "2026-04-08T23:00:13+00:00",
+      "reason": "Selected base by Sharpe/equity.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 1.136640422532775,
+          "profit_factor": 1.8906418524945794,
+          "max_drawdown": 0.10370718229272037,
+          "total_trades": 45,
+          "final_equity": 12364.3223482221,
+          "generated_at_utc": "2026-04-08T23:00:13+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 1.1217059345516354,
+          "profit_factor": 1.88341347918525,
+          "max_drawdown": 0.12109810327912585,
+          "total_trades": 45,
+          "final_equity": 12613.214961412117,
+          "generated_at_utc": "2026-04-08T23:00:13+00:00"
+        }
+      }
+    },
+    "SENSEX_1D": {
+      "sleeve_id": "SENSEX_1D",
+      "symbol": "SENSEX",
+      "lane": "1D",
+      "variant": "base",
+      "selected_variant": "base",
+      "enabled": true,
+      "sharpe": 0.6342380527356789,
+      "profit_factor": 8.060768528115888,
+      "max_drawdown": 0.01652740292410658,
+      "total_trades": 32,
+      "final_equity": 15537.873065481363,
+      "generated_at_utc": "2026-04-08T23:00:23+00:00",
+      "reason": "Selected base by Sharpe/equity.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 0.6342380527356789,
+          "profit_factor": 8.060768528115888,
+          "max_drawdown": 0.01652740292410658,
+          "total_trades": 32,
+          "final_equity": 15537.873065481363,
+          "generated_at_utc": "2026-04-08T23:00:23+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 0.6334989991223543,
+          "profit_factor": 8.060768528115887,
+          "max_drawdown": 0.019562460875152753,
+          "total_trades": 32,
+          "final_equity": 16922.3413318517,
+          "generated_at_utc": "2026-04-08T23:00:23+00:00"
+        }
+      }
+    },
+    "BTCUSDT_1H": {
+      "sleeve_id": "BTCUSDT_1H",
+      "symbol": "BTCUSDT",
+      "lane": "1H",
+      "variant": null,
+      "selected_variant": null,
+      "enabled": false,
+      "sharpe": null,
+      "profit_factor": null,
+      "max_drawdown": null,
+      "total_trades": 0,
+      "final_equity": null,
+      "generated_at_utc": "2026-04-08T23:01:02+00:00",
+      "reason": "No variant met admission criteria.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": -0.3996349634598454,
+          "profit_factor": 0.28578311515283683,
+          "max_drawdown": 0.056516313191155146,
+          "total_trades": 4,
+          "final_equity": 9589.724420197126,
+          "generated_at_utc": "2026-04-08T23:01:01+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": null,
+          "profit_factor": null,
+          "max_drawdown": 0.0,
+          "total_trades": 0,
+          "final_equity": 10000.0,
+          "generated_at_utc": "2026-04-08T23:01:02+00:00"
+        }
+      }
+    },
+    "BTCUSDT_1D": {
+      "sleeve_id": "BTCUSDT_1D",
+      "symbol": "BTCUSDT",
+      "lane": "1D",
+      "variant": null,
+      "selected_variant": null,
+      "enabled": false,
+      "sharpe": null,
+      "profit_factor": null,
+      "max_drawdown": null,
+      "total_trades": 0,
+      "final_equity": null,
+      "generated_at_utc": "2026-04-08T23:01:13+00:00",
+      "reason": "No variant met admission criteria.",
+      "variants": {
+        "base": {
+          "variant": "base",
+          "enabled": false,
+          "sharpe": 0.20903558048154416,
+          "profit_factor": 2.228290979849193,
+          "max_drawdown": 0.12470189548039488,
+          "total_trades": 14,
+          "final_equity": 12214.075848394117,
+          "generated_at_utc": "2026-04-08T23:01:13+00:00"
+        },
+        "policy": {
+          "variant": "policy",
+          "enabled": false,
+          "sharpe": 0.20868647176653804,
+          "profit_factor": 2.228290979849193,
+          "max_drawdown": 0.08105623206225664,
+          "total_trades": 14,
+          "final_equity": 11439.149301456177,
+          "generated_at_utc": "2026-04-08T23:01:13+00:00"
+        }
+      }
+    }
+  }
+}

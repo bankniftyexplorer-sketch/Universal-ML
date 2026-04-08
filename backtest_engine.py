@@ -28,14 +28,17 @@ from universal_ml_engine import (
     prepare_intraday_thermodynamics,
     resolve_artifact_path,
     migrate_legacy_artifacts,
+    score_policy_artifact,
 )
 from julia_bridge import (
     compute_backtest_bar_state_fast,
     holographic_feature_engine_fast as holographic_feature_engine,
     kalman_structural_engine_fast,
+    narrative_context_engine_fast,
     rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
+from sleeve_registry import load_sleeve_registry_entry
 
 warnings.filterwarnings("ignore")
 
@@ -143,6 +146,7 @@ def run_backtest(
     prob_array_1d,
     feature_cols,
     trade_plan_models=None,
+    policy_artifact=None,
     initial_capital=10000.0,
     risk_pct=0.02,
     conf_threshold=LIVE_CONFIDENCE_THRESHOLD,
@@ -152,6 +156,7 @@ def run_backtest(
     eod_gate_hour: int = EOD_GATE_HOUR,
     use_julia_bar_state: bool = True,
     use_julia_hurst: bool | None = None,
+    lane: str = "1H",
 ):
     if use_julia_hurst is not None:
         # Backward-compatible alias for older callers from the first migration
@@ -163,6 +168,7 @@ def run_backtest(
     peak_equity = equity
     max_drawdown = 0.0
     conflict_blocks = 0
+    policy_blocks = 0
     volatility_blocks = 0
     no_prediction_bars = 0
     trades = []
@@ -260,8 +266,26 @@ def run_backtest(
 
         confidence = float(confidence_arr[i])
         direction = "LONG" if direction_long_arr[i] else "SHORT"
+        policy_verdict = score_policy_artifact(
+            policy_artifact,
+            df.iloc[i].copy(),
+            proba_up=float(prob_array[i]),
+            direction="UP" if direction == "LONG" else "DOWN",
+            lane=lane,
+            confidence_threshold=conf_threshold,
+        )
+        if not bool(policy_verdict["allow_trade"]):
+            policy_blocks += 1
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+            i += 1
+            continue
 
-        risk_dollar = (initial_capital if fixed_risk else equity) * risk_pct
+        risk_dollar = (
+            (initial_capital if fixed_risk else equity)
+            * risk_pct
+            * float(policy_verdict["risk_mult"])
+        )
         trade_plan = predict_trade_plan(
             trade_plan_models or {},
             feature_cols,
@@ -310,6 +334,8 @@ def run_backtest(
                 "exit_reason": trade_path["exit_reason"],
                 "initial_risk": risk_dollar,
                 "confidence": confidence,
+                "policy_score": policy_verdict["score"],
+                "policy_risk_mult": policy_verdict["risk_mult"],
                 "pnl": pnl,
                 "status": "CLOSED",
                 "tp1_hit": trade_path["tp1_hit"],
@@ -332,6 +358,7 @@ def run_backtest(
         "equity_curve": equity_curve,
         "time_curve": time_curve,
         "conflict_blocks": conflict_blocks,
+        "policy_blocks": policy_blocks,
         "volatility_blocks": volatility_blocks,
         "shock_blocks": shock_blocks,
         "no_prediction_bars": no_prediction_bars,
@@ -601,8 +628,19 @@ def main():
     trade_plan_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "trade_plan_models"
     )
+    policy_path = resolve_artifact_path(
+        SYMBOL_DIR, file_prefix, "1H", "policy_artifact"
+    )
     calibrator_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "calibrator")
     # NOTE: 1D conflict gating via separate model is not implemented.
+
+    registry_entry = load_sleeve_registry_entry(SYMBOL, "1H")
+    if registry_entry is not None and not bool(registry_entry.get("enabled")):
+        print(
+            f"  [Registry] Sleeve {SYMBOL}_1H disabled. "
+            f"Reason: {registry_entry.get('reason', 'admission failed')}"
+        )
+        return
 
     if not os.path.exists(model_path) or not os.path.exists(feat_path):
         print(f"[!] Could not find {model_path} or {feat_path}.")
@@ -617,9 +655,23 @@ def main():
     trade_plan_models = (
         joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
     )
+    policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
     calibrator = (
         joblib.load(calibrator_path) if os.path.exists(calibrator_path) else None
     )
+    selected_variant = (
+        str(registry_entry.get("selected_variant"))
+        if registry_entry is not None and registry_entry.get("selected_variant")
+        else None
+    )
+    if selected_variant == "base":
+        policy_artifact = None
+        print(f"  [Registry] Using base variant for {SYMBOL}_1H.")
+    elif selected_variant == "policy":
+        if policy_artifact is None:
+            print(f"  [Registry] Policy variant selected for {SYMBOL}_1H but artifact is missing.")
+            return
+        print(f"  [Registry] Using policy variant for {SYMBOL}_1H.")
     if trade_plan_models:
         print(
             f"  [=] Trade-plan models loaded. {len(trade_plan_models)} ML exit models available."
@@ -627,6 +679,11 @@ def main():
     else:
         print(
             "  [!] WARNING: No ML trade-plan models found. Falling back to static ATR exits."
+        )
+    if policy_artifact is not None:
+        print(
+            f"  [=] Policy artifact loaded. "
+            f"Threshold {policy_artifact.get('deploy_threshold', float('nan')):.2f}"
         )
 
     print("  [=] Reconstructing holographic feature space over historical data...")
@@ -668,6 +725,9 @@ def main():
     rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     for col in rv_df.columns:
         df_full[col] = rv_df[col].values
+    nc_df = narrative_context_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
 
     # Step 3: ASOF-merge for temporal alignment
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
@@ -762,9 +822,11 @@ def main():
         prob_array_1d,
         feature_cols,
         trade_plan_models=trade_plan_models,
+        policy_artifact=policy_artifact,
         initial_capital=10000.0,
         risk_pct=0.02,
         conf_threshold=LIVE_CONFIDENCE_THRESHOLD,
+        lane="1H",
     )
 
     if results is None:
@@ -787,6 +849,7 @@ def main():
     print(f"  Max Consec Loss: {metrics.get('max_consec_loss', 0)}")
     print(f"  True TUW       : {metrics.get('true_tuw_days', 0)} Days")
     print(f"  Conflict Gated : {results.get('conflict_blocks', 0)} blocks bypassed")
+    print(f"  Policy Filter  : {results.get('policy_blocks', 0)} bars bypassed")
     print(
         f"  Shock Gate     : {results.get('shock_blocks', 0)} bars bypassed (|Z| > 2.5)"
     )

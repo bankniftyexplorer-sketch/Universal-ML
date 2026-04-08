@@ -45,6 +45,8 @@ from julia_bridge import (
     holographic_feature_engine_fast,
     kalman_structural_engine_daily,
     kalman_structural_engine_fast,
+    narrative_context_engine_daily,
+    narrative_context_engine_fast,
     rv_feature_engine_daily,
     rv_feature_engine_fast,
     smc_feature_engine_daily,
@@ -73,6 +75,7 @@ HASH_KEYS = (
     "oos_proba",
     "calibrator",
     "trade_plan_models",
+    "policy_artifact",
     "ml_report",
     "backtest_report",
 )
@@ -314,6 +317,9 @@ def _build_1h_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     for col in rv_df.columns:
         df_full[col] = rv_df[col].values
+    nc_df = narrative_context_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
     df_full = add_target_fast(
         df_full,
@@ -373,6 +379,9 @@ def _build_1d_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     kf_df = kalman_structural_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
     for col in kf_df.columns:
         df_full[col] = kf_df[col].values
+    nc_df = narrative_context_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
     df_full = _inject_macro_regime(df_full, df_6m, "6m")
     df_full = _inject_macro_regime(df_full, df_12m, "12m")
     df_full = add_daily_confluence(df_full)

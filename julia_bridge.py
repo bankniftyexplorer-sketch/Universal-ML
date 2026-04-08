@@ -528,6 +528,21 @@ _KALMAN_PIPELINES = {
     },
 }
 
+_NARRATIVE_CONTEXT_FIELDS = (
+    "regime_streak",
+    "regime_accel",
+    "cum_disp_since_flip",
+    "max_dd_since_flip",
+    "swing_count_since_flip",
+    "fib_range_age",
+    "fib_range_size",
+)
+
+_NARRATIVE_PIPELINES = {
+    "1H": {"mapped": ("1D", "1W")},
+    "1D": {"mapped": ("1W", "1M")},
+}
+
 
 def _kalman_structural_engine(
     df_primary: pd.DataFrame,
@@ -655,6 +670,162 @@ def _kalman_structural_engine(
             ordered_cols.append(f"kf_{prefix}_{field}")
 
     return result.reindex(columns=ordered_cols, fill_value=0.0)
+
+
+def _narrative_context_engine(
+    df_primary: pd.DataFrame,
+    htf_frames: dict[str, pd.DataFrame | None],
+    *,
+    primary_tf: str,
+) -> pd.DataFrame:
+    """
+    Compute narrative context features for the primary TF and map HTF contexts.
+
+    Returns a DataFrame with:
+      - 7 primary columns:  nc_{field}
+      - 7 per HTF columns:  nc_{htf_label}_{field}
+      - 2 cross-TF columns: nc_cross_tf_sum, nc_cross_tf_abs
+    """
+    config = _NARRATIVE_PIPELINES.get(primary_tf.upper())
+    if config is None:
+        return pd.DataFrame(index=df_primary.index)
+
+    primary = _prepare_kalman_frame(df_primary)
+    if primary is None:
+        return pd.DataFrame(index=df_primary.index)
+
+    _, TM = _init_julia()
+    primary_inputs = _extract_kalman_inputs(primary)
+
+    primary_state = _materialize_kalman_state(
+        TM.compute_kalman_tf_state(
+            primary_inputs["open"],
+            primary_inputs["high"],
+            primary_inputs["low"],
+            primary_inputs["close"],
+            primary_inputs["volume"],
+            primary_inputs["atr"],
+        )
+    )
+
+    split = _split_swings_by_type(primary_state)
+
+    nc_jl = TM.compute_narrative_context(
+        primary_inputs["close"],
+        primary_inputs["atr"],
+        primary_state["regime"],
+        _to_i64(primary_state["confirm_bar"]),
+        split["high_price"],
+        split["high_confirm"],
+        split["low_price"],
+        split["low_confirm"],
+    )
+    nc_dict = {str(k): np.array(nc_jl[k], dtype=np.float64) for k in nc_jl}
+
+    result = pd.DataFrame(index=primary.index)
+    for field in _NARRATIVE_CONTEXT_FIELDS:
+        result[f"nc_{field}"] = nc_dict.get(field, np.zeros(len(primary)))
+
+    regime_signs = [np.sign(np.asarray(primary_state["regime"], dtype=np.float64))]
+
+    for label in config["mapped"]:
+        frame = _prepare_kalman_frame(htf_frames.get(label))
+        if frame is None or len(frame) < 3:
+            for field in _NARRATIVE_CONTEXT_FIELDS:
+                result[f"nc_{label.lower()}_{field}"] = 0.0
+            continue
+
+        htf_inputs = _extract_kalman_inputs(
+            frame,
+            timeframe_label=label,
+            align_to_close=True,
+        )
+        htf_state = _materialize_kalman_state(
+            TM.compute_kalman_tf_state(
+                htf_inputs["open"],
+                htf_inputs["high"],
+                htf_inputs["low"],
+                htf_inputs["close"],
+                htf_inputs["volume"],
+                htf_inputs["atr"],
+            )
+        )
+
+        htf_split = _split_swings_by_type(htf_state)
+        htf_nc_jl = TM.compute_narrative_context(
+            htf_inputs["close"],
+            htf_inputs["atr"],
+            htf_state["regime"],
+            _to_i64(htf_state["confirm_bar"]),
+            htf_split["high_price"],
+            htf_split["high_confirm"],
+            htf_split["low_price"],
+            htf_split["low_confirm"],
+        )
+        htf_nc = {str(k): np.array(htf_nc_jl[k], dtype=np.float64) for k in htf_nc_jl}
+
+        prefix = label.lower()
+        for field in _NARRATIVE_CONTEXT_FIELDS:
+            vals = htf_nc.get(field, np.zeros(len(frame)))
+            result[f"nc_{prefix}_{field}"] = _map_htf_series_to_primary(
+                primary_inputs["time"],
+                htf_inputs["time"],
+                vals,
+            )
+
+        htf_regime = np.asarray(htf_state["regime"], dtype=np.float64)
+        mapped_sign = _map_htf_series_to_primary(
+            primary_inputs["time"],
+            htf_inputs["time"],
+            np.sign(htf_regime),
+        )
+        regime_signs.append(mapped_sign)
+
+    alignment = np.sum(regime_signs, axis=0)
+    result["nc_cross_tf_sum"] = alignment
+    result["nc_cross_tf_abs"] = np.abs(alignment)
+
+    ordered_cols = [f"nc_{field}" for field in _NARRATIVE_CONTEXT_FIELDS]
+    for label in config["mapped"]:
+        prefix = label.lower()
+        ordered_cols.extend(
+            f"nc_{prefix}_{field}" for field in _NARRATIVE_CONTEXT_FIELDS
+        )
+    ordered_cols.extend(("nc_cross_tf_sum", "nc_cross_tf_abs"))
+
+    return (
+        result.reindex(columns=ordered_cols, fill_value=0.0)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+
+def narrative_context_engine_fast(
+    df_1h: pd.DataFrame,
+    df_1d: pd.DataFrame | None = None,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """1H-lane narrative context: primary + 1D + 1W mapped."""
+    return _narrative_context_engine(
+        df_1h,
+        {"1D": df_1d, "1W": df_1w, "1M": df_1m},
+        primary_tf="1H",
+    )
+
+
+def narrative_context_engine_daily(
+    df_1d: pd.DataFrame,
+    df_1w: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+    df_6m: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """1D-lane narrative context: primary + 1W + 1M mapped."""
+    return _narrative_context_engine(
+        df_1d,
+        {"1W": df_1w, "1M": df_1m, "6M": df_6m},
+        primary_tf="1D",
+    )
 
 
 def compute_hurst_fast(

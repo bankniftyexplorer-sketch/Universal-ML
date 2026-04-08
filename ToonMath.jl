@@ -1782,56 +1782,92 @@ function add_target_loop(
             entry_price = long_entry_price
             curr_atr    = atrs[i]
 
-            ## LONG MFE/MAE
+            ## LONG MFE/MAE (DECOUPLED)
             sl_dist_l  = 2.0 * curr_atr
             sl_price_l = entry_price - sl_dist_l
+            
+            # Kinematic trackers (Capped)
             peak_high_l = entry_price
             peak_low_l  = entry_price
+            kin_alive_l = true
+            
+            # True Limit trackers (Uncapped)
+            uncap_peak_high_l = entry_price
+            uncap_peak_low_l  = entry_price
 
             for j in entry_idx_jl:horizon_end-1
                 val_high = highs[j]; val_low = lows[j]
-                if val_low <= sl_price_l
-                    peak_high_l = max(peak_high_l, val_high)
-                    peak_low_l  = sl_price_l
-                    break
-                else
-                    peak_high_l = max(peak_high_l, val_high)
-                    peak_low_l  = min(peak_low_l, val_low)
+                
+                # Uncapped Tracking (For ML Trade Plan)
+                uncap_peak_high_l = max(uncap_peak_high_l, val_high)
+                uncap_peak_low_l  = min(uncap_peak_low_l, val_low)
+                
+                # Kinematic Tracking (For Classifier)
+                if kin_alive_l
+                    if val_low <= sl_price_l
+                        peak_high_l = max(peak_high_l, val_high)
+                        peak_low_l  = sl_price_l
+                        kin_alive_l = false
+                    else
+                        peak_high_l = max(peak_high_l, val_high)
+                        peak_low_l  = min(peak_low_l, val_low)
+                    end
                 end
             end
-            long_mfe_atr[i] = max(0.0, (peak_high_l - entry_price) / (curr_atr + 1e-9))
-            long_mae_atr[i] = max(0.0, (entry_price - peak_low_l)  / (curr_atr + 1e-9))
+            
+            kin_mfe_l = max(0.0, (peak_high_l - entry_price) / (curr_atr + 1e-9))
+            kin_mae_l = max(0.0, (entry_price - peak_low_l)  / (curr_atr + 1e-9))
+            
+            # Exported True Limits
+            long_mfe_atr[i] = max(0.0, (uncap_peak_high_l - entry_price) / (curr_atr + 1e-9))
+            long_mae_atr[i] = max(0.0, (entry_price - uncap_peak_low_l)  / (curr_atr + 1e-9))
 
-            ## SHORT MFE/MAE
+            ## SHORT MFE/MAE (DECOUPLED)
             sl_dist_s  = 2.0 * curr_atr
             sl_price_s = entry_price + sl_dist_s
+            
+            # Kinematic trackers (Capped)
             peak_low_s  = entry_price
             peak_high_s = entry_price
+            kin_alive_s = true
+            
+            # True Limit trackers (Uncapped)
+            uncap_peak_low_s  = entry_price
+            uncap_peak_high_s = entry_price
 
             for j in entry_idx_jl:horizon_end-1
                 val_high = highs[j]; val_low = lows[j]
-                if val_high >= sl_price_s
-                    peak_low_s  = min(peak_low_s, val_low)
-                    peak_high_s = sl_price_s
-                    break
-                else
-                    peak_low_s  = min(peak_low_s, val_low)
-                    peak_high_s = max(peak_high_s, val_high)
+                
+                # Uncapped Tracking (For ML Trade Plan)
+                uncap_peak_low_s  = min(uncap_peak_low_s, val_low)
+                uncap_peak_high_s = max(uncap_peak_high_s, val_high)
+                
+                # Kinematic Tracking (For Classifier)
+                if kin_alive_s
+                    if val_high >= sl_price_s
+                        peak_low_s  = min(peak_low_s, val_low)
+                        peak_high_s = sl_price_s
+                        kin_alive_s = false
+                    else
+                        peak_low_s  = min(peak_low_s, val_low)
+                        peak_high_s = max(peak_high_s, val_high)
+                    end
                 end
             end
-            short_mfe_atr[i] = max(0.0, (entry_price - peak_low_s) / (curr_atr + 1e-9))
-            short_mae_atr[i] = max(0.0, (peak_high_s - entry_price) / (curr_atr + 1e-9))
-        end
-
-        # Kinetic score and target assignment (mirrors Python exactly)
-        if horizon_end > entry_idx_jl && atrs[i] > 0.0
-            mfe_l = long_mfe_atr[i]; mae_l = long_mae_atr[i]
-            raw_long = mfe_l / (mfe_l + mae_l + 1e-9)
+            
+            kin_mfe_s = max(0.0, (entry_price - peak_low_s) / (curr_atr + 1e-9))
+            kin_mae_s = max(0.0, (peak_high_s - entry_price) / (curr_atr + 1e-9))
+            
+            # Exported True Limits
+            short_mfe_atr[i] = max(0.0, (entry_price - uncap_peak_low_s) / (curr_atr + 1e-9))
+            short_mae_atr[i] = max(0.0, (uncap_peak_high_s - entry_price) / (curr_atr + 1e-9))
+        
+            # Kinetic score and target assignment
+            raw_long = kin_mfe_l / (kin_mfe_l + kin_mae_l + 1e-9)
             vel_l    = 1.0 - ((long_eidx - i) / horizon)
             long_kinscore = raw_long * max(0.01, vel_l)
 
-            mfe_s = short_mfe_atr[i]; mae_s = short_mae_atr[i]
-            raw_short = mfe_s / (mfe_s + mae_s + 1e-9)
+            raw_short = kin_mfe_s / (kin_mfe_s + kin_mae_s + 1e-9)
             vel_s     = 1.0 - ((short_eidx - i) / horizon)
             short_kinscore = raw_short * max(0.01, vel_s)
 
@@ -3180,6 +3216,168 @@ function compute_rv_features(
         "jump_ratio" => jump_ratio_out,
         "rv_asym" => rv_asym_out,
         "rv_skew" => rv_skew_out,
+    )
+end
+
+"""
+    compute_narrative_context(
+        closes, atrs, regime, swing_confirm_bars,
+        swing_highs_price, swing_highs_confirm,
+        swing_lows_price, swing_lows_confirm
+    ) -> Dict{String, Vector{Float64}}
+
+Narrative Context Awareness — 7 columns per timeframe:
+  regime_streak           — consecutive bars of same-sign regime
+  regime_accel            — MA(5) - MA(20) of regime, ATR-normalized
+  cum_disp_since_flip     — cumulative ATR-normalized returns since regime flip
+  max_dd_since_flip       — max drawdown from phase high, ATR-normalized
+  swing_count_since_flip  — Kalman swing events since last regime flip
+  fib_range_age           — bars since latest confirming swing
+  fib_range_size          — current swing range / ATR
+
+All O(n) single-pass. No heap allocation in hot loops.
+"""
+function compute_narrative_context(
+    closes::Vector{Float64},
+    atrs::Vector{Float64},
+    regime::Vector{Float64},
+    swing_confirm_bars::Vector{Int64},
+    swing_highs_price::Vector{Float64},
+    swing_highs_confirm::Vector{Int64},
+    swing_lows_price::Vector{Float64},
+    swing_lows_confirm::Vector{Int64},
+)::Dict{String, Vector{Float64}}
+    n = length(closes)
+    eps = 1e-9
+
+    streak = zeros(Float64, n)
+    accel = zeros(Float64, n)
+    cum_disp = zeros(Float64, n)
+    max_dd = zeros(Float64, n)
+    sw_count = zeros(Float64, n)
+    fib_age = zeros(Float64, n)
+    fib_size = zeros(Float64, n)
+
+    # ── 1. Regime streak ──
+    @inbounds for i in 2:n
+        if (regime[i] >= 0.0) == (regime[i-1] >= 0.0)
+            streak[i] = streak[i-1] + 1.0
+        else
+            streak[i] = 1.0
+        end
+    end
+
+    # ── 2. Regime acceleration (MA5 - MA20 of regime / ATR) ──
+    # Use cumulative sum for O(1) rolling mean
+    regime_cumsum = zeros(Float64, n + 1)
+    @inbounds for i in 1:n
+        regime_cumsum[i + 1] = regime_cumsum[i] + regime[i]
+    end
+    @inbounds for i in 1:n
+        s5 = max(i - 4, 1)
+        s20 = max(i - 19, 1)
+        ma5 = (regime_cumsum[i + 1] - regime_cumsum[s5]) / (i - s5 + 1)
+        ma20 = (regime_cumsum[i + 1] - regime_cumsum[s20]) / (i - s20 + 1)
+        atr_i = atrs[i]
+        scale = (isfinite(atr_i) && atr_i > eps) ? atr_i : 1.0
+        accel[i] = (ma5 - ma20) / scale
+    end
+
+    # ── 3. Cumulative displacement since flip + 4. Max drawdown since flip + 5. Swing count ──
+    swing_set = Set{Int64}(swing_confirm_bars)
+    cum_sum = 0.0
+    phase_high = closes[1]
+    sw_cnt = 0
+
+    @inbounds for i in 2:n
+        atr_i = atrs[i]
+        scale = (isfinite(atr_i) && atr_i > eps) ? atr_i : 1.0
+
+        # Flip detection
+        if (regime[i] >= 0.0) != (regime[i-1] >= 0.0)
+            cum_sum = 0.0
+            phase_high = closes[i]
+            sw_cnt = 0
+        end
+
+        # Cumulative displacement
+        bar_ret = (closes[i] - closes[i-1]) / scale
+        cum_sum += bar_ret
+        cum_disp[i] = cum_sum
+
+        # Max drawdown from phase high
+        if closes[i] > phase_high
+            phase_high = closes[i]
+        end
+        max_dd[i] = (phase_high - closes[i]) / scale
+
+        # Swing count
+        if i in swing_set
+            sw_cnt += 1
+        end
+        sw_count[i] = Float64(sw_cnt)
+    end
+
+    # ── 6 & 7. Fib range age and size ──
+    n_sh = length(swing_highs_confirm)
+    n_sl = length(swing_lows_confirm)
+    sh_ptr = 1
+    sl_ptr = 1
+    curr_sh = NaN
+    curr_sl = NaN
+    latest_bar = 0
+
+    @inbounds for i in 1:n
+        while sh_ptr <= n_sh && swing_highs_confirm[sh_ptr] <= i
+            curr_sh = swing_highs_price[sh_ptr]
+            latest_bar = max(latest_bar, Int(swing_highs_confirm[sh_ptr]))
+            sh_ptr += 1
+        end
+        while sl_ptr <= n_sl && swing_lows_confirm[sl_ptr] <= i
+            curr_sl = swing_lows_price[sl_ptr]
+            latest_bar = max(latest_bar, Int(swing_lows_confirm[sl_ptr]))
+            sl_ptr += 1
+        end
+
+        if isfinite(curr_sh) && isfinite(curr_sl) && curr_sh > curr_sl
+            fib_age[i] = Float64(i - latest_bar)
+            atr_i = atrs[i]
+            scale = (isfinite(atr_i) && atr_i > eps) ? atr_i : 1.0
+            fib_size[i] = (curr_sh - curr_sl) / scale
+        end
+    end
+
+    return Dict{String, Vector{Float64}}(
+        "regime_streak" => streak,
+        "regime_accel" => accel,
+        "cum_disp_since_flip" => cum_disp,
+        "max_dd_since_flip" => max_dd,
+        "swing_count_since_flip" => sw_count,
+        "fib_range_age" => fib_age,
+        "fib_range_size" => fib_size,
+    )
+end
+
+# AbstractVector dispatch wrapper
+function compute_narrative_context(
+    closes::AbstractVector{Float64},
+    atrs::AbstractVector{Float64},
+    regime::AbstractVector{Float64},
+    swing_confirm_bars::AbstractVector{Int64},
+    swing_highs_price::AbstractVector{Float64},
+    swing_highs_confirm::AbstractVector{Int64},
+    swing_lows_price::AbstractVector{Float64},
+    swing_lows_confirm::AbstractVector{Int64},
+)::Dict{String, Vector{Float64}}
+    return compute_narrative_context(
+        collect(Float64, closes),
+        collect(Float64, atrs),
+        collect(Float64, regime),
+        collect(Int64, swing_confirm_bars),
+        collect(Float64, swing_highs_price),
+        collect(Int64, swing_highs_confirm),
+        collect(Float64, swing_lows_price),
+        collect(Int64, swing_lows_confirm),
     )
 end
 

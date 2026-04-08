@@ -8,7 +8,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 
 ## One-screen summary
 
-- Core purpose: predict market direction from OHLCV using Julia-native holographic geometry, SMC institutional-intent, Kalman structural, and realized-volatility surface features.
+- Core purpose: predict market direction from OHLCV using Julia-native holographic geometry, SMC institutional-intent, Kalman structural, realized-volatility surface, and narrative-context features.
 - Active production lanes:
   - `1H` intraday lane
   - `1D` daily lane
@@ -16,21 +16,25 @@ After any bugfix, modification, or addition that changes repo behavior or contra
   - canonical market data DB: `data_vault/ohlcv.db`
   - optional local custom Yahoo alias registry: `data_vault/custom_yahoo_instruments.json`
   - per-symbol artifacts: `<PROJECT_ROOT>/<SYMBOL>/`
+  - cross-symbol sleeve admission registry: `<PROJECT_ROOT>/portfolio_sleeve_registry.json`
   - local accuracy baselines: `<PROJECT_ROOT>/.accuracy_baselines/<SYMBOL>.json`
 - Market data is now guarded by a sync-quality ledger plus a strict runtime gate at the bridge.
 - The vault can also run as a resource-gated auto-sync supervisor that only refreshes when CPU load and Yahoo probe throughput clear configured thresholds.
-- Feature space is now built from four Julia-driven families:
+- Feature space is now built from five Julia-driven families:
   - holographic geometry features
   - SMC institutional-intent features
   - Kalman structural features
   - realized-volatility surface features
-- Both active lanes now inject Julia-native realized-volatility surfaces through `julia_bridge.py`.
+  - narrative-context awareness features
+- Both active lanes now inject Julia-native realized-volatility surfaces and narrative-context awareness through `julia_bridge.py`.
 - The raw `realized_volatility` series from the vault remains state only and is excluded from feature selection.
 - Feature math lives in Julia kernels, called from Python bridges.
 - `julia_bridge.py` is the only supported Python interface to `ToonMath.jl`, and it shifts higher-timeframe timestamps to bar-close availability before Julia dispatch or Python-side HTF projection mapping.
 - `holographic_engine.py` is a frozen legacy module; only its feature-selection helpers remain live.
 - LightGBM now trains as a 3-member ensemble in both active lanes.
 - OOS probability maps are isotonic-calibrated and the fitted calibrators are saved as artifacts.
+- Both active lanes can also train a second-stage policy artifact that learns execution filtering and risk scaling on top of the base directional model.
+- Both active lanes preserve raw OHLC state inside their model-ready training frames so trade-plan and policy replay can simulate candidate trades without rebuilding the raw bars.
 - Backtests and live inference reuse saved artifacts instead of rebuilding everything from scratch.
 - Saved-artifact accuracy can be checked without retraining via `accuracy_guardrail.py`.
 
@@ -49,6 +53,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
 | `live_inference.py` | Fast `1H` signal path without retraining | You care about current live signal |
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
+| `sleeve_registry.py` | Builds the cross-symbol sleeve admission registry from honest replay metrics and chooses `base` vs `policy` execution per symbol/lane | You want deployable sleeve selection |
 | `accuracy_guardrail.py` | Rebuilds model-ready frames, replays saved OOS maps, compares against a local baseline | You care about proving an update did or did not change saved-artifact accuracy |
 | `holographic_engine.py` | Frozen legacy module; only the selection helpers (`feature_selection_pipeline`, `correlation_filter`, `phase1_ranking`) remain live | You care about feature selection or legacy context |
 | `julia_bridge.py` | Only supported Python-to-Julia adapter for holographic, SMC, Kalman, realized-volatility, target, and backtest helper kernels; it also enforces higher-timeframe close-availability alignment | You care about bridge contracts or array prep |
@@ -95,20 +100,28 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 9. `julia_bridge.rv_feature_engine_fast()` adds a 47-column `1H` realized-volatility surface:
    - 11 primary `1H` RV features
    - 12 columns each from `1D/1W/1M` (11 HTF RV features + 1 term-structure column), aligned to completed bars only
-10. `universal_ml_engine.merge_higher_tf()` aligns higher-timeframe raw context onto the `1H` frame.
-11. `julia_bridge.add_target_fast()` creates labels from forward trade simulation.
+10. `julia_bridge.narrative_context_engine_fast()` adds a 23-column `1H` narrative-context family:
+   - 7 primary `1H` narrative-context features from Kalman regime persistence, displacement, drawdown, swing count, and fib range state
+   - 7 mapped columns each from `1D` and `1W`, aligned to completed bars only
+   - 2 cross-timeframe alignment columns: `nc_cross_tf_sum` and `nc_cross_tf_abs`
+11. `universal_ml_engine.merge_higher_tf()` aligns higher-timeframe raw context onto the `1H` frame.
+12. `julia_bridge.add_target_fast()` creates decoupled labels from forward trade simulation: Kinematic (capped) ensuring entry classifier precision, and Excursion (uncapped) ensuring exit regressor ceilings.
    - directional trade-plan regressors treat targets as continuous kinetic scores and split direction with `target > 0.5` for long and `target < 0.5` for short
-12. `universal_ml_engine.fold_consensus_feature_selection()` runs nested feature selection inside each walk-forward fold using `holographic_engine.correlation_filter()` and `phase1_ranking()`, then keeps the consensus feature set.
-13. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation with the shared ensemble trainer.
-14. `calibrate_oos_probabilities()` fits an isotonic calibrator from the saved OOS map and persists it beside the model artifact.
-15. `train_trade_plan_models()` fits the six `1H` exit quantile regressors with an inner validation slice, a `24`-bar purge gap, and dynamic minimum-sample guards before saving them under the standard trade-plan artifact.
-16. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme, now including the calibrator artifact.
-17. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV` SPOT-only feature-prep contract before consuming saved artifacts.
-18. `backtest_engine.py` and `meta_strategy_selector.py` now apply the saved calibrator to OOS probabilities before confidence gating or strategy ranking, so historical simulation matches the calibrated runtime path.
-19. `live_inference.py` applies the saved calibrator to the latest prediction, and `predict_next_bar()` also applies regime-aware confidence penalties from RV vol-of-vol and Kalman flat-regime checks.
-20. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
-21. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
-22. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
+13. `universal_ml_engine.fold_consensus_feature_selection()` runs nested feature selection inside each walk-forward fold using `holographic_engine.correlation_filter()` and `phase1_ranking()`, then keeps the consensus feature set.
+14. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation with the shared ensemble trainer.
+15. `calibrate_oos_probabilities()` fits an isotonic calibrator from the saved OOS map and persists it beside the model artifact.
+16. `train_trade_plan_models()` fits the six `1H` exit quantile regressors with an inner validation slice, a `24`-bar purge gap, and dynamic minimum-sample guards before saving them under the standard trade-plan artifact.
+17. `train_policy_artifact()` fits a second-stage `1H` execution policy on honest post-trade-plan candidate trades and saves a deploy threshold plus risk bands as a symbol-scoped artifact.
+18. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme, now including the calibrator and policy artifact.
+19. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV + Narrative Context` SPOT-only feature-prep contract before consuming saved artifacts.
+20. `backtest_engine.py` and `meta_strategy_selector.py` now apply the saved calibrator to OOS probabilities before confidence gating or strategy ranking, so historical simulation matches the calibrated runtime path.
+21. The same saved `1H` policy artifact is consumed by training summaries, backtests, live inference, and meta-strategy evaluation, so execution filtering is no longer a training-only idea.
+22. `sleeve_registry.py` can replay saved `1H` and `1D` artifacts, train candidate policy artifacts if needed, and write a deployable `portfolio_sleeve_registry.json` that decides whether each sleeve is enabled and whether `base` or `policy` execution is allowed.
+23. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` now obey the `1H` sleeve registry before executing signals or replay, so disabled sleeves are blocked consistently.
+24. `live_inference.py` applies the saved calibrator to the latest prediction, then the policy artifact when the registry allows it, and `predict_next_bar()` also applies regime-aware confidence penalties from RV vol-of-vol and Kalman flat-regime checks.
+25. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
+26. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
+27. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
 
 ### `1D` daily lane
 
@@ -134,16 +147,22 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 9. `julia_bridge.rv_feature_engine_daily()` adds a 71-column daily realized-volatility surface:
    - 11 primary `1D` RV features
    - 12 columns each from `1W/1M/3M/6M/12M` (11 HTF RV features + 1 term-structure column), aligned to completed bars only
-10. `daily_ml_engine.compute_macro_regime()` adds compact `6M` and `12M` regime overlays.
-11. `daily_ml_engine.add_daily_confluence()` adds daily confluence terms.
-12. `julia_bridge.add_target_fast()` creates daily labels with the daily horizon settings.
-13. `fold_consensus_feature_selection_daily()` performs the same nested consensus-selection contract as the `1H` lane before `walk_forward_daily()` trains the ensemble final model.
-14. `calibrate_oos_probabilities()` fits and saves a `1D` isotonic calibrator from the saved daily OOS map.
-15. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme, now including the calibrator artifact.
-16. The daily lane now uses its own calibrated confidence gate (`0.72` at present) instead of the intraday threshold because calibrated daily probabilities were too dense around the old shared gate.
-17. Weak-confidence or stale latest-bar `1D` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
-18. `daily_backtest_engine.py` reconstructs the same `1D + RV + SMC + Kalman + macro-regime` feature space, applies the saved daily calibrator to the OOS map, and replays the saved `1D` model.
-19. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
+10. `julia_bridge.narrative_context_engine_daily()` adds a 23-column daily narrative-context family:
+   - 7 primary `1D` narrative-context features from Kalman regime persistence, displacement, drawdown, swing count, and fib range state
+   - 7 mapped columns each from `1W` and `1M`, aligned to completed bars only
+   - 2 cross-timeframe alignment columns: `nc_cross_tf_sum` and `nc_cross_tf_abs`
+11. `daily_ml_engine.compute_macro_regime()` adds compact `6M` and `12M` regime overlays.
+12. `daily_ml_engine.add_daily_confluence()` adds daily confluence terms.
+13. `julia_bridge.add_target_fast()` creates daily labels with the daily horizon settings.
+14. `fold_consensus_feature_selection_daily()` performs the same nested consensus-selection contract as the `1H` lane before `walk_forward_daily()` trains the ensemble final model.
+15. `calibrate_oos_probabilities()` fits and saves a `1D` isotonic calibrator from the saved daily OOS map.
+16. `train_policy_artifact()` fits a second-stage `1D` execution policy on honest post-trade-plan candidate trades and saves a deploy threshold plus risk bands as a symbol-scoped artifact.
+17. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme, now including the calibrator and policy artifact.
+18. The daily lane now uses its own calibrated confidence gate (`0.72` at present) instead of the intraday threshold because calibrated daily probabilities were too dense around the old shared gate.
+19. Weak-confidence or stale latest-bar `1D` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels and the policy artifact can still suppress execution.
+20. `daily_backtest_engine.py` reconstructs the same `1D + RV + SMC + Kalman + Narrative Context + macro-regime` feature space, applies the saved daily calibrator to the OOS map, and replays the saved `1D` model through the same policy artifact when present.
+21. `sleeve_registry.py` writes the daily sleeve admission verdict into the shared registry, and `daily_backtest_engine.py` now obeys that verdict before replay.
+22. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
 
 ## Data contracts
 
@@ -186,6 +205,12 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 
 Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 
+### Shared portfolio artifact
+
+- `portfolio_sleeve_registry.json`
+- built by `sleeve_registry.py`
+- stores sleeve admission criteria, replay metrics, `enabled` status, and chosen `base` vs `policy` execution variant per `SYMBOL x LANE`
+
 ### `1H`
 
 - `{symbol}_1H_model.pkl`
@@ -193,6 +218,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1H_oos_proba.pkl`
 - `{symbol}_1H_calibrator.pkl`
 - `{symbol}_1H_trade_plan_models.pkl`
+- `{symbol}_1H_policy_artifact.pkl`
 - `{symbol}_1H_ml_report.png`
 - `{symbol}_1H_backtest_report.png`
 
@@ -203,6 +229,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1D_oos_proba.pkl`
 - `{symbol}_1D_calibrator.pkl`
 - `{symbol}_1D_trade_plan_models.pkl`
+- `{symbol}_1D_policy_artifact.pkl`
 - `{symbol}_1D_ml_report.png`
 - `{symbol}_1D_backtest_report.png`
 
@@ -227,10 +254,11 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `julia_bridge.py` is the only supported adapter into `ToonMath.jl`; Python code should not include or reference `ToonMath.jl` directly.
 - `holographic_engine.py` is a frozen legacy file whose only live selection helpers are `feature_selection_pipeline`, `correlation_filter`, and `phase1_ranking`.
 - `backtest_engine.py` and `daily_backtest_engine.py` depend on saved model artifacts.
+- `sleeve_registry.py` depends on saved model artifacts plus honest replay through the backtest engines.
 - `live_inference.py` depends on saved `1H` artifacts, the latest DB state, and optionally `shadow_brain.py`.
 - `meta_strategy_selector.py` depends on the same reconstructed `1H` feature space as the training lane.
 - `accuracy_guardrail.py` depends on the same DB + feature-prep contracts as the training roots, but does not retrain models.
-- Both active lanes consume Julia-native realized-volatility surfaces built from OHLC data, while the DB-level `realized_volatility` series remains supporting state.
+- Both active lanes consume Julia-native realized-volatility surfaces and narrative-context families through `julia_bridge.py`, while the DB-level `realized_volatility` series remains supporting state.
 
 ## Fast read order for another AI
 
@@ -272,8 +300,8 @@ If you need:
 - `market_sync_quality` is the machine-facing health ledger for base-lane history.
 - `InferenceBridge` now defaults to strict runtime gating, so `FAIL` quality is an operational firewall rather than a warning.
 - Julia does the heavy numerical work; Python orchestrates data flow, model training, reporting, and file management.
-- `ToonMath.jl` is the active holographic, SMC, Kalman, and realized-volatility engine.
-- Both active lanes combine holographic geometry, SMC institutional-intent, Kalman structural, and realized-volatility surface features.
+- `ToonMath.jl` is the active holographic, SMC, Kalman, realized-volatility, and narrative-context engine.
+- Both active lanes combine holographic geometry, SMC institutional-intent, Kalman structural, realized-volatility surface, and narrative-context features.
 - The `1D` lane additionally injects `6M/12M` macro-regime overlays on top of the shared Julia feature families.
 - Weak-confidence or stale latest-bar forecasts are marked `NO_TRADE`, but forecast text and PNG reports still print the experimental SL/TP/trailing levels.
 - There is no formal unit-test suite; confidence comes from walk-forward validation, saved OOS probability maps, and backtest reports.

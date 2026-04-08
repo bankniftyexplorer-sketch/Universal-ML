@@ -21,6 +21,7 @@ from daily_ml_engine import LIVE_CONFIDENCE_THRESHOLD_DAILY
 from julia_bridge import (
     holographic_feature_engine_daily,
     kalman_structural_engine_daily,
+    narrative_context_engine_daily,
     rv_feature_engine_daily,
     smc_feature_engine_daily,
 )
@@ -36,6 +37,7 @@ from universal_ml_engine import (
     resolve_artifact_path,
     select_primary_timeframe,
 )
+from sleeve_registry import load_sleeve_registry_entry
 
 warnings.filterwarnings("ignore")
 
@@ -129,6 +131,15 @@ def main() -> None:
     trade_plan_path = resolve_artifact_path(
         symbol_dir, file_prefix, "1D", "trade_plan_models"
     )
+    policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "policy_artifact")
+
+    registry_entry = load_sleeve_registry_entry(symbol, "1D")
+    if registry_entry is not None and not bool(registry_entry.get("enabled")):
+        print(
+            f"  [Registry] Sleeve {symbol}_1D disabled. "
+            f"Reason: {registry_entry.get('reason', 'admission failed')}"
+        )
+        return
 
     if not os.path.exists(model_path) or not os.path.exists(feat_path):
         print(
@@ -145,6 +156,25 @@ def main() -> None:
     trade_plan_models = (
         joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
     )
+    policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
+    selected_variant = (
+        str(registry_entry.get("selected_variant"))
+        if registry_entry is not None and registry_entry.get("selected_variant")
+        else None
+    )
+    if selected_variant == "base":
+        policy_artifact = None
+        print(f"  [Registry] Using base variant for {symbol}_1D.")
+    elif selected_variant == "policy":
+        if policy_artifact is None:
+            print(f"  [Registry] Policy variant selected for {symbol}_1D but artifact is missing.")
+            return
+        print(f"  [Registry] Using policy variant for {symbol}_1D.")
+    if policy_artifact is not None:
+        print(
+            f"  [=] Daily policy artifact loaded. "
+            f"Threshold {policy_artifact.get('deploy_threshold', float('nan')):.2f}"
+        )
 
     print("\n  [=] Reconstructing daily feature space over historical data...")
 
@@ -170,6 +200,9 @@ def main() -> None:
     kf_df = kalman_structural_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
     for col in kf_df.columns:
         df_full[col] = kf_df[col].values
+    nc_df = narrative_context_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
 
     from daily_ml_engine import add_daily_confluence, inject_macro_regime
 
@@ -235,11 +268,13 @@ def main() -> None:
         prob_array_1d,
         feature_cols,
         trade_plan_models=trade_plan_models,
+        policy_artifact=policy_artifact,
         initial_capital=10000.0,
         risk_pct=0.02,
         conf_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
         max_hold_bars=BARRIER_HORIZON_BARS_DAILY,
         eod_gate_hour=EOD_GATE_HOUR_DAILY,
+        lane="1D",
     )
 
     if results is None:
@@ -259,6 +294,7 @@ def main() -> None:
     print(f"  Win Rate       : {metrics.get('win_rate', 0) * 100:.1f}%")
     print(f"  Profit Factor  : {metrics.get('profit_factor', 0):.3f}")
     print(f"  Sharpe Ratio   : {metrics.get('sharpe', 0):.3f}")
+    print(f"  Policy Filter  : {results.get('policy_blocks', 0)} bars bypassed")
     print(f"  Max Drawdown   : {results['max_drawdown'] * 100:.2f}%")
     print("=" * 60)
 

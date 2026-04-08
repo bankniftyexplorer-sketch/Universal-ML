@@ -32,9 +32,11 @@ from universal_ml_engine import (
 from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
     kalman_structural_engine_fast,
+    narrative_context_engine_fast,
     rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
+from sleeve_registry import load_sleeve_registry_entry
 from shadow_brain import ShadowBrain
 
 warnings.filterwarnings("ignore")
@@ -91,9 +93,26 @@ def main():
     mod_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "model")
     feat_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "features")
     tp_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "trade_plan_models")
+    policy_path = resolve_artifact_path(
+        SYMBOL_DIR, file_prefix, "1H", "policy_artifact"
+    )
+    registry_entry = load_sleeve_registry_entry(SYMBOL, "1H")
 
     if not os.path.exists(mod_path) or not os.path.exists(feat_path):
         print(f"  [!] FATAL: Pre-trained model missing for {SYMBOL} in {SYMBOL_DIR}.")
+        return
+
+    if registry_entry is not None and not bool(registry_entry.get("enabled")):
+        print("\n" + "=" * 70)
+        print(f"  {SYMBOL.upper()} FORECAST (LIVE INFERENCE)")
+        print("=" * 70)
+        print("  Direction   : NO_TRADE")
+        print("  Signal      : NO_TRADE")
+        print(
+            f"  [Registry] Sleeve {SYMBOL}_1H disabled. "
+            f"Reason: {registry_entry.get('reason', 'admission failed')}"
+        )
+        print("======================================================================")
         return
 
     ultimate_model = joblib.load(mod_path)
@@ -101,6 +120,23 @@ def main():
         feature_cols_to_use = [line.strip() for line in f.readlines() if line.strip()]
 
     trade_plan_models = joblib.load(tp_path) if os.path.exists(tp_path) else {}
+    policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
+    selected_variant = (
+        str(registry_entry.get("selected_variant"))
+        if registry_entry is not None and registry_entry.get("selected_variant")
+        else None
+    )
+    if selected_variant == "base":
+        policy_artifact = None
+        print(f"  [Registry] Using base variant for {SYMBOL}_1H.")
+    elif selected_variant == "policy":
+        if policy_artifact is None:
+            print(
+                f"  [Registry] Policy variant selected for {SYMBOL}_1H "
+                "but artifact is missing."
+            )
+            return
+        print(f"  [Registry] Using policy variant for {SYMBOL}_1H.")
     cal_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "calibrator")
     calibrator = joblib.load(cal_path) if os.path.exists(cal_path) else None
 
@@ -142,6 +178,9 @@ def main():
     rv_df = rv_feature_engine_fast(df_1h_tail, df_1d, df_1w, df_1m)
     for col in rv_df.columns:
         df_full[col] = rv_df[col].values
+    nc_df = narrative_context_engine_fast(df_1h_tail, df_1d, df_1w, df_1m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
     for col in kf_df_tail.columns:
         df_full[col] = kf_df_tail[col].values
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
@@ -196,6 +235,8 @@ def main():
         last_row,
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
         calibrator=calibrator,
+        policy_artifact=policy_artifact,
+        policy_lane="1H",
     )
     close_price = float(last_row["close"])
     atr = float(last_row["atr14"]) if "atr14" in last_row else 150.0
@@ -209,6 +250,8 @@ def main():
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
         base_note=trade_plan["note"],
     )
+    if pred.get("policy_filtered"):
+        filter_note = f"{filter_note} POLICY_FILTERED".strip()
 
     # Initialize and Train Shadow Brain with Strict Symbol Isolation
     shadow = ShadowBrain(
@@ -257,6 +300,11 @@ def main():
         f"  Confidence  : {pred['confidence']:.1%} "
         f"(Raw: {pred['raw_score']:.3f} | Cal: {pred['calibrated_score']:.3f})"
     )
+    if np.isfinite(pred.get("policy_score", np.nan)):
+        print(
+            f"  Policy      : {pred['policy_score']:.3f} "
+            f"(Risk x{pred.get('policy_risk_mult', 1.0):.2f})"
+        )
     print(f"  Signal      : {pred['signal_strength']}")
     print("----------------------------------------------------------------------")
     print(f"  Entry Price : {close_price:,.2f} (Current Close)")

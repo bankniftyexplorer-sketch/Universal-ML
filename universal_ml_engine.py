@@ -5,16 +5,20 @@ No classical indicators. 4 extraction layers. Multi-timeframe pyramid.
 Walk-forward validated | i7-4770 / 16 GB RAM / CPU only
 """
 
-import re
-import warnings
-import numpy as np
-import pandas as pd
-import lightgbm as lgb
-import matplotlib
 import argparse
+import json
 import os
+from functools import lru_cache
+from pathlib import Path
+import re
 import subprocess
 import sys
+import warnings
+
+import lightgbm as lgb
+import matplotlib
+import numpy as np
+import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 
 matplotlib.use("Agg")
@@ -24,9 +28,11 @@ import matplotlib.gridspec as gridspec
 from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
     kalman_structural_engine_fast,
+    narrative_context_engine_fast,
     rv_feature_engine_fast,
     smc_feature_engine_fast,
     add_target_fast as add_target,
+    compute_backtest_bar_state_fast,
 )
 from data_vault.symbol_identity import extract_symbol_payload, parse_symbol_payload
 from numba import njit
@@ -64,6 +70,7 @@ TIME_COL_CANDIDATES = (
 MESSAGE_COL_CANDIDATES = ("Message", "message")
 MODEL_N_JOBS = 4
 FINAL_FEAT_BUDGET = 40  # Max features in final model
+HYPERPARAMS_PATH = Path(__file__).with_name("hyperparams.json")
 # Regime gating thresholds (tunable — calibrate per-instrument if needed)
 REGIME_VOV_PENALTY_THRESHOLD = 2.0
 REGIME_VOV_PENALTY_VALUE = 0.03
@@ -141,6 +148,25 @@ FORECAST_STALE_THRESHOLDS = {
     "1D": pd.Timedelta(days=4),
 }
 PRIMARY_ASSET_CLASS = "SPOT"
+POLICY_COLLECTION_THRESHOLD = 0.55
+POLICY_MIN_SAMPLES = 120
+POLICY_MIN_CLASS_SAMPLES = 20
+POLICY_VALIDATION_RATIO = 0.25
+POLICY_THRESHOLD_GRID = tuple(np.round(np.arange(0.50, 0.86, 0.05), 2))
+POLICY_RISK_MULTS = (
+    (0.12, 1.25),
+    (0.05, 1.00),
+    (0.00, 0.65),
+)
+POLICY_EOD_GATE_HOUR_1H = 14
+POLICY_EOD_GATE_HOUR_1D = 24
+SKIP_OK = 0
+SKIP_NO_PREDICTION = 1
+SKIP_EOD_GATE = 2
+SKIP_LOW_CONFIDENCE = 3
+SKIP_INVALID_ATR = 4
+SKIP_SHOCK = 5
+SKIP_LOW_HURST = 6
 
 
 class EnsembleModel:
@@ -838,79 +864,77 @@ def simulate_trade_path_from_arrays(
 
 def _build_lgbm_ensemble() -> list[lgb.LGBMRegressor]:
     """Three complementary LightGBM configurations."""
-    return [
-        lgb.LGBMRegressor(
-            n_estimators=800,
-            learning_rate=0.02,
-            num_leaves=31,
-            max_depth=5,
-            min_child_samples=40,
-            subsample=0.75,
-            subsample_freq=1,
-            colsample_bytree=0.75,
-            reg_alpha=0.15,
-            reg_lambda=0.15,
-            random_state=42,
-            n_jobs=MODEL_N_JOBS,
-            verbose=-1,
-            objective="regression",
-            metric="mae",
-        ),
-        lgb.LGBMRegressor(
-            n_estimators=600,
-            learning_rate=0.03,
-            num_leaves=15,
-            max_depth=3,
-            min_child_samples=60,
-            subsample=0.70,
-            subsample_freq=1,
-            colsample_bytree=0.65,
-            reg_alpha=0.30,
-            reg_lambda=0.30,
-            random_state=123,
-            n_jobs=MODEL_N_JOBS,
-            verbose=-1,
-            objective="regression",
-            metric="mae",
-        ),
-        lgb.LGBMRegressor(
-            n_estimators=500,
-            learning_rate=0.015,
-            num_leaves=63,
-            max_depth=7,
-            min_child_samples=30,
-            subsample=0.80,
-            subsample_freq=1,
-            colsample_bytree=0.80,
-            reg_alpha=0.10,
-            reg_lambda=0.10,
-            random_state=7,
-            n_jobs=MODEL_N_JOBS,
-            verbose=-1,
-            objective="regression",
-            metric="mae",
-        ),
-    ]
+    specs = _load_hyperparams_config()["classifier_ensemble"]
+    if not isinstance(specs, list) or not specs:
+        raise ValueError(
+            f"`classifier_ensemble` must be a non-empty list in {HYPERPARAMS_PATH}."
+        )
+
+    models: list[lgb.LGBMRegressor] = []
+    for idx, spec in enumerate(specs, start=1):
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"`classifier_ensemble[{idx - 1}]` must be an object in {HYPERPARAMS_PATH}."
+            )
+        params = dict(spec)
+        params.update(
+            {
+                "n_jobs": MODEL_N_JOBS,
+                "verbose": -1,
+                "objective": "regression",
+                "metric": "mae",
+            }
+        )
+        models.append(lgb.LGBMRegressor(**params))
+    return models
 
 
 def _build_lgbm_regressor(alpha: float) -> lgb.LGBMRegressor:
-    return lgb.LGBMRegressor(
-        n_estimators=400,
-        learning_rate=0.03,
-        num_leaves=31,
-        max_depth=5,
-        min_child_samples=40,
-        subsample=0.75,
-        subsample_freq=1,
-        colsample_bytree=0.75,
-        reg_alpha=0.10,
-        reg_lambda=0.10,
-        random_state=42,
-        n_jobs=MODEL_N_JOBS,
-        verbose=-1,
-        objective="quantile",
-        alpha=alpha,
+    spec = _load_hyperparams_config()["trade_plan_regressor"]
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"`trade_plan_regressor` must be an object in {HYPERPARAMS_PATH}."
+        )
+
+    params = dict(spec)
+    params.update(
+        {
+            "n_jobs": MODEL_N_JOBS,
+            "verbose": -1,
+            "objective": "quantile",
+            "alpha": alpha,
+        }
     )
+    return lgb.LGBMRegressor(**params)
+
+
+@lru_cache(maxsize=1)
+def _load_hyperparams_config() -> dict:
+    try:
+        with HYPERPARAMS_PATH.open("r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Required hyperparameter config not found: {HYPERPARAMS_PATH}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Failed to parse hyperparameter config {HYPERPARAMS_PATH}: {exc}"
+        ) from exc
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Hyperparameter config root must be a JSON object: {HYPERPARAMS_PATH}"
+        )
+    if "classifier_ensemble" not in config:
+        raise KeyError(
+            f"Missing `classifier_ensemble` in hyperparameter config: {HYPERPARAMS_PATH}"
+        )
+    if "trade_plan_regressor" not in config:
+        raise KeyError(
+            f"Missing `trade_plan_regressor` in hyperparameter config: {HYPERPARAMS_PATH}"
+        )
+    return config
 
 
 def _fit_lgbm_with_inner_validation(
@@ -954,6 +978,537 @@ def _fit_lgbm_with_inner_validation(
         )
         fitted_models.append(model)
     return EnsembleModel(fitted_models), X_val_inner, y_val_inner
+
+
+def _safe_numeric(value: object, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def build_prob_array_from_oos_map(
+    times: pd.Series | np.ndarray | list,
+    oos_proba_map: dict | None,
+    calibrator=None,
+) -> np.ndarray:
+    mapped = {pd.Timestamp(ts): float(prob) for ts, prob in (oos_proba_map or {}).items()}
+    probs = np.array(
+        [mapped.get(pd.Timestamp(ts), np.nan) for ts in times],
+        dtype=float,
+    )
+    return apply_calibrator_to_prob_array(probs, calibrator)
+
+
+def _policy_term_columns(lane: str) -> tuple[str, str]:
+    lane_key = str(lane).upper()
+    if lane_key == "1D":
+        return "rv_term_1w_1d", "rv_term_1m_1d"
+    return "rv_term_1d_1h", "rv_term_1w_1h"
+
+
+def _build_policy_feature_record(
+    row: pd.Series,
+    *,
+    proba_up: float,
+    direction: str,
+    lane: str,
+    confidence_threshold: float,
+) -> dict[str, float]:
+    lane_key = str(lane).upper()
+    rv_prefix = f"rv_{lane_key.lower()}"
+    term_fast_col, term_slow_col = _policy_term_columns(lane_key)
+    direction_sign = 1.0 if direction == "UP" else -1.0
+    base_confidence = max(proba_up, 1.0 - proba_up)
+    base_edge = abs(proba_up - 0.5) * 2.0
+    kf_regime = _safe_numeric(row.get("kf_regime"))
+    nc_cross_sum = _safe_numeric(row.get("nc_cross_tf_sum"))
+    nc_regime_accel = _safe_numeric(row.get("nc_regime_accel"))
+    basis_z = _safe_numeric(row.get("basis_z_score"))
+    return {
+        "policy_prob_up": float(np.clip(proba_up, 0.0, 1.0)),
+        "policy_prob_down": float(np.clip(1.0 - proba_up, 0.0, 1.0)),
+        "policy_base_confidence": base_confidence,
+        "policy_base_edge": base_edge,
+        "policy_gate_margin": base_confidence - float(confidence_threshold),
+        "policy_direction_sign": direction_sign,
+        "policy_basis_z": basis_z,
+        "policy_basis_z_abs": abs(basis_z),
+        "policy_kf_regime": kf_regime,
+        "policy_abs_kf_regime": abs(kf_regime),
+        "policy_signed_kf_regime": direction_sign * kf_regime,
+        "policy_kf_bar_delta": _safe_numeric(row.get("kf_bar_delta")),
+        "policy_kf_swing_accum": _safe_numeric(row.get("kf_swing_accum")),
+        "policy_kf_net_swing_delta": _safe_numeric(row.get("kf_net_swing_delta")),
+        "policy_nc_regime_streak": _safe_numeric(row.get("nc_regime_streak")),
+        "policy_nc_regime_accel": nc_regime_accel,
+        "policy_signed_nc_regime_accel": direction_sign * nc_regime_accel,
+        "policy_nc_cum_disp": _safe_numeric(row.get("nc_cum_disp_since_flip")),
+        "policy_nc_max_dd": _safe_numeric(row.get("nc_max_dd_since_flip")),
+        "policy_nc_swing_count": _safe_numeric(row.get("nc_swing_count_since_flip")),
+        "policy_nc_fib_age": _safe_numeric(row.get("nc_fib_range_age")),
+        "policy_nc_fib_size": _safe_numeric(row.get("nc_fib_range_size")),
+        "policy_nc_cross_sum": nc_cross_sum,
+        "policy_nc_cross_abs": abs(_safe_numeric(row.get("nc_cross_tf_abs"), abs(nc_cross_sum))),
+        "policy_signed_nc_cross_sum": direction_sign * nc_cross_sum,
+        "policy_primary_rv_z": _safe_numeric(row.get(f"{rv_prefix}_yz_z")),
+        "policy_primary_rv_vov": _safe_numeric(row.get(f"{rv_prefix}_vov")),
+        "policy_primary_rv_jump_ratio": _safe_numeric(row.get(f"{rv_prefix}_jump_ratio")),
+        "policy_primary_rv_range_eff": _safe_numeric(row.get(f"{rv_prefix}_range_eff")),
+        "policy_term_fast": _safe_numeric(row.get(term_fast_col)),
+        "policy_term_slow": _safe_numeric(row.get(term_slow_col)),
+    }
+
+
+def _fit_policy_ensemble(
+    X_full: pd.DataFrame,
+    y_full: pd.Series,
+    *,
+    purge_gap: int,
+) -> EnsembleModel:
+    inner_val_size = max(30, int(len(X_full) * 0.20))
+    inner_val_size = min(inner_val_size, len(X_full) - 1)
+    if inner_val_size <= 0:
+        raise ValueError("Not enough rows for policy inner validation.")
+
+    purged_end = -(inner_val_size + int(max(purge_gap, 0)))
+    if abs(purged_end) >= len(X_full):
+        purged_end = 0
+
+    X_train_inner = (
+        X_full.iloc[:purged_end] if purged_end != 0 else X_full.iloc[:-inner_val_size]
+    )
+    y_train_inner = (
+        y_full.iloc[:purged_end] if purged_end != 0 else y_full.iloc[:-inner_val_size]
+    )
+    X_val_inner = X_full.iloc[-inner_val_size:]
+    y_val_inner = y_full.iloc[-inner_val_size:]
+
+    fitted_models: list[lgb.LGBMRegressor] = []
+    for model in _build_lgbm_ensemble():
+        model.fit(
+            X_train_inner,
+            y_train_inner,
+            eval_set=[(X_val_inner, y_val_inner)],
+            eval_metric="mae",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=40, verbose=False),
+                lgb.log_evaluation(period=10000),
+            ],
+        )
+        fitted_models.append(model)
+    return EnsembleModel(fitted_models)
+
+
+def _score_policy_threshold(
+    candidate_df: pd.DataFrame,
+    scores: np.ndarray,
+    threshold: float,
+) -> dict[str, float]:
+    equity = 10000.0
+    peak_equity = equity
+    max_drawdown = 0.0
+    total_r = 0.0
+    total_trades = 0
+    i = 0
+    while i < len(candidate_df):
+        if not np.isfinite(scores[i]) or scores[i] < threshold:
+            i += 1
+            continue
+        trade_r = _safe_numeric(candidate_df["policy_total_r"].iat[i])
+        total_r += trade_r
+        equity += trade_r * (10000.0 * 0.02)
+        peak_equity = max(peak_equity, equity)
+        max_drawdown = max(max_drawdown, (peak_equity - equity) / max(peak_equity, 1e-9))
+        total_trades += 1
+        exit_idx = int(candidate_df["policy_exit_index"].iat[i])
+        i += 1
+        while i < len(candidate_df) and int(candidate_df["policy_source_index"].iat[i]) <= exit_idx:
+            i += 1
+    avg_r = total_r / total_trades if total_trades > 0 else float("-inf")
+    return {
+        "threshold": float(threshold),
+        "final_equity": float(equity),
+        "max_drawdown": float(max_drawdown),
+        "total_trades": int(total_trades),
+        "avg_r": float(avg_r),
+    }
+
+
+def _resolve_policy_risk_mult(policy_artifact: dict, score: float) -> float:
+    for band in policy_artifact.get("risk_bands", []):
+        min_score = _safe_numeric(band.get("min_score"), 1.1)
+        if score >= min_score:
+            return _safe_numeric(band.get("risk_mult"), 1.0)
+    return 1.0
+
+
+def score_policy_artifact(
+    policy_artifact: dict | None,
+    row: pd.Series,
+    *,
+    proba_up: float,
+    direction: str,
+    lane: str,
+    confidence_threshold: float,
+) -> dict[str, float | bool]:
+    if not policy_artifact or "model" not in policy_artifact:
+        return {
+            "score": np.nan,
+            "allow_trade": True,
+            "risk_mult": 1.0,
+            "threshold": np.nan,
+        }
+
+    feature_cols = list(policy_artifact.get("feature_cols", []))
+    if not feature_cols:
+        return {
+            "score": np.nan,
+            "allow_trade": True,
+            "risk_mult": 1.0,
+            "threshold": np.nan,
+        }
+
+    feature_record = _build_policy_feature_record(
+        row,
+        proba_up=proba_up,
+        direction=direction,
+        lane=lane,
+        confidence_threshold=confidence_threshold,
+    )
+    X = pd.DataFrame(
+        [{col: _safe_numeric(feature_record.get(col)) for col in feature_cols}]
+    )
+    raw_score = _safe_numeric(policy_artifact["model"].predict(X)[0], 0.0)
+    score = float(np.clip(raw_score, 0.0, 1.0))
+    threshold = float(np.clip(_safe_numeric(policy_artifact.get("deploy_threshold"), 0.5), 0.0, 1.0))
+    allow_trade = score >= threshold
+    risk_mult = 0.0 if not allow_trade else _resolve_policy_risk_mult(policy_artifact, score)
+    return {
+        "score": score,
+        "allow_trade": bool(allow_trade),
+        "risk_mult": float(risk_mult),
+        "threshold": threshold,
+    }
+
+
+def apply_policy_artifact_to_prediction(
+    pred: dict,
+    policy_artifact: dict | None,
+    row: pd.Series,
+    *,
+    lane: str,
+    confidence_threshold: float,
+) -> dict:
+    updated = dict(pred)
+    verdict = score_policy_artifact(
+        policy_artifact,
+        row,
+        proba_up=float(updated.get("calibrated_score", updated.get("raw_score", 0.5))),
+        direction=str(updated.get("direction", "UP")),
+        lane=lane,
+        confidence_threshold=confidence_threshold,
+    )
+    updated["policy_score"] = verdict["score"]
+    updated["policy_threshold"] = verdict["threshold"]
+    updated["policy_risk_mult"] = verdict["risk_mult"]
+    updated["policy_allowed"] = verdict["allow_trade"]
+    updated["policy_filtered"] = False
+    if updated.get("signal_strength") != "NO_TRADE" and not verdict["allow_trade"]:
+        updated["signal_strength"] = "NO_TRADE"
+        updated["policy_filtered"] = True
+    return updated
+
+
+def train_policy_artifact(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    prob_array: np.ndarray,
+    trade_plan_models: dict,
+    *,
+    lane: str,
+    confidence_threshold: float,
+    start_idx: int = 0,
+    max_hold_bars: int | None = None,
+    eod_gate_hour: int | None = None,
+) -> dict | None:
+    if df is None or df.empty:
+        return None
+
+    lane_key = str(lane).upper()
+    source_df = df.reset_index(drop=True).copy()
+    probs = np.asarray(prob_array, dtype=float)
+    if len(source_df) != len(probs):
+        raise ValueError("Policy training frame and probability array length mismatch.")
+
+    slice_start = int(max(start_idx, 0))
+    if slice_start >= len(source_df) - 2:
+        return None
+    if slice_start > 0:
+        source_df = source_df.iloc[slice_start:].reset_index(drop=True)
+        probs = probs[slice_start:]
+
+    if max_hold_bars is None:
+        max_hold_bars = BARRIER_HORIZON_BARS if lane_key == "1H" else 10
+    if eod_gate_hour is None:
+        eod_gate_hour = (
+            POLICY_EOD_GATE_HOUR_1H if lane_key == "1H" else POLICY_EOD_GATE_HOUR_1D
+        )
+
+    close_arr = source_df["close"].to_numpy(dtype=float)
+    open_arr = source_df["open"].to_numpy(dtype=float)
+    high_arr = source_df["high"].to_numpy(dtype=float)
+    low_arr = source_df["low"].to_numpy(dtype=float)
+    atr_arr = source_df["atr14"].to_numpy(dtype=float)
+    time_arr = source_df["time"].to_numpy()
+    time_dt = pd.to_datetime(time_arr)
+    z_arr = (
+        source_df["basis_z_score"].to_numpy(dtype=float)
+        if "basis_z_score" in source_df.columns
+        else np.zeros(len(source_df), dtype=float)
+    )
+
+    hour_arr = np.asarray(time_dt.hour, dtype=np.int64)
+    next_hour_arr = np.full(len(hour_arr), 24, dtype=np.int64)
+    if len(hour_arr) > 1:
+        next_hour_arr[:-1] = hour_arr[1:]
+
+    bar_state = compute_backtest_bar_state_fast(
+        close_arr,
+        probs,
+        atr_arr,
+        z_arr,
+        next_hour_arr,
+        window_h=100,
+        default_hurst=0.5,
+        conf_threshold=POLICY_COLLECTION_THRESHOLD,
+        shock_z_abs=2.5,
+        min_hurst=0.45,
+        eod_gate_hour=eod_gate_hour,
+    )
+    skip_code_arr = np.asarray(bar_state["skip_code"], dtype=np.int64)
+
+    rows: list[dict[str, float]] = []
+    for i in range(len(source_df) - 1):
+        skip_code = int(skip_code_arr[i])
+        if skip_code in {
+            SKIP_NO_PREDICTION,
+            SKIP_EOD_GATE,
+            SKIP_LOW_CONFIDENCE,
+            SKIP_INVALID_ATR,
+            SKIP_SHOCK,
+            SKIP_LOW_HURST,
+        }:
+            continue
+
+        curr_atr = atr_arr[i]
+        if not np.isfinite(curr_atr) or curr_atr <= 0:
+            continue
+
+        proba_up = float(np.clip(probs[i], 0.0, 1.0))
+        direction = "UP" if proba_up > 0.5 else "DOWN"
+        row = source_df.iloc[i].copy()
+        trade_plan = predict_trade_plan(
+            trade_plan_models,
+            feature_cols,
+            row.copy(),
+            direction,
+            float(curr_atr),
+        )
+        stop_dist = float(curr_atr * _safe_numeric(trade_plan.get("stop_atr"), BARRIER_ATR_MULT))
+        tp1_dist = float(curr_atr * _safe_numeric(trade_plan.get("tp1_atr"), TP1_R_MULT))
+        tp2_dist = float(curr_atr * _safe_numeric(trade_plan.get("tp2_atr"), TP2_R_MULT))
+        trail_dist = float(curr_atr * _safe_numeric(trade_plan.get("trail_r"), TRAIL_R_MULT))
+
+        trade_path = simulate_trade_path_from_arrays(
+            open_arr,
+            high_arr,
+            low_arr,
+            close_arr,
+            time_arr,
+            i + 1,
+            "LONG" if direction == "UP" else "SHORT",
+            stop_dist,
+            tp1_dist=tp1_dist,
+            tp2_dist=tp2_dist,
+            trail_dist=trail_dist,
+            horizon=max_hold_bars,
+            fee_pct=EXEC_FEE_PCT,
+            slippage_bps=EXEC_SLIPPAGE_BPS,
+        )
+        total_r = _safe_numeric(trade_path.get("total_r"), np.nan)
+        if not np.isfinite(total_r):
+            continue
+
+        feature_record = _build_policy_feature_record(
+            row,
+            proba_up=proba_up,
+            direction=direction,
+            lane=lane_key,
+            confidence_threshold=confidence_threshold,
+        )
+        feature_record.update(
+            {
+                "policy_label": 1.0 if total_r > 0.0 else 0.0,
+                "policy_total_r": total_r,
+                "policy_source_index": float(i),
+                "policy_exit_index": float(trade_path.get("exit_idx", i)),
+            }
+        )
+        rows.append(feature_record)
+
+    candidate_df = pd.DataFrame(rows)
+    if len(candidate_df) < POLICY_MIN_SAMPLES:
+        return None
+
+    positive_count = int(candidate_df["policy_label"].sum())
+    negative_count = int(len(candidate_df) - positive_count)
+    if (
+        positive_count < POLICY_MIN_CLASS_SAMPLES
+        or negative_count < POLICY_MIN_CLASS_SAMPLES
+    ):
+        return None
+
+    policy_feature_cols = [
+        col
+        for col in candidate_df.columns
+        if col.startswith("policy_")
+        and col
+        not in {
+            "policy_label",
+            "policy_total_r",
+            "policy_source_index",
+            "policy_exit_index",
+        }
+    ]
+
+    val_size = max(40, int(len(candidate_df) * POLICY_VALIDATION_RATIO))
+    val_size = min(val_size, len(candidate_df) - 60)
+    if val_size < 20:
+        return None
+
+    train_df = candidate_df.iloc[:-val_size].copy()
+    val_df = candidate_df.iloc[-val_size:].copy()
+    if len(train_df) < 60:
+        return None
+
+    fitted_models: list[lgb.LGBMRegressor] = []
+    X_train = train_df[policy_feature_cols]
+    y_train = train_df["policy_label"]
+    X_val = val_df[policy_feature_cols]
+    y_val = val_df["policy_label"]
+    for model in _build_lgbm_ensemble():
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            eval_metric="mae",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=40, verbose=False),
+                lgb.log_evaluation(period=10000),
+            ],
+        )
+        fitted_models.append(model)
+    provisional_model = EnsembleModel(fitted_models)
+    val_scores = np.clip(provisional_model.predict(X_val), 0.0, 1.0)
+
+    finite_val_scores = val_scores[np.isfinite(val_scores)]
+    quantile_thresholds = []
+    if len(finite_val_scores) > 0:
+        quantile_thresholds = np.quantile(
+            finite_val_scores,
+            [0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.92],
+        ).tolist()
+    threshold_grid = sorted(
+        {
+            *[float(x) for x in POLICY_THRESHOLD_GRID],
+            *[float(x) for x in quantile_thresholds],
+        }
+    )
+
+    min_eval_trades = max(5, min(20, len(val_df) // 12))
+    all_evals: list[dict[str, float]] = []
+    best_eval: dict[str, float] | None = None
+    for threshold in threshold_grid:
+        eval_metrics = _score_policy_threshold(val_df, val_scores, float(threshold))
+        all_evals.append(eval_metrics)
+        if eval_metrics["total_trades"] < min_eval_trades:
+            continue
+        if best_eval is None:
+            best_eval = eval_metrics
+            continue
+        current_rank = (
+            eval_metrics["final_equity"],
+            eval_metrics["avg_r"],
+            -eval_metrics["max_drawdown"],
+            eval_metrics["total_trades"],
+        )
+        best_rank = (
+            best_eval["final_equity"],
+            best_eval["avg_r"],
+            -best_eval["max_drawdown"],
+            best_eval["total_trades"],
+        )
+        if current_rank > best_rank:
+            best_eval = eval_metrics
+
+    if best_eval is None:
+        fallback_candidates = [
+            item for item in all_evals if int(item["total_trades"]) > 0
+        ]
+        if fallback_candidates:
+            best_eval = max(
+                fallback_candidates,
+                key=lambda item: (
+                    item["final_equity"],
+                    item["avg_r"],
+                    -item["max_drawdown"],
+                    item["total_trades"],
+                ),
+            )
+
+    deploy_threshold = (
+        float(best_eval["threshold"]) if best_eval is not None else 0.50
+    )
+    risk_bands = [
+        {
+            "min_score": float(min(1.0, deploy_threshold + uplift)),
+            "risk_mult": float(mult),
+        }
+        for uplift, mult in POLICY_RISK_MULTS
+    ]
+    risk_bands.sort(key=lambda item: item["min_score"], reverse=True)
+
+    final_model = _fit_policy_ensemble(
+        candidate_df[policy_feature_cols],
+        candidate_df["policy_label"],
+        purge_gap=max_hold_bars,
+    )
+
+    return {
+        "model": final_model,
+        "feature_cols": policy_feature_cols,
+        "deploy_threshold": deploy_threshold,
+        "risk_bands": risk_bands,
+        "lane": lane_key,
+        "collection_threshold": float(POLICY_COLLECTION_THRESHOLD),
+        "metadata": {
+            "train_rows": int(len(train_df)),
+            "validation_rows": int(len(val_df)),
+            "candidate_rows": int(len(candidate_df)),
+            "positive_rate": float(candidate_df["policy_label"].mean()),
+            "validation_final_equity": (
+                float(best_eval["final_equity"]) if best_eval is not None else None
+            ),
+            "validation_max_drawdown": (
+                float(best_eval["max_drawdown"]) if best_eval is not None else None
+            ),
+            "validation_trades": (
+                int(best_eval["total_trades"]) if best_eval is not None else 0
+            ),
+        },
+    }
 
 
 def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
@@ -1697,6 +2252,8 @@ def predict_next_bar(
     row: pd.Series,
     confidence_threshold: float = LIVE_CONFIDENCE_THRESHOLD,
     calibrator=None,
+    policy_artifact: dict | None = None,
+    policy_lane: str = "1H",
 ) -> dict:
     X_inf = row[feature_cols].to_frame().T.astype(float)
     raw_score = float(np.clip(model.predict(X_inf)[0], 0.0, 1.0))
@@ -1723,7 +2280,7 @@ def predict_next_bar(
     else:
         signal = "NO_TRADE"
 
-    return {
+    pred = {
         "direction": direction,
         "confidence": confidence,
         "signal_strength": signal,
@@ -1731,6 +2288,13 @@ def predict_next_bar(
         "calibrated_score": proba_up,
         "regime_penalty": regime_penalty,
     }
+    return apply_policy_artifact_to_prediction(
+        pred,
+        policy_artifact,
+        row,
+        lane=policy_lane,
+        confidence_threshold=confidence_threshold,
+    )
 
 
 def _append_filter_note(existing_note: str, extra_note: str) -> str:
@@ -1969,6 +2533,7 @@ ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_1H_oos_proba.pkl",
         "calibrator": "{prefix}_1H_calibrator.pkl",
         "trade_plan_models": "{prefix}_1H_trade_plan_models.pkl",
+        "policy_artifact": "{prefix}_1H_policy_artifact.pkl",
         "ml_report": "{prefix}_1H_ml_report.png",
         "backtest_report": "{prefix}_1H_backtest_report.png",
     },
@@ -1978,6 +2543,7 @@ ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_1D_oos_proba.pkl",
         "calibrator": "{prefix}_1D_calibrator.pkl",
         "trade_plan_models": "{prefix}_1D_trade_plan_models.pkl",
+        "policy_artifact": "{prefix}_1D_policy_artifact.pkl",
         "ml_report": "{prefix}_1D_ml_report.png",
         "backtest_report": "{prefix}_1D_backtest_report.png",
     },
@@ -1991,6 +2557,7 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_oos_proba.pkl",
         "calibrator": "{prefix}_1H_calibrator.pkl",
         "trade_plan_models": "{prefix}_trade_plan_models.pkl",
+        "policy_artifact": "{prefix}_1H_policy_artifact.pkl",
         "ml_report": "{prefix}_ml_report_ultimate.png",
         "backtest_report": "{prefix}_backtest_report.png",
     },
@@ -2000,6 +2567,7 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_daily_oos_proba.pkl",
         "calibrator": "{prefix}_1D_calibrator.pkl",
         "trade_plan_models": "{prefix}_daily_trade_plan_models.pkl",
+        "policy_artifact": "{prefix}_1D_policy_artifact.pkl",
         "ml_report": "{prefix}_daily_ml_report.png",
         "backtest_report": "{prefix}_daily_backtest_report.png",
     },
@@ -2191,6 +2759,12 @@ if __name__ == "__main__":
         df_full[col] = rv_df[col].values
     print(f"  [TOON v5.4] RV features injected: {len(rv_df.columns)} columns")
 
+    print("  [TOON v5.5] Building Narrative Context Awareness (23 context signals)...")
+    nc_df = narrative_context_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
+    print(f"  [TOON v5.5] Narrative context injected: {len(nc_df.columns)} columns")
+
     # ── Step 3: ASOF-merge higher-TF timestamps for temporal alignment ────
     # merge_higher_tf now only brings in raw OHLCV columns with the look-ahead
     # shift. The holographic engine has already extracted all shape features.
@@ -2214,7 +2788,8 @@ if __name__ == "__main__":
     all_holo_cols = [c for c in df_full.columns if c not in NON_FEATURE_COLS]
 
     # Sanitize: replace inf/nan
-    state_cols = ["target", "time", "close", "atr14"]
+    # Preserve raw OHLC state for downstream trade-plan / policy replay.
+    state_cols = ["target", "time", "open", "high", "low", "close", "atr14"]
     for b_col in ["basis_pct", "basis_z_score", "basis_vel_5", "basis_vel_10"]:
         if b_col in df_full.columns:
             state_cols.append(b_col)
@@ -2341,6 +2916,31 @@ if __name__ == "__main__":
         print(
             f"  Trade-plan models saved to '{trade_plan_path}' ({len(trade_plan_models)} models)"
         )
+        prob_array_full = build_prob_array_from_oos_map(
+            df_model_ready["time"],
+            wf_results["oos_proba_map"],
+            calibrator=calibrator,
+        )
+        policy_artifact = train_policy_artifact(
+            df_model_ready,
+            feature_cols_to_use,
+            prob_array_full,
+            trade_plan_models,
+            lane="1H",
+            confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+            start_idx=_tp_train_end,
+            max_hold_bars=BARRIER_HORIZON_BARS,
+            eod_gate_hour=POLICY_EOD_GATE_HOUR_1H,
+        )
+        if policy_artifact is not None:
+            policy_path = artifact_paths_1h["policy_artifact"]
+            joblib.dump(policy_artifact, policy_path)
+            print(
+                f"  Policy artifact saved to '{policy_path}' "
+                f"({policy_artifact['metadata']['candidate_rows']} candidates)"
+            )
+        else:
+            print("  [Policy] Skipped 1H policy artifact: insufficient honest candidate trades.")
 
         last_row = df_model_ready.iloc[-1]
         pred = predict_next_bar(
@@ -2349,6 +2949,8 @@ if __name__ == "__main__":
             last_row,
             confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
             calibrator=calibrator,
+            policy_artifact=policy_artifact,
+            policy_lane="1H",
         )
         primary_asset_label = str(df_1h.attrs.get("selected_asset_class", "PRIMARY"))
         close_price = float(last_row["close"])
@@ -2372,6 +2974,11 @@ if __name__ == "__main__":
             f"  Confidence  : {pred['confidence']:.1%} "
             f"(Raw: {pred['raw_score']:.3f} | Cal: {pred['calibrated_score']:.3f})"
         )
+        if np.isfinite(pred.get("policy_score", np.nan)):
+            print(
+                f"  Policy      : {pred['policy_score']:.3f} "
+                f"(Risk x{pred.get('policy_risk_mult', 1.0):.2f})"
+            )
         print(f"  Signal      : {pred['signal_strength']}")
         print("----------------------------------------------------------------------")
         print(f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)")
@@ -2384,6 +2991,8 @@ if __name__ == "__main__":
             confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
             base_note=trade_plan["note"],
         )
+        if pred.get("policy_filtered"):
+            filter_note = f"{filter_note} POLICY_FILTERED".strip()
         if pred["direction"] in {"UP", "DOWN"} and np.isfinite(trade_plan["sl"]):
             sl_str = f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
             tp1_str = (

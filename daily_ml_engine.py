@@ -25,14 +25,18 @@ from julia_bridge import (
     add_target_fast,
     holographic_feature_engine_daily,
     kalman_structural_engine_daily,
+    narrative_context_engine_daily,
     rv_feature_engine_daily,
     smc_feature_engine_daily,
 )
 from universal_ml_engine import (
     EnsembleModel,
     MODEL_N_JOBS,
+    POLICY_EOD_GATE_HOUR_1D,
     TRADE_PLAN_LABEL_COLS,
     _compute_atr14,
+    _load_hyperparams_config,
+    build_prob_array_from_oos_map,
     build_report_data_lines,
     build_timeframe_selection,
     calibrate_oos_probabilities,
@@ -44,6 +48,7 @@ from universal_ml_engine import (
     predict_trade_plan,
     save_report,
     select_primary_timeframe,
+    train_policy_artifact,
     train_trade_plan_models,
 )
 
@@ -206,59 +211,25 @@ def add_daily_confluence(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_lgbm_ensemble_daily() -> list[lgb.LGBMRegressor]:
-    return [
-        lgb.LGBMRegressor(
-            n_estimators=800,
-            learning_rate=0.02,
-            num_leaves=31,
-            max_depth=5,
-            min_child_samples=40,
-            subsample=0.75,
-            subsample_freq=1,
-            colsample_bytree=0.75,
-            reg_alpha=0.15,
-            reg_lambda=0.15,
-            random_state=42,
-            n_jobs=MODEL_N_JOBS,
-            verbose=-1,
-            objective="regression",
-            metric="mae",
-        ),
-        lgb.LGBMRegressor(
-            n_estimators=600,
-            learning_rate=0.03,
-            num_leaves=15,
-            max_depth=3,
-            min_child_samples=60,
-            subsample=0.70,
-            subsample_freq=1,
-            colsample_bytree=0.65,
-            reg_alpha=0.30,
-            reg_lambda=0.30,
-            random_state=123,
-            n_jobs=MODEL_N_JOBS,
-            verbose=-1,
-            objective="regression",
-            metric="mae",
-        ),
-        lgb.LGBMRegressor(
-            n_estimators=500,
-            learning_rate=0.015,
-            num_leaves=63,
-            max_depth=7,
-            min_child_samples=30,
-            subsample=0.80,
-            subsample_freq=1,
-            colsample_bytree=0.80,
-            reg_alpha=0.10,
-            reg_lambda=0.10,
-            random_state=7,
-            n_jobs=MODEL_N_JOBS,
-            verbose=-1,
-            objective="regression",
-            metric="mae",
-        ),
-    ]
+    specs = _load_hyperparams_config()["classifier_ensemble"]
+    if not isinstance(specs, list) or not specs:
+        raise ValueError("`classifier_ensemble` must be a non-empty list.")
+
+    models: list[lgb.LGBMRegressor] = []
+    for idx, spec in enumerate(specs, start=1):
+        if not isinstance(spec, dict):
+            raise ValueError(f"`classifier_ensemble[{idx - 1}]` must be an object.")
+        params = dict(spec)
+        params.update(
+            {
+                "n_jobs": MODEL_N_JOBS,
+                "verbose": -1,
+                "objective": "regression",
+                "metric": "mae",
+            }
+        )
+        models.append(lgb.LGBMRegressor(**params))
+    return models
 
 
 def _fit_lgbm_with_inner_validation_daily(
@@ -684,6 +655,12 @@ def main() -> None:
         df_full[col] = kf_df[col].values
     print(f"  [TOON DAILY] Kalman structural features injected: {len(kf_df.columns)} columns")
 
+    print("  [TOON DAILY] Layer 1d: Narrative Context Awareness (23 context signals)...")
+    nc_df = narrative_context_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
+    print(f"  [TOON DAILY] Narrative context injected: {len(nc_df.columns)} columns")
+
     print("  [TOON DAILY] Layer 2: Injecting macro regime overlays (6M/12M)...")
     df_full = inject_macro_regime(df_full, df_6m, "6m")
     df_full = inject_macro_regime(df_full, df_12m, "12m")
@@ -701,7 +678,8 @@ def main() -> None:
     )
 
     all_holo_cols = [c for c in df_full.columns if c not in NON_FEATURE_COLS_DAILY]
-    state_cols = ["target", "time", "close", "atr14"]
+    # Preserve raw OHLC state for downstream trade-plan / policy replay.
+    state_cols = ["target", "time", "open", "high", "low", "close", "atr14"]
     for col in [
         "basis_pct",
         "basis_z_score",
@@ -816,6 +794,31 @@ def main() -> None:
         wf_results["feature_cols"],
     )
     joblib.dump(trade_plan_models, trade_plan_path)
+    prob_array_full = build_prob_array_from_oos_map(
+        df_model_ready["time"],
+        wf_results["oos_proba_map"],
+        calibrator=calibrator,
+    )
+    policy_artifact = train_policy_artifact(
+        df_model_ready,
+        wf_results["feature_cols"],
+        prob_array_full,
+        trade_plan_models,
+        lane="1D",
+        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
+        start_idx=tp_train_end,
+        max_hold_bars=BARRIER_HORIZON_BARS_DAILY,
+        eod_gate_hour=POLICY_EOD_GATE_HOUR_1D,
+    )
+    if policy_artifact is not None:
+        policy_path = artifact_paths_1d["policy_artifact"]
+        joblib.dump(policy_artifact, policy_path)
+        print(
+            f"  1D policy artifact saved to '{policy_path}' "
+            f"({policy_artifact['metadata']['candidate_rows']} candidates)"
+        )
+    else:
+        print("  [Policy] Skipped 1D policy artifact: insufficient honest candidate trades.")
 
     print(f"\n  1D model saved to '{model_path}'")
     print(f"  1D feature list saved to '{feat_path}'")
@@ -833,6 +836,8 @@ def main() -> None:
         last_row,
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
         calibrator=calibrator,
+        policy_artifact=policy_artifact,
+        policy_lane="1D",
     )
     primary_asset_label = str(df_1d.attrs.get("selected_asset_class", "PRIMARY"))
     close_price = float(last_row["close"])
@@ -853,6 +858,8 @@ def main() -> None:
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
         base_note=trade_plan["note"],
     )
+    if pred.get("policy_filtered"):
+        filter_note = f"{filter_note} POLICY_FILTERED".strip()
     if pred["direction"] in {"UP", "DOWN"} and np.isfinite(trade_plan["sl"]):
         sl_str = (
             f"{trade_plan['sl']:,.2f}  (ML stop {trade_plan['stop_atr']:.2f}x ATR14)"
@@ -878,6 +885,11 @@ def main() -> None:
         f"  Confidence  : {pred['confidence']:.1%} "
         f"(Raw: {pred['raw_score']:.3f} | Cal: {pred['calibrated_score']:.3f})"
     )
+    if np.isfinite(pred.get("policy_score", np.nan)):
+        print(
+            f"  Policy      : {pred['policy_score']:.3f} "
+            f"(Risk x{pred.get('policy_risk_mult', 1.0):.2f})"
+        )
     print(f"  Signal      : {pred['signal_strength']}")
     print("----------------------------------------------------------------------")
     print(f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)")

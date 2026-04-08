@@ -14,9 +14,11 @@ from universal_ml_engine import (
     merge_higher_tf,
     add_target,
     apply_calibrator_to_prob_array,
+    build_prob_array_from_oos_map,
     calibrate_oos_probabilities,
     fold_consensus_feature_selection,
     train_trade_plan_models,
+    train_policy_artifact,
     walk_forward,
     predict_next_bar,
     _compute_atr14,
@@ -31,10 +33,12 @@ from universal_ml_engine import (
 from julia_bridge import (
     holographic_feature_engine_fast as holographic_feature_engine,
     kalman_structural_engine_fast,
+    narrative_context_engine_fast,
     rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
 from backtest_engine import run_backtest, calculate_metrics
+from sleeve_registry import load_sleeve_registry_entry
 
 warnings.filterwarnings("ignore")
 
@@ -219,6 +223,7 @@ def run_strategy_zoo(
         else:
             strategy_df = wf_result.get("df")
             trade_plan_models = {}
+            policy_artifact = None
             if isinstance(strategy_df, pd.DataFrame) and not strategy_df.empty:
                 tp_holdout = max(int(len(strategy_df) * 0.15), 1)
                 tp_train_end = max(len(strategy_df) - tp_holdout, 1)
@@ -236,6 +241,28 @@ def run_strategy_zoo(
                 wf_result.get("oos_proba_map", {}),
                 strategy_df,
             )
+            if isinstance(strategy_df, pd.DataFrame) and not strategy_df.empty:
+                try:
+                    prob_array = build_prob_array_from_oos_map(
+                        strategy_df["time"],
+                        wf_result.get("oos_proba_map", {}),
+                        calibrator=wf_result["calibrator"],
+                    )
+                    policy_artifact = train_policy_artifact(
+                        strategy_df,
+                        feature_cols,
+                        prob_array,
+                        trade_plan_models,
+                        lane="1H",
+                        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+                        start_idx=tp_train_end,
+                        max_hold_bars=BARRIER_HORIZON_BARS,
+                    )
+                except Exception as exc:
+                    print(
+                        f"  [Meta] [Zoo] Policy artifact training failed for {key}: {exc}"
+                    )
+            wf_result["policy_artifact"] = policy_artifact
 
         zoo_results[key] = wf_result
 
@@ -259,6 +286,7 @@ def meta_select_strategy(
         oos_proba_map = wf_result.get("oos_proba_map") or {}
         trade_plan_models = wf_result.get("trade_plan_models", {})
         calibrator = wf_result.get("calibrator")
+        policy_artifact = wf_result.get("policy_artifact")
 
         if (
             not isinstance(strategy_df, pd.DataFrame)
@@ -309,9 +337,11 @@ def meta_select_strategy(
                 nan_1d,
                 feature_cols,
                 trade_plan_models=trade_plan_models,
+                policy_artifact=policy_artifact,
                 initial_capital=BACKTEST_INITIAL_CAPITAL,
                 risk_pct=BACKTEST_RISK_PCT,
                 conf_threshold=conf_threshold,
+                lane="1H",
             )
             bt_metrics = calculate_metrics(
                 bt_results["trades"],
@@ -430,6 +460,7 @@ def verdict_output(
     feature_cols = winning_wf.get("feature_cols", [])
     winning_df = winning_wf.get("df")
     calibrator = winning_wf.get("calibrator")
+    policy_artifact = winning_wf.get("policy_artifact")
     last_row = (
         winning_df.iloc[-1].copy()
         if isinstance(winning_df, pd.DataFrame) and not winning_df.empty
@@ -443,6 +474,8 @@ def verdict_output(
             last_row,
             LIVE_CONFIDENCE_THRESHOLD,
             calibrator=calibrator,
+            policy_artifact=policy_artifact,
+            policy_lane="1H",
         )
     else:
         pred = {
@@ -582,6 +615,13 @@ if __name__ == "__main__":
     baseline_oos_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "oos_proba"
     )
+    registry_entry = load_sleeve_registry_entry(SYMBOL, "1H")
+    if registry_entry is not None and not bool(registry_entry.get("enabled")):
+        print(
+            f"  [Meta] Sleeve {SYMBOL}_1H disabled by registry. "
+            f"Reason: {registry_entry.get('reason', 'admission failed')}"
+        )
+        raise SystemExit(0)
     if os.path.exists(baseline_model_path):
         print(f"  [Meta] Found baseline model: {baseline_model_path}")
     if os.path.exists(baseline_oos_path):
@@ -627,6 +667,9 @@ if __name__ == "__main__":
     rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     for col in rv_df.columns:
         df_full[col] = rv_df[col].values
+    nc_df = narrative_context_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
+    for col in nc_df.columns:
+        df_full[col] = nc_df[col].values
     df_full = merge_higher_tf(df_full.copy(), df_1d.copy(), df_1w.copy(), df_1m.copy())
     if "atr14" not in df_full.columns:
         df_full = _compute_atr14(df_full.copy())
