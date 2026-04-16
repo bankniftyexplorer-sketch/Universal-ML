@@ -35,6 +35,7 @@ from julia_bridge import (
     compute_backtest_bar_state_fast,
 )
 from data_vault.symbol_identity import extract_symbol_payload, parse_symbol_payload
+from instrument_registry import InstrumentIdentity, resolve_instrument_identity
 from numba import njit
 
 warnings.filterwarnings("ignore")
@@ -153,6 +154,29 @@ POLICY_MIN_SAMPLES = 120
 POLICY_MIN_CLASS_SAMPLES = 20
 POLICY_VALIDATION_RATIO = 0.25
 POLICY_THRESHOLD_GRID = tuple(np.round(np.arange(0.50, 0.86, 0.05), 2))
+POLICY_ARTIFACT_SCHEMA_VERSION = 2
+POLICY_ARTIFACT_KIND = "opportunity_head_v2"
+EXIT_SURFACE_ARTIFACT_SCHEMA_VERSION = 1
+EXIT_SURFACE_ARTIFACT_KIND = "exit_surface_v1"
+EXIT_SURFACE_MIN_SAMPLES = 80
+EXIT_SURFACE_CONF_QUANTILES = (0.50, 0.80)
+EXIT_SURFACE_TEMPLATE_CATALOG = {
+    "1H": (
+        {"id": "h1_compact", "stop_atr": 0.75, "tp1_atr": 1.00, "tp2_atr": 1.80, "trail_atr": 0.60},
+        {"id": "h1_balanced", "stop_atr": 0.75, "tp1_atr": 1.25, "tp2_atr": 2.25, "trail_atr": 0.75},
+        {"id": "h1_wide_runner", "stop_atr": 1.00, "tp1_atr": 1.25, "tp2_atr": 2.50, "trail_atr": 0.80},
+        {"id": "h1_trend", "stop_atr": 1.00, "tp1_atr": 1.50, "tp2_atr": 3.00, "trail_atr": 1.00},
+        {"id": "h1_defensive", "stop_atr": 1.25, "tp1_atr": 1.50, "tp2_atr": 2.50, "trail_atr": 1.00},
+        {"id": "h1_swing", "stop_atr": 1.25, "tp1_atr": 2.00, "tp2_atr": 3.50, "trail_atr": 1.25},
+    ),
+    "1D": (
+        {"id": "d1_compact", "stop_atr": 1.00, "tp1_atr": 1.50, "tp2_atr": 3.00, "trail_atr": 1.00},
+        {"id": "d1_balanced", "stop_atr": 1.25, "tp1_atr": 2.00, "tp2_atr": 3.50, "trail_atr": 1.25},
+        {"id": "d1_trend", "stop_atr": 1.50, "tp1_atr": 2.00, "tp2_atr": 4.00, "trail_atr": 1.50},
+        {"id": "d1_wide_runner", "stop_atr": 1.50, "tp1_atr": 2.50, "tp2_atr": 4.50, "trail_atr": 1.25},
+        {"id": "d1_defensive", "stop_atr": 2.00, "tp1_atr": 2.50, "tp2_atr": 5.00, "trail_atr": 1.50},
+    ),
+}
 POLICY_RISK_MULTS = (
     (0.12, 1.25),
     (0.05, 1.00),
@@ -1144,6 +1168,31 @@ def _resolve_policy_risk_mult(policy_artifact: dict, score: float) -> float:
     return 1.0
 
 
+def resolve_policy_decision_threshold(policy_artifact: dict | None) -> float:
+    if not policy_artifact:
+        return float("nan")
+    raw_value = policy_artifact.get(
+        "decision_threshold",
+        policy_artifact.get("deploy_threshold"),
+    )
+    return float(np.clip(_safe_numeric(raw_value, 0.5), 0.0, 1.0))
+
+
+def describe_policy_artifact(policy_artifact: dict | None) -> str:
+    if not policy_artifact or "model" not in policy_artifact:
+        return "policy artifact unavailable"
+    schema_version = int(policy_artifact.get("schema_version", 1))
+    artifact_kind = str(policy_artifact.get("artifact_kind", "policy_artifact_v1"))
+    lane = str(policy_artifact.get("lane", "UNK")).upper()
+    threshold = resolve_policy_decision_threshold(policy_artifact)
+    if np.isfinite(threshold):
+        return (
+            f"{artifact_kind} v{schema_version} "
+            f"[lane={lane} threshold={threshold:.2f}]"
+        )
+    return f"{artifact_kind} v{schema_version} [lane={lane}]"
+
+
 def score_policy_artifact(
     policy_artifact: dict | None,
     row: pd.Series,
@@ -1154,6 +1203,16 @@ def score_policy_artifact(
     confidence_threshold: float,
 ) -> dict[str, float | bool]:
     if not policy_artifact or "model" not in policy_artifact:
+        return {
+            "score": np.nan,
+            "allow_trade": True,
+            "risk_mult": 1.0,
+            "threshold": np.nan,
+        }
+
+    lane_key = str(lane).upper()
+    artifact_lane = str(policy_artifact.get("lane", lane_key)).upper()
+    if artifact_lane and artifact_lane != lane_key:
         return {
             "score": np.nan,
             "allow_trade": True,
@@ -1182,7 +1241,7 @@ def score_policy_artifact(
     )
     raw_score = _safe_numeric(policy_artifact["model"].predict(X)[0], 0.0)
     score = float(np.clip(raw_score, 0.0, 1.0))
-    threshold = float(np.clip(_safe_numeric(policy_artifact.get("deploy_threshold"), 0.5), 0.0, 1.0))
+    threshold = resolve_policy_decision_threshold(policy_artifact)
     allow_trade = score >= threshold
     risk_mult = 0.0 if not allow_trade else _resolve_policy_risk_mult(policy_artifact, score)
     return {
@@ -1215,6 +1274,14 @@ def apply_policy_artifact_to_prediction(
     updated["policy_risk_mult"] = verdict["risk_mult"]
     updated["policy_allowed"] = verdict["allow_trade"]
     updated["policy_filtered"] = False
+    updated["policy_artifact_kind"] = (
+        str(policy_artifact.get("artifact_kind", "policy_artifact_v1"))
+        if policy_artifact
+        else "none"
+    )
+    updated["policy_schema_version"] = (
+        int(policy_artifact.get("schema_version", 1)) if policy_artifact else 0
+    )
     if updated.get("signal_strength") != "NO_TRADE" and not verdict["allow_trade"]:
         updated["signal_strength"] = "NO_TRADE"
         updated["policy_filtered"] = True
@@ -1226,6 +1293,7 @@ def train_policy_artifact(
     feature_cols: list[str],
     prob_array: np.ndarray,
     trade_plan_models: dict,
+    exit_surface_artifact: dict | None = None,
     *,
     lane: str,
     confidence_threshold: float,
@@ -1315,6 +1383,9 @@ def train_policy_artifact(
             row.copy(),
             direction,
             float(curr_atr),
+            exit_surface_artifact=exit_surface_artifact,
+            proba_up=proba_up,
+            lane=lane_key,
         )
         stop_dist = float(curr_atr * _safe_numeric(trade_plan.get("stop_atr"), BARRIER_ATR_MULT))
         tp1_dist = float(curr_atr * _safe_numeric(trade_plan.get("tp1_atr"), TP1_R_MULT))
@@ -1487,22 +1558,37 @@ def train_policy_artifact(
     )
 
     return {
+        "schema_version": POLICY_ARTIFACT_SCHEMA_VERSION,
+        "artifact_kind": POLICY_ARTIFACT_KIND,
         "model": final_model,
         "feature_cols": policy_feature_cols,
+        "decision_threshold": deploy_threshold,
         "deploy_threshold": deploy_threshold,
         "risk_bands": risk_bands,
         "lane": lane_key,
         "collection_threshold": float(POLICY_COLLECTION_THRESHOLD),
         "metadata": {
+            "threshold_scope": "symbol_lane_local",
+            "base_confidence_threshold": float(confidence_threshold),
+            "source_rows": int(len(source_df)),
             "train_rows": int(len(train_df)),
             "validation_rows": int(len(val_df)),
             "candidate_rows": int(len(candidate_df)),
+            "candidate_rate": float(len(candidate_df) / max(len(source_df), 1)),
             "positive_rate": float(candidate_df["policy_label"].mean()),
+            "validation_avg_r": (
+                float(best_eval["avg_r"]) if best_eval is not None else None
+            ),
             "validation_final_equity": (
                 float(best_eval["final_equity"]) if best_eval is not None else None
             ),
             "validation_max_drawdown": (
                 float(best_eval["max_drawdown"]) if best_eval is not None else None
+            ),
+            "validation_active_rate": (
+                float(best_eval["total_trades"] / max(len(val_df), 1))
+                if best_eval is not None
+                else None
             ),
             "validation_trades": (
                 int(best_eval["total_trades"]) if best_eval is not None else 0
@@ -1520,7 +1606,7 @@ def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
         ),  # Tightened: 40th percentile (Pro-Trader SL)
         "up_tp1_atr": (1, "long_mfe_atr", 0.55),
         "up_tp2_atr": (1, "long_mfe_atr", 0.75),
-        "down_stop_atr": (0, "short_mae_atr", 0.40),  # Tightened
+        "down_stop_atr": (0, "short_mae_atr", 0.40),
         "down_tp1_atr": (0, "short_mfe_atr", 0.55),
         "down_tp2_atr": (0, "short_mfe_atr", 0.75),
     }
@@ -1569,12 +1655,266 @@ def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
     return models
 
 
+def _exit_surface_bucket(confidence: float, bucket_edges: list[float]) -> int:
+    bucket = 0
+    for edge in bucket_edges:
+        if confidence < edge:
+            return bucket
+        bucket += 1
+    return bucket
+
+
+def _select_exit_surface_template(
+    exit_surface_artifact: dict | None,
+    *,
+    direction: str,
+    proba_up: float | None,
+    lane: str,
+) -> dict | None:
+    if not exit_surface_artifact:
+        return None
+    lane_key = str(lane).upper()
+    artifact_lane = str(exit_surface_artifact.get("lane", lane_key)).upper()
+    if artifact_lane != lane_key:
+        return None
+    selection_map = exit_surface_artifact.get("selection_map", {})
+    if not isinstance(selection_map, dict) or not selection_map:
+        return None
+    confidence = (
+        max(float(proba_up), 1.0 - float(proba_up))
+        if proba_up is not None and np.isfinite(proba_up)
+        else 0.5
+    )
+    bucket_edges = [
+        float(edge)
+        for edge in exit_surface_artifact.get("confidence_bucket_edges", [])
+        if np.isfinite(edge)
+    ]
+    bucket = _exit_surface_bucket(confidence, bucket_edges)
+    key = f"{direction}|{bucket}"
+    entry = (
+        selection_map.get(key)
+        or selection_map.get(f"{direction}|default")
+        or selection_map.get("ANY|default")
+    )
+    if not isinstance(entry, dict):
+        return None
+    template = entry.get("template")
+    return dict(template) if isinstance(template, dict) else None
+
+
+def train_exit_surface_artifact(
+    df: pd.DataFrame,
+    prob_array: np.ndarray,
+    *,
+    lane: str,
+    start_idx: int = 0,
+    max_hold_bars: int | None = None,
+    eod_gate_hour: int | None = None,
+) -> dict | None:
+    if df is None or df.empty:
+        return None
+
+    lane_key = str(lane).upper()
+    source_df = df.reset_index(drop=True).copy()
+    probs = np.asarray(prob_array, dtype=float)
+    if len(source_df) != len(probs):
+        raise ValueError("Exit-surface frame and probability array length mismatch.")
+
+    slice_start = int(max(start_idx, 0))
+    if slice_start >= len(source_df) - 2:
+        return None
+    if slice_start > 0:
+        source_df = source_df.iloc[slice_start:].reset_index(drop=True)
+        probs = probs[slice_start:]
+
+    if max_hold_bars is None:
+        max_hold_bars = BARRIER_HORIZON_BARS if lane_key == "1H" else 10
+    if eod_gate_hour is None:
+        eod_gate_hour = (
+            POLICY_EOD_GATE_HOUR_1H if lane_key == "1H" else POLICY_EOD_GATE_HOUR_1D
+        )
+
+    catalog = [dict(item) for item in EXIT_SURFACE_TEMPLATE_CATALOG.get(lane_key, ())]
+    if not catalog:
+        return None
+
+    close_arr = source_df["close"].to_numpy(dtype=float)
+    open_arr = source_df["open"].to_numpy(dtype=float)
+    high_arr = source_df["high"].to_numpy(dtype=float)
+    low_arr = source_df["low"].to_numpy(dtype=float)
+    atr_arr = source_df["atr14"].to_numpy(dtype=float)
+    time_arr = source_df["time"].to_numpy()
+    time_dt = pd.to_datetime(time_arr)
+    z_arr = (
+        source_df["basis_z_score"].to_numpy(dtype=float)
+        if "basis_z_score" in source_df.columns
+        else np.zeros(len(source_df), dtype=float)
+    )
+
+    hour_arr = np.asarray(time_dt.hour, dtype=np.int64)
+    next_hour_arr = np.full(len(hour_arr), 24, dtype=np.int64)
+    if len(hour_arr) > 1:
+        next_hour_arr[:-1] = hour_arr[1:]
+
+    bar_state = compute_backtest_bar_state_fast(
+        close_arr,
+        probs,
+        atr_arr,
+        z_arr,
+        next_hour_arr,
+        window_h=100,
+        default_hurst=0.5,
+        conf_threshold=POLICY_COLLECTION_THRESHOLD,
+        shock_z_abs=2.5,
+        min_hurst=0.45,
+        eod_gate_hour=eod_gate_hour,
+    )
+    skip_code_arr = np.asarray(bar_state["skip_code"], dtype=np.int64)
+
+    candidates: list[dict[str, float | int | str]] = []
+    for i in range(len(source_df) - 1):
+        skip_code = int(skip_code_arr[i])
+        if skip_code in {
+            SKIP_NO_PREDICTION,
+            SKIP_EOD_GATE,
+            SKIP_LOW_CONFIDENCE,
+            SKIP_INVALID_ATR,
+            SKIP_SHOCK,
+            SKIP_LOW_HURST,
+        }:
+            continue
+
+        curr_atr = float(atr_arr[i])
+        if not np.isfinite(curr_atr) or curr_atr <= 0:
+            continue
+
+        proba_up = float(np.clip(probs[i], 0.0, 1.0))
+        confidence = max(proba_up, 1.0 - proba_up)
+        candidates.append(
+            {
+                "index": i,
+                "proba_up": proba_up,
+                "confidence": confidence,
+                "direction": "UP" if proba_up > 0.5 else "DOWN",
+                "atr": curr_atr,
+            }
+        )
+
+    if len(candidates) < EXIT_SURFACE_MIN_SAMPLES:
+        return None
+
+    confidence_values = np.asarray([item["confidence"] for item in candidates], dtype=float)
+    bucket_edges = sorted(
+        {
+            float(edge)
+            for edge in np.quantile(confidence_values, EXIT_SURFACE_CONF_QUANTILES)
+            if np.isfinite(edge)
+        }
+    )
+
+    aggregate: dict[tuple[str, str], dict[str, float]] = {}
+
+    def _record(group_key: str, template: dict, total_r: float) -> None:
+        stats = aggregate.setdefault(
+            (group_key, str(template["id"])),
+            {"sum_r": 0.0, "wins": 0.0, "samples": 0.0},
+        )
+        stats["sum_r"] += float(total_r)
+        stats["wins"] += 1.0 if total_r > 0.0 else 0.0
+        stats["samples"] += 1.0
+
+    for item in candidates:
+        idx = int(item["index"])
+        curr_atr = float(item["atr"])
+        direction = str(item["direction"])
+        bucket = _exit_surface_bucket(float(item["confidence"]), bucket_edges)
+        group_key = f"{direction}|{bucket}"
+        default_key = f"{direction}|default"
+        for template in catalog:
+            trade_path = simulate_trade_path_from_arrays(
+                open_arr,
+                high_arr,
+                low_arr,
+                close_arr,
+                time_arr,
+                idx + 1,
+                "LONG" if direction == "UP" else "SHORT",
+                float(curr_atr * float(template["stop_atr"])),
+                tp1_dist=float(curr_atr * float(template["tp1_atr"])),
+                tp2_dist=float(curr_atr * float(template["tp2_atr"])),
+                trail_dist=float(curr_atr * float(template["trail_atr"])),
+                horizon=max_hold_bars,
+                fee_pct=EXEC_FEE_PCT,
+                slippage_bps=EXEC_SLIPPAGE_BPS,
+            )
+            total_r = _safe_numeric(trade_path.get("total_r"), np.nan)
+            if not np.isfinite(total_r):
+                continue
+            _record(group_key, template, total_r)
+            _record(default_key, template, total_r)
+
+    selection_map: dict[str, dict[str, object]] = {}
+    min_group_samples = max(8, min(24, len(candidates) // 10))
+    for group_key in sorted({group for group, _template_id in aggregate.keys()}):
+        template_rows = []
+        for template in catalog:
+            stats = aggregate.get((group_key, str(template["id"])))
+            if not stats or stats["samples"] < min_group_samples:
+                continue
+            avg_r = float(stats["sum_r"] / max(stats["samples"], 1.0))
+            win_rate = float(stats["wins"] / max(stats["samples"], 1.0))
+            template_rows.append(
+                (
+                    avg_r,
+                    win_rate,
+                    int(stats["samples"]),
+                    dict(template),
+                )
+            )
+        if not template_rows:
+            continue
+        template_rows.sort(reverse=True)
+        avg_r, win_rate, samples, template = template_rows[0]
+        selection_map[group_key] = {
+            "template_id": str(template["id"]),
+            "template": template,
+            "samples": samples,
+            "avg_r": avg_r,
+            "win_rate": win_rate,
+        }
+
+    if not selection_map:
+        return None
+
+    return {
+        "schema_version": EXIT_SURFACE_ARTIFACT_SCHEMA_VERSION,
+        "artifact_kind": EXIT_SURFACE_ARTIFACT_KIND,
+        "lane": lane_key,
+        "template_catalog": catalog,
+        "confidence_bucket_edges": bucket_edges,
+        "selection_map": selection_map,
+        "metadata": {
+            "source_rows": int(len(source_df)),
+            "candidate_rows": int(len(candidates)),
+            "candidate_rate": float(len(candidates) / max(len(source_df), 1)),
+            "bucket_count": int(len(bucket_edges) + 1),
+            "template_count": int(len(catalog)),
+            "selection_keys": int(len(selection_map)),
+        },
+    }
+
+
 def predict_trade_plan(
     plan_models: dict,
     feature_cols: list,
     latest_row: pd.Series,
     direction: str,
     atr_value: float,
+    *,
+    exit_surface_artifact: dict | None = None,
+    proba_up: float | None = None,
+    lane: str = "1H",
 ) -> dict:
     fallback_r = BARRIER_ATR_MULT
     if direction not in {"UP", "DOWN"} or atr_value <= 0:
@@ -1597,12 +1937,23 @@ def predict_trade_plan(
             latest_row[col] = 0.0
     X = latest_row[feature_cols].values.reshape(1, -1)
 
-    if all(key in plan_models for key in required):
+    template = _select_exit_surface_template(
+        exit_surface_artifact,
+        direction=direction,
+        proba_up=proba_up,
+        lane=lane,
+    )
+    if template is not None:
+        stop_atr = float(np.clip(_safe_numeric(template.get("stop_atr"), fallback_r), 0.35, 2.50))
+        tp1_atr = float(np.clip(_safe_numeric(template.get("tp1_atr"), stop_atr), 0.50, 8.00))
+        tp2_atr = float(np.clip(_safe_numeric(template.get("tp2_atr"), tp1_atr), 1.00, 12.00))
+        trail_r = float(np.clip(_safe_numeric(template.get("trail_atr"), stop_atr), 0.30, 4.00))
+        note = f"Exit surface template: {template.get('id', 'unknown')}."
+    elif all(key in plan_models for key in required):
         stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 1.50))
         tp1_atr = float(np.clip(plan_models[required[1]].predict(X)[0], 0.50, 4.00))
         tp2_atr = float(np.clip(plan_models[required[2]].predict(X)[0], 1.00, 7.00))
 
-        # Ensure Reward/Risk logic: TP1 should be at least 1x Stop
         tp1_atr = max(tp1_atr, stop_atr * 1.00)
         tp2_atr = max(tp2_atr, tp1_atr + 0.25)
         trail_r = float(np.clip(stop_atr, 0.40, 1.50))
@@ -2533,6 +2884,7 @@ ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_1H_oos_proba.pkl",
         "calibrator": "{prefix}_1H_calibrator.pkl",
         "trade_plan_models": "{prefix}_1H_trade_plan_models.pkl",
+        "exit_surface": "{prefix}_1H_exit_surface.pkl",
         "policy_artifact": "{prefix}_1H_policy_artifact.pkl",
         "ml_report": "{prefix}_1H_ml_report.png",
         "backtest_report": "{prefix}_1H_backtest_report.png",
@@ -2543,6 +2895,7 @@ ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_1D_oos_proba.pkl",
         "calibrator": "{prefix}_1D_calibrator.pkl",
         "trade_plan_models": "{prefix}_1D_trade_plan_models.pkl",
+        "exit_surface": "{prefix}_1D_exit_surface.pkl",
         "policy_artifact": "{prefix}_1D_policy_artifact.pkl",
         "ml_report": "{prefix}_1D_ml_report.png",
         "backtest_report": "{prefix}_1D_backtest_report.png",
@@ -2557,6 +2910,7 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_oos_proba.pkl",
         "calibrator": "{prefix}_1H_calibrator.pkl",
         "trade_plan_models": "{prefix}_trade_plan_models.pkl",
+        "exit_surface": "{prefix}_1H_exit_surface.pkl",
         "policy_artifact": "{prefix}_1H_policy_artifact.pkl",
         "ml_report": "{prefix}_ml_report_ultimate.png",
         "backtest_report": "{prefix}_backtest_report.png",
@@ -2567,6 +2921,7 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "oos_proba": "{prefix}_daily_oos_proba.pkl",
         "calibrator": "{prefix}_1D_calibrator.pkl",
         "trade_plan_models": "{prefix}_daily_trade_plan_models.pkl",
+        "exit_surface": "{prefix}_1D_exit_surface.pkl",
         "policy_artifact": "{prefix}_1D_policy_artifact.pkl",
         "ml_report": "{prefix}_daily_ml_report.png",
         "backtest_report": "{prefix}_daily_backtest_report.png",
@@ -2622,6 +2977,102 @@ def migrate_legacy_artifacts(
     return current_paths
 
 
+def _alias_artifact_locations(
+    identity: InstrumentIdentity,
+    outdir: str,
+    timeframe: str,
+) -> list[tuple[str, dict[str, str]]]:
+    locations: list[tuple[str, dict[str, str]]] = []
+    for alias_symbol in identity.alias_set:
+        if alias_symbol == identity.canonical_symbol:
+            continue
+        alias_dir = os.path.join(outdir, alias_symbol)
+        if not os.path.isdir(alias_dir):
+            continue
+        alias_prefix = alias_symbol.lower().replace(" ", "_")
+        locations.append(
+            (alias_symbol, get_artifact_paths(alias_dir, alias_prefix, timeframe))
+        )
+        locations.append(
+            (
+                alias_symbol,
+                get_artifact_paths(alias_dir, alias_prefix, timeframe, legacy=True),
+            )
+        )
+    return locations
+
+
+def migrate_alias_artifacts(
+    outdir: str,
+    identity: InstrumentIdentity,
+    timeframe: str,
+    logger=print,
+) -> dict[str, str]:
+    symbol_dir = identity.symbol_dir(outdir)
+    os.makedirs(symbol_dir, exist_ok=True)
+    current_paths = get_artifact_paths(symbol_dir, identity.artifact_prefix, timeframe)
+    moved_any = False
+
+    for alias_symbol, alias_paths in _alias_artifact_locations(identity, outdir, timeframe):
+        for artifact_key, alias_path in alias_paths.items():
+            target_path = current_paths[artifact_key]
+            if not os.path.exists(alias_path) or os.path.exists(target_path):
+                continue
+            os.replace(alias_path, target_path)
+            moved_any = True
+            if logger is not None:
+                logger(
+                    f"  [Artifacts] Canonicalized {timeframe} {artifact_key} "
+                    f"from {alias_symbol} -> {identity.canonical_symbol}"
+                )
+
+    if moved_any:
+        for alias_symbol in identity.alias_set:
+            if alias_symbol == identity.canonical_symbol:
+                continue
+            alias_dir = os.path.join(outdir, alias_symbol)
+            if os.path.isdir(alias_dir) and not os.listdir(alias_dir):
+                os.rmdir(alias_dir)
+                if logger is not None:
+                    logger(
+                        f"  [Artifacts] Removed empty alias artifact directory {alias_symbol}"
+                    )
+
+    return migrate_legacy_artifacts(
+        symbol_dir,
+        identity.artifact_prefix,
+        timeframe,
+        logger=logger,
+    )
+
+
+def prepare_symbol_artifact_context(
+    outdir: str,
+    symbol: str,
+    *,
+    asset_class: str = "SPOT",
+    timeframes: tuple[str, ...] = ("1H", "1D"),
+    logger=print,
+) -> dict[str, str | InstrumentIdentity]:
+    identity = resolve_instrument_identity(
+        symbol,
+        outdir=outdir,
+        asset_class=asset_class,
+    )
+    symbol_dir = identity.symbol_dir(outdir)
+    os.makedirs(symbol_dir, exist_ok=True)
+    for timeframe in timeframes:
+        migrate_alias_artifacts(outdir, identity, timeframe, logger=logger)
+    return {
+        "identity": identity,
+        "symbol": identity.display_symbol,
+        "requested_symbol": identity.request_symbol,
+        "canonical_symbol": identity.canonical_symbol,
+        "symbol_dir": symbol_dir,
+        "file_prefix": identity.artifact_prefix,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Universal ML Direction Predictor")
     parser.add_argument(
@@ -2639,17 +3090,27 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    DATA_DIR = args.outdir
-    SYMBOL = args.symbol.upper()
-    file_prefix = SYMBOL.lower().replace(" ", "_")
-
-    # CRITICAL: Create Symbol-Specific Artifact Vault
-    SYMBOL_DIR = os.path.join(DATA_DIR, SYMBOL)
-    os.makedirs(SYMBOL_DIR, exist_ok=True)
-    artifact_paths_1h = migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1H")
+    DATA_DIR = os.path.abspath(args.outdir)
+    requested_symbol = args.symbol.upper()
+    artifact_ctx = prepare_symbol_artifact_context(
+        DATA_DIR,
+        requested_symbol,
+        asset_class=PRIMARY_ASSET_CLASS,
+        timeframes=("1H",),
+    )
+    SYMBOL = str(artifact_ctx["symbol"])
+    SYMBOL_DIR = str(artifact_ctx["symbol_dir"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    artifact_paths_1h = get_artifact_paths(SYMBOL_DIR, file_prefix, "1H")
 
     print("=" * 70)
-    print(f"  INITIATING DATABASE UPLINK FOR: {SYMBOL}")
+    if requested_symbol != SYMBOL:
+        print(
+            f"  INITIATING DATABASE UPLINK FOR: {SYMBOL} "
+            f"[requested {requested_symbol}]"
+        )
+    else:
+        print(f"  INITIATING DATABASE UPLINK FOR: {SYMBOL}")
     print("=" * 70)
 
     # Connect to Bridge
@@ -2667,7 +3128,7 @@ if __name__ == "__main__":
     # Fetch Holographic Stacks
     tf_maps = {
         "SPOT": bridge.fetch_holographic_stack(
-            SYMBOL,
+            str(artifact_ctx["identity"].market_data_symbol),
             PRIMARY_ASSET_CLASS,
         ),
     }
@@ -2916,16 +3377,33 @@ if __name__ == "__main__":
         print(
             f"  Trade-plan models saved to '{trade_plan_path}' ({len(trade_plan_models)} models)"
         )
-        prob_array_full = build_prob_array_from_oos_map(
-            df_model_ready["time"],
-            wf_results["oos_proba_map"],
-            calibrator=calibrator,
+        exit_surface_artifact = train_exit_surface_artifact(
+            df_model_ready,
+            prob_array_full := build_prob_array_from_oos_map(
+                df_model_ready["time"],
+                wf_results["oos_proba_map"],
+                calibrator=calibrator,
+            ),
+            lane="1H",
+            start_idx=_tp_train_end,
+            max_hold_bars=BARRIER_HORIZON_BARS,
+            eod_gate_hour=POLICY_EOD_GATE_HOUR_1H,
         )
+        exit_surface_path = artifact_paths_1h["exit_surface"]
+        if exit_surface_artifact is not None:
+            joblib.dump(exit_surface_artifact, exit_surface_path)
+            print(
+                f"  Exit surface saved to '{exit_surface_path}' "
+                f"({exit_surface_artifact['metadata']['candidate_rows']} candidates)"
+            )
+        else:
+            print("  [Exit Surface] Skipped 1H artifact: insufficient honest candidate trades.")
         policy_artifact = train_policy_artifact(
             df_model_ready,
             feature_cols_to_use,
             prob_array_full,
             trade_plan_models,
+            exit_surface_artifact=exit_surface_artifact,
             lane="1H",
             confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
             start_idx=_tp_train_end,
@@ -2962,6 +3440,9 @@ if __name__ == "__main__":
             last_row.copy(),
             pred["direction"],
             atr,
+            exit_surface_artifact=exit_surface_artifact,
+            proba_up=float(pred.get("calibrated_score", pred.get("raw_score", np.nan))),
+            lane="1H",
         )
 
         print("\n" + "=" * 70)

@@ -65,6 +65,7 @@ Notes:
 - repeat `--symbol` to sync multiple instruments
 - omit `--symbol` to sync the core watchlist first (`NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50`, `SPX500`, `BTC`), then the rest of the curated Yahoo map and any custom aliases saved locally
 - `--symbol` accepts curated aliases like `BTCUSDT`, custom registered aliases, and raw Yahoo tickers like `AAPL`, `^GDAXI`, or `EURUSD=X`
+- model/runtime artifacts are written under the canonical symbol directory, so alias requests such as `BTCUSDT` resolve into the shared `BTC/` artifact tree
 - normal syncs are incremental by default for speed; use `--full-refresh` when you want a max-history rebuild from Yahoo
 - `data_vault/vault_engine.py` is the canonical entrypoint
 - the root-level `vault_engine.py` remains an import-compatibility shim
@@ -268,6 +269,7 @@ uv run python meta_strategy_selector.py --symbol NIFTY --outdir /home/km/Univers
 ```
 
 Use this only if you want the strategy-comparison verdict layer.
+For replay parity with the current runtime path, regenerate the symbol’s `1H` artifacts first so the selector can reuse the saved exit-surface artifact instead of falling back to local legacy trade-plan exits.
 
 ---
 
@@ -312,6 +314,21 @@ What this checks:
 
 This is the safest first check before trusting refactors, optimizations, or
 runtime changes.
+
+For execution-policy changes that do not retrain the direction model, capture a
+replay baseline and compare the saved-artifact variants directly:
+
+```bash
+uv run python execution_guardrail.py capture --symbols NIFTY BANKNIFTY SENSEX BTCUSDT --outdir /home/km/Universal-ML/ --lane all
+uv run python execution_guardrail.py compare --symbols NIFTY BANKNIFTY SENSEX BTCUSDT --outdir /home/km/Universal-ML/ --lane all
+```
+
+This replay guardrail:
+
+- rebuilds the saved-artifact backtest bundle for each requested symbol/lane
+- evaluates both `base` and `policy` execution variants read-only
+- compares replay equity, profit factor, Sharpe, and max drawdown against the captured baseline
+- reports whether the tracked execution artifacts are the same run or a different run
 
 Outputs to understand:
 

@@ -12,6 +12,7 @@ import sys
 import numpy as np
 import pandas as pd
 import joblib
+import json
 import warnings
 
 from universal_ml_engine import EnsembleModel  # noqa: F401
@@ -19,11 +20,12 @@ from universal_ml_engine import (
     prepare_intraday_thermodynamics,
     _compute_atr14,
     build_timeframe_selection,
+    describe_policy_artifact,
     describe_selected_frame,
     merge_higher_tf,
-    migrate_legacy_artifacts,
     NON_FEATURE_COLS_SET,
     finalize_forecast_context,
+    prepare_symbol_artifact_context,
     predict_next_bar,
     predict_trade_plan,
     resolve_artifact_path,
@@ -50,11 +52,18 @@ def main():
     parser.add_argument("--symbol", type=str, required=True, help="Target Base Symbol")
     args = parser.parse_args()
 
-    PROJECT_ROOT = args.outdir
-    SYMBOL = args.symbol.upper()
-    SYMBOL_DIR = os.path.join(PROJECT_ROOT, SYMBOL)
-    file_prefix = SYMBOL.lower().replace(" ", "_")
-    migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1H", logger=None)
+    PROJECT_ROOT = os.path.abspath(args.outdir)
+    requested_symbol = args.symbol.upper()
+    artifact_ctx = prepare_symbol_artifact_context(
+        PROJECT_ROOT,
+        requested_symbol,
+        asset_class="SPOT",
+        timeframes=("1H",),
+        logger=None,
+    )
+    SYMBOL = str(artifact_ctx["symbol"])
+    SYMBOL_DIR = str(artifact_ctx["symbol_dir"])
+    file_prefix = str(artifact_ctx["file_prefix"])
 
     sys.path.append(os.path.join(PROJECT_ROOT, "data_vault"))
     try:
@@ -70,7 +79,7 @@ def main():
 
     tf_maps = {
         "SPOT": bridge.fetch_holographic_stack(
-            SYMBOL,
+            str(artifact_ctx["identity"].market_data_symbol),
             "SPOT",
         ),
     }
@@ -93,6 +102,9 @@ def main():
     mod_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "model")
     feat_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "features")
     tp_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "trade_plan_models")
+    exit_surface_path = resolve_artifact_path(
+        SYMBOL_DIR, file_prefix, "1H", "exit_surface"
+    )
     policy_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "policy_artifact"
     )
@@ -120,6 +132,9 @@ def main():
         feature_cols_to_use = [line.strip() for line in f.readlines() if line.strip()]
 
     trade_plan_models = joblib.load(tp_path) if os.path.exists(tp_path) else {}
+    exit_surface_artifact = (
+        joblib.load(exit_surface_path) if os.path.exists(exit_surface_path) else None
+    )
     policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
     selected_variant = (
         str(registry_entry.get("selected_variant"))
@@ -137,6 +152,13 @@ def main():
             )
             return
         print(f"  [Registry] Using policy variant for {SYMBOL}_1H.")
+        print(f"  [Registry] {describe_policy_artifact(policy_artifact)}")
+    if exit_surface_artifact is not None:
+        print(
+            f"  [Registry] Exit surface active: "
+            f"{exit_surface_artifact.get('artifact_kind', 'exit_surface')} "
+            f"[lane={exit_surface_artifact.get('lane', 'UNK')}]"
+        )
     cal_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "calibrator")
     calibrator = joblib.load(cal_path) if os.path.exists(cal_path) else None
 
@@ -241,7 +263,14 @@ def main():
     close_price = float(last_row["close"])
     atr = float(last_row["atr14"]) if "atr14" in last_row else 150.0
     trade_plan = predict_trade_plan(
-        trade_plan_models, feature_cols_to_use, last_row.copy(), pred["direction"], atr
+        trade_plan_models,
+        feature_cols_to_use,
+        last_row.copy(),
+        pred["direction"],
+        atr,
+        exit_surface_artifact=exit_surface_artifact,
+        proba_up=float(pred.get("calibrated_score", pred.get("raw_score", np.nan))),
+        lane="1H",
     )
     pred, filter_note = finalize_forecast_context(
         pred,
@@ -336,6 +365,24 @@ def main():
 
     print("======================================================================")
 
+    # ── 8. DASHBOARD ARTIFACT DUMP ───────────────────────────────────────
+    try:
+        live_signal_data = {
+            "symbol": SYMBOL,
+            "lane": "1H",
+            "timestamp": str(last_row.get("time", "N/A")),
+            "direction": pred.get("direction", "N/A"),
+            "confidence": float(pred.get("confidence", 0.0)),
+            "signal": pred.get("signal_strength", "NO_TRADE"),
+            "stop_loss": float(trade_plan.get("sl", 0.0)) if np.isfinite(trade_plan.get("sl", 0.0)) else None,
+            "tp1": float(trade_plan.get("tp1", 0.0)) if np.isfinite(trade_plan.get("tp1", 0.0)) else None,
+            "tp2": float(trade_plan.get("tp2", 0.0)) if np.isfinite(trade_plan.get("tp2", 0.0)) else None,
+        }
+        json_path = os.path.join(SYMBOL_DIR, f"{file_prefix}_live_signal_1H.json")
+        with open(json_path, "w") as jf:
+            json.dump(live_signal_data, jf, indent=4)
+    except Exception as e:
+        print(f"  [!] Failed to save live signal JSON for dashboard: {e}")
 
 if __name__ == "__main__":
     main()

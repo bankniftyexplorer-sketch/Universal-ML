@@ -61,12 +61,14 @@ from universal_ml_engine import (
     _compute_atr14,
     apply_calibrator_to_prob_array,
     build_timeframe_selection,
+    get_artifact_paths,
     inject_thermodynamic_basis,
     merge_higher_tf,
-    migrate_legacy_artifacts,
+    prepare_symbol_artifact_context,
     prepare_intraday_thermodynamics,
 )
 from inference_bridge import InferenceBridge
+from instrument_registry import resolve_instrument_identity
 
 DEFAULT_BASELINE_DIR = ".accuracy_baselines"
 HASH_KEYS = (
@@ -75,6 +77,7 @@ HASH_KEYS = (
     "oos_proba",
     "calibrator",
     "trade_plan_models",
+    "exit_surface",
     "policy_artifact",
     "ml_report",
     "backtest_report",
@@ -90,7 +93,8 @@ def _lane_list(selected: str) -> list[str]:
 
 
 def _baseline_path(base_dir: str, symbol: str) -> Path:
-    return Path(base_dir) / f"{symbol.upper()}.json"
+    canonical_symbol = resolve_instrument_identity(symbol).canonical_symbol
+    return Path(base_dir) / f"{canonical_symbol}.json"
 
 
 def _sha256(path: str) -> str:
@@ -169,6 +173,10 @@ def _score_saved_oos(
     test_size_ratio: float,
     n_splits: int,
 ) -> dict[str, Any]:
+    for col in feature_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     score_df = df.dropna(subset=feature_cols + ["target"]).reset_index(drop=True)
     split_points = _build_split_points(
         len(score_df),
@@ -417,9 +425,17 @@ def _build_1d_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
 
 
 def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, Any]:
-    symbol_dir = os.path.join(data_dir, symbol)
-    file_prefix = symbol.lower().replace(" ", "_")
-    artifact_paths = migrate_legacy_artifacts(symbol_dir, file_prefix, lane, logger=None)
+    artifact_ctx = prepare_symbol_artifact_context(
+        data_dir,
+        symbol,
+        asset_class="SPOT",
+        timeframes=(lane,),
+        logger=None,
+    )
+    symbol = str(artifact_ctx["symbol"])
+    symbol_dir = str(artifact_ctx["symbol_dir"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    artifact_paths = get_artifact_paths(symbol_dir, file_prefix, lane)
 
     features_path = artifact_paths["features"]
     oos_path = artifact_paths["oos_proba"]
@@ -493,7 +509,7 @@ def capture_baseline(args: argparse.Namespace) -> int:
 
     snapshot = {
         "schema_version": 1,
-        "symbol": args.symbol.upper(),
+        "symbol": resolve_instrument_identity(args.symbol).canonical_symbol,
         "outdir": os.path.abspath(args.outdir),
         "captured_at_utc": _utc_now(),
         "lanes": {},
@@ -508,10 +524,10 @@ def capture_baseline(args: argparse.Namespace) -> int:
             snapshot["lanes"].update(existing_lanes)
 
     for lane in _lane_list(args.lane):
-        print(f"[capture] rebuilding {lane} guardrail snapshot for {args.symbol.upper()}...")
-        lane_snapshot = _capture_lane_snapshot(args.outdir, args.symbol.upper(), lane)
+        print(f"[capture] rebuilding {lane} guardrail snapshot for {snapshot['symbol']}...")
+        lane_snapshot = _capture_lane_snapshot(args.outdir, snapshot["symbol"], lane)
         snapshot["lanes"][lane] = lane_snapshot
-        _print_lane_metrics(args.symbol.upper(), lane, lane_snapshot["metrics"])
+        _print_lane_metrics(snapshot["symbol"], lane, lane_snapshot["metrics"])
 
     baseline_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     print(f"[capture] baseline written to {baseline_path}")
@@ -546,7 +562,7 @@ def compare_baseline(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Baseline file not found: {baseline_path}")
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    symbol = args.symbol.upper()
+    symbol = resolve_instrument_identity(args.symbol).canonical_symbol
     failures: list[str] = []
 
     for lane in _lane_list(args.lane):

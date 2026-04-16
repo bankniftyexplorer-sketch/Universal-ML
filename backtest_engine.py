@@ -15,6 +15,7 @@ import warnings
 from universal_ml_engine import EnsembleModel  # noqa: F401
 from universal_ml_engine import (
     apply_calibrator_to_prob_array,
+    get_artifact_paths,
     merge_higher_tf,
     _compute_atr14,
     BARRIER_HORIZON_BARS,
@@ -22,12 +23,13 @@ from universal_ml_engine import (
     EXEC_FEE_PCT,
     build_report_data_lines,
     build_timeframe_selection,
+    describe_policy_artifact,
     describe_selected_frame,
     simulate_trade_path_from_arrays,
     predict_trade_plan,
     prepare_intraday_thermodynamics,
+    prepare_symbol_artifact_context,
     resolve_artifact_path,
-    migrate_legacy_artifacts,
     score_policy_artifact,
 )
 from julia_bridge import (
@@ -146,6 +148,7 @@ def run_backtest(
     prob_array_1d,
     feature_cols,
     trade_plan_models=None,
+    exit_surface_artifact=None,
     policy_artifact=None,
     initial_capital=10000.0,
     risk_pct=0.02,
@@ -292,6 +295,9 @@ def run_backtest(
             df.iloc[i].copy(),
             "UP" if direction == "LONG" else "DOWN",
             float(current_atr),
+            exit_surface_artifact=exit_surface_artifact,
+            proba_up=float(prob_array[i]),
+            lane=lane,
         )
 
         stop_dist = float(current_atr * trade_plan["stop_atr"])
@@ -578,12 +584,18 @@ def main():
 
     args = parser.parse_args()
 
-    DATA_DIR = args.outdir
-    SYMBOL = args.symbol.upper()
-    SYMBOL_DIR = os.path.join(DATA_DIR, SYMBOL)
-    file_prefix = SYMBOL.lower().replace(" ", "_")
-    artifact_paths_1h = migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1H")
-    migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1D", logger=None)
+    DATA_DIR = os.path.abspath(args.outdir)
+    requested_symbol = args.symbol.upper()
+    artifact_ctx = prepare_symbol_artifact_context(
+        DATA_DIR,
+        requested_symbol,
+        asset_class="SPOT",
+        timeframes=("1H", "1D"),
+    )
+    SYMBOL = str(artifact_ctx["symbol"])
+    SYMBOL_DIR = str(artifact_ctx["symbol_dir"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    artifact_paths_1h = get_artifact_paths(SYMBOL_DIR, file_prefix, "1H")
 
     import sys
 
@@ -601,7 +613,7 @@ def main():
     bridge = InferenceBridge(db_path=os.path.join(DATA_DIR, "data_vault", "ohlcv.db"))
     tf_maps = {
         "SPOT": bridge.fetch_holographic_stack(
-            SYMBOL,
+            str(artifact_ctx["identity"].market_data_symbol),
             "SPOT",
         ),
     }
@@ -627,6 +639,9 @@ def main():
     feat_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "features")
     trade_plan_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "trade_plan_models"
+    )
+    exit_surface_path = resolve_artifact_path(
+        SYMBOL_DIR, file_prefix, "1H", "exit_surface"
     )
     policy_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "policy_artifact"
@@ -655,6 +670,9 @@ def main():
     trade_plan_models = (
         joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
     )
+    exit_surface_artifact = (
+        joblib.load(exit_surface_path) if os.path.exists(exit_surface_path) else None
+    )
     policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
     calibrator = (
         joblib.load(calibrator_path) if os.path.exists(calibrator_path) else None
@@ -681,9 +699,12 @@ def main():
             "  [!] WARNING: No ML trade-plan models found. Falling back to static ATR exits."
         )
     if policy_artifact is not None:
+        print(f"  [=] Opportunity head loaded. {describe_policy_artifact(policy_artifact)}")
+    if exit_surface_artifact is not None:
         print(
-            f"  [=] Policy artifact loaded. "
-            f"Threshold {policy_artifact.get('deploy_threshold', float('nan')):.2f}"
+            f"  [=] Exit surface loaded. "
+            f"{exit_surface_artifact.get('artifact_kind', 'exit_surface')} "
+            f"[lane={exit_surface_artifact.get('lane', 'UNK')}]"
         )
 
     print("  [=] Reconstructing holographic feature space over historical data...")
@@ -822,6 +843,7 @@ def main():
         prob_array_1d,
         feature_cols,
         trade_plan_models=trade_plan_models,
+        exit_surface_artifact=exit_surface_artifact,
         policy_artifact=policy_artifact,
         initial_capital=10000.0,
         risk_pct=0.02,

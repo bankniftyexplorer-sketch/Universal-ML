@@ -41,13 +41,15 @@ from universal_ml_engine import (
     build_timeframe_selection,
     calibrate_oos_probabilities,
     describe_selected_frame,
+    get_artifact_paths,
     inject_thermodynamic_basis,
-    migrate_legacy_artifacts,
     finalize_forecast_context,
+    prepare_symbol_artifact_context,
     predict_next_bar,
     predict_trade_plan,
     save_report,
     select_primary_timeframe,
+    train_exit_surface_artifact,
     train_policy_artifact,
     train_trade_plan_models,
 )
@@ -562,15 +564,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    data_dir = args.outdir
-    symbol = args.symbol.upper()
-    file_prefix = symbol.lower().replace(" ", "_")
-    symbol_dir = os.path.join(data_dir, symbol)
-    os.makedirs(symbol_dir, exist_ok=True)
-    artifact_paths_1d = migrate_legacy_artifacts(symbol_dir, file_prefix, "1D")
+    data_dir = os.path.abspath(args.outdir)
+    requested_symbol = args.symbol.upper()
+    artifact_ctx = prepare_symbol_artifact_context(
+        data_dir,
+        requested_symbol,
+        asset_class="SPOT",
+        timeframes=("1D",),
+    )
+    symbol = str(artifact_ctx["symbol"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    symbol_dir = str(artifact_ctx["symbol_dir"])
+    artifact_paths_1d = get_artifact_paths(symbol_dir, file_prefix, "1D")
 
     print("=" * 70)
-    print(f"  INITIATING DAILY DATABASE UPLINK FOR: {symbol}")
+    if requested_symbol != symbol:
+        print(
+            f"  INITIATING DAILY DATABASE UPLINK FOR: {symbol} "
+            f"[requested {requested_symbol}]"
+        )
+    else:
+        print(f"  INITIATING DAILY DATABASE UPLINK FOR: {symbol}")
     print("=" * 70)
 
     sys.path.append(os.path.join(data_dir, "data_vault"))
@@ -583,7 +597,7 @@ def main() -> None:
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     tf_maps = {
         "SPOT": bridge.fetch_holographic_stack(
-            symbol,
+            str(artifact_ctx["identity"].market_data_symbol),
             "SPOT",
             include_realized_vol=True,
         ),
@@ -799,11 +813,29 @@ def main() -> None:
         wf_results["oos_proba_map"],
         calibrator=calibrator,
     )
+    exit_surface_artifact = train_exit_surface_artifact(
+        df_model_ready,
+        prob_array_full,
+        lane="1D",
+        start_idx=tp_train_end,
+        max_hold_bars=BARRIER_HORIZON_BARS_DAILY,
+        eod_gate_hour=POLICY_EOD_GATE_HOUR_1D,
+    )
+    if exit_surface_artifact is not None:
+        exit_surface_path = artifact_paths_1d["exit_surface"]
+        joblib.dump(exit_surface_artifact, exit_surface_path)
+        print(
+            f"  1D exit surface saved to '{exit_surface_path}' "
+            f"({exit_surface_artifact['metadata']['candidate_rows']} candidates)"
+        )
+    else:
+        print("  [Exit Surface] Skipped 1D artifact: insufficient honest candidate trades.")
     policy_artifact = train_policy_artifact(
         df_model_ready,
         wf_results["feature_cols"],
         prob_array_full,
         trade_plan_models,
+        exit_surface_artifact=exit_surface_artifact,
         lane="1D",
         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
         start_idx=tp_train_end,
@@ -848,6 +880,9 @@ def main() -> None:
         last_row.copy(),
         pred["direction"],
         atr_value,
+        exit_surface_artifact=exit_surface_artifact,
+        proba_up=float(pred.get("calibrated_score", pred.get("raw_score", np.nan))),
+        lane="1D",
     )
 
     trail_str = "N/A"

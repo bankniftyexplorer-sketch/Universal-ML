@@ -31,9 +31,11 @@ from universal_ml_engine import (
     apply_calibrator_to_prob_array,
     build_report_data_lines,
     build_timeframe_selection,
+    describe_policy_artifact,
     describe_selected_frame,
+    get_artifact_paths,
     inject_thermodynamic_basis,
-    migrate_legacy_artifacts,
+    prepare_symbol_artifact_context,
     resolve_artifact_path,
     select_primary_timeframe,
 )
@@ -67,11 +69,18 @@ def main() -> None:
     parser.add_argument("--symbol", type=str, required=True)
     args = parser.parse_args()
 
-    data_dir = args.outdir
-    symbol = args.symbol.upper()
-    symbol_dir = os.path.join(data_dir, symbol)
-    file_prefix = symbol.lower().replace(" ", "_")
-    artifact_paths_1d = migrate_legacy_artifacts(symbol_dir, file_prefix, "1D")
+    data_dir = os.path.abspath(args.outdir)
+    requested_symbol = args.symbol.upper()
+    artifact_ctx = prepare_symbol_artifact_context(
+        data_dir,
+        requested_symbol,
+        asset_class="SPOT",
+        timeframes=("1D",),
+    )
+    symbol = str(artifact_ctx["symbol"])
+    symbol_dir = str(artifact_ctx["symbol_dir"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    artifact_paths_1d = get_artifact_paths(symbol_dir, file_prefix, "1D")
 
     sys.path.append(os.path.join(data_dir, "data_vault"))
     try:
@@ -87,7 +96,7 @@ def main() -> None:
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     tf_maps = {
         "SPOT": bridge.fetch_holographic_stack(
-            symbol,
+            str(artifact_ctx["identity"].market_data_symbol),
             "SPOT",
             include_realized_vol=True,
         ),
@@ -131,6 +140,7 @@ def main() -> None:
     trade_plan_path = resolve_artifact_path(
         symbol_dir, file_prefix, "1D", "trade_plan_models"
     )
+    exit_surface_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "exit_surface")
     policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "policy_artifact")
 
     registry_entry = load_sleeve_registry_entry(symbol, "1D")
@@ -156,6 +166,9 @@ def main() -> None:
     trade_plan_models = (
         joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}
     )
+    exit_surface_artifact = (
+        joblib.load(exit_surface_path) if os.path.exists(exit_surface_path) else None
+    )
     policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
     selected_variant = (
         str(registry_entry.get("selected_variant"))
@@ -171,9 +184,12 @@ def main() -> None:
             return
         print(f"  [Registry] Using policy variant for {symbol}_1D.")
     if policy_artifact is not None:
+        print(f"  [=] Opportunity head loaded. {describe_policy_artifact(policy_artifact)}")
+    if exit_surface_artifact is not None:
         print(
-            f"  [=] Daily policy artifact loaded. "
-            f"Threshold {policy_artifact.get('deploy_threshold', float('nan')):.2f}"
+            f"  [=] Exit surface loaded. "
+            f"{exit_surface_artifact.get('artifact_kind', 'exit_surface')} "
+            f"[lane={exit_surface_artifact.get('lane', 'UNK')}]"
         )
 
     print("\n  [=] Reconstructing daily feature space over historical data...")
@@ -268,6 +284,7 @@ def main() -> None:
         prob_array_1d,
         feature_cols,
         trade_plan_models=trade_plan_models,
+        exit_surface_artifact=exit_surface_artifact,
         policy_artifact=policy_artifact,
         initial_capital=10000.0,
         risk_pct=0.02,

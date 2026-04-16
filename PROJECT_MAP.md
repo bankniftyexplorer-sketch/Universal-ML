@@ -46,6 +46,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `start_vault_autosync.sh` | Safe wrapper that starts the resource-gated auto-sync supervisor with a single-instance lock | You want the vault to stay running in the background |
 | `ops/systemd/user/universal-ml-vault-autosync.service` | User-level systemd unit template for starting the vault auto-sync supervisor at login | You want the auto-sync loop to come up automatically with the system session |
 | `vault_engine.py` | Root-level compatibility shim that re-exports `DataVault` | A root script imports `vault_engine` directly |
+| `instrument_registry.py` | Shared runtime/artifact symbol identity helper that collapses aliases like `BTCUSDT -> BTC` and `SP500 -> SPX500` into one canonical artifact contract | You care about canonical symbol naming across scripts |
 | `inference_bridge.py` | Reads DB, attaches `data_quality`, and enforces the strict runtime gate on `FAIL` quality by default | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants, nested consensus feature selection, ensemble model wrapper, and probability calibration | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer with the same nested-selection, ensemble, and calibration contract | You care about the daily core |
@@ -111,17 +112,19 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 14. `universal_ml_engine.walk_forward()` performs honest out-of-sample validation with the shared ensemble trainer.
 15. `calibrate_oos_probabilities()` fits an isotonic calibrator from the saved OOS map and persists it beside the model artifact.
 16. `train_trade_plan_models()` fits the six `1H` exit quantile regressors with an inner validation slice, a `24`-bar purge gap, and dynamic minimum-sample guards before saving them under the standard trade-plan artifact.
-17. `train_policy_artifact()` fits a second-stage `1H` execution policy on honest post-trade-plan candidate trades and saves a deploy threshold plus risk bands as a symbol-scoped artifact.
-18. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme, now including the calibrator and policy artifact.
-19. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` reconstruct the same `1H + SMC + Kalman + RV + Narrative Context` SPOT-only feature-prep contract before consuming saved artifacts.
-20. `backtest_engine.py` and `meta_strategy_selector.py` now apply the saved calibrator to OOS probabilities before confidence gating or strategy ranking, so historical simulation matches the calibrated runtime path.
-21. The same saved `1H` policy artifact is consumed by training summaries, backtests, live inference, and meta-strategy evaluation, so execution filtering is no longer a training-only idea.
-22. `sleeve_registry.py` can replay saved `1H` and `1D` artifacts, train candidate policy artifacts if needed, and write a deployable `portfolio_sleeve_registry.json` that decides whether each sleeve is enabled and whether `base` or `policy` execution is allowed.
-23. `backtest_engine.py`, `live_inference.py`, and `meta_strategy_selector.py` now obey the `1H` sleeve registry before executing signals or replay, so disabled sleeves are blocked consistently.
-24. `live_inference.py` applies the saved calibrator to the latest prediction, then the policy artifact when the registry allows it, and `predict_next_bar()` also applies regime-aware confidence penalties from RV vol-of-vol and Kalman flat-regime checks.
-25. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
-26. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels.
-27. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
+17. `train_exit_surface_artifact()` evaluates a small discrete `1H` exit-template catalog on honest post-signal candidate trades and saves a symbol-scoped exit-surface artifact that selects a tested SL / TP1 / TP2 / trailing ladder by confidence bucket and direction.
+18. `train_policy_artifact()` fits a second-stage `1H` opportunity head on honest post-exit-surface candidate trades and saves a symbol-lane-local decision threshold plus risk bands as a symbol-scoped artifact.
+19. Final artifacts are saved under `<SYMBOL>/` using the `1H` naming scheme, now including the calibrator, exit-surface artifact, and policy artifact.
+20. `backtest_engine.py` and `live_inference.py` reconstruct the same `1H + SMC + Kalman + RV + Narrative Context` SPOT-only feature-prep contract before consuming saved artifacts, and they prefer the saved exit-surface artifact over the continuous trade-plan regressors when present.
+21. `backtest_engine.py` and `meta_strategy_selector.py` now apply the saved calibrator to OOS probabilities before confidence gating or strategy ranking, so historical simulation matches the calibrated runtime path.
+22. The same saved `1H` opportunity head artifact is consumed by training summaries, backtests, live inference, and sleeve replay, so execution filtering is no longer a training-only idea.
+23. `sleeve_registry.py` can replay saved `1H` and `1D` artifacts, reuse the saved exit-surface artifact, train candidate policy artifacts if needed, and write a deployable `portfolio_sleeve_registry.json` that decides whether each sleeve is enabled and whether `base` or `policy` execution is allowed.
+24. `backtest_engine.py` and `live_inference.py` now obey the `1H` sleeve registry before executing signals or replay, so disabled sleeves are blocked consistently.
+25. `live_inference.py` applies the saved calibrator to the latest prediction, then the policy artifact when the registry allows it, and `predict_next_bar()` also applies regime-aware confidence penalties from RV vol-of-vol and Kalman flat-regime checks.
+26. `live_inference.py` can optionally pass the latest row through `shadow_brain.py` as a veto layer backed by `performance_ledger`.
+27. Weak-confidence or stale latest-bar `1H` forecasts are surfaced as `NO_TRADE`, but forecast text and reports still print the currently selected exit ladder.
+28. `accuracy_guardrail.py` can reconstruct the same `1H` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
+29. `meta_strategy_selector.py` now reuses the saved `1H` exit-surface artifact for strategy replay and local policy training when it is present and valid, and only falls back to locally trained trade-plan regressors if that artifact is missing.
 
 ### `1D` daily lane
 
@@ -156,13 +159,14 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 13. `julia_bridge.add_target_fast()` creates daily labels with the daily horizon settings.
 14. `fold_consensus_feature_selection_daily()` performs the same nested consensus-selection contract as the `1H` lane before `walk_forward_daily()` trains the ensemble final model.
 15. `calibrate_oos_probabilities()` fits and saves a `1D` isotonic calibrator from the saved daily OOS map.
-16. `train_policy_artifact()` fits a second-stage `1D` execution policy on honest post-trade-plan candidate trades and saves a deploy threshold plus risk bands as a symbol-scoped artifact.
-17. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme, now including the calibrator and policy artifact.
-18. The daily lane now uses its own calibrated confidence gate (`0.72` at present) instead of the intraday threshold because calibrated daily probabilities were too dense around the old shared gate.
-19. Weak-confidence or stale latest-bar `1D` forecasts are surfaced as `NO_TRADE`, but the forecast text/report still shows the experimental SL/TP/trailing levels and the policy artifact can still suppress execution.
-20. `daily_backtest_engine.py` reconstructs the same `1D + RV + SMC + Kalman + Narrative Context + macro-regime` feature space, applies the saved daily calibrator to the OOS map, and replays the saved `1D` model through the same policy artifact when present.
-21. `sleeve_registry.py` writes the daily sleeve admission verdict into the shared registry, and `daily_backtest_engine.py` now obeys that verdict before replay.
-22. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
+16. `train_exit_surface_artifact()` evaluates a small discrete `1D` exit-template catalog on honest post-signal candidate trades and saves a symbol-scoped daily exit-surface artifact that selects a tested SL / TP1 / TP2 / trailing ladder by confidence bucket and direction.
+17. `train_policy_artifact()` fits a second-stage `1D` opportunity head on honest post-exit-surface candidate trades and saves a symbol-lane-local decision threshold plus risk bands as a symbol-scoped artifact.
+18. Final artifacts are saved under `<SYMBOL>/` using the `1D` naming scheme, now including the calibrator, exit-surface artifact, and policy artifact.
+19. The daily lane now uses its own calibrated confidence gate (`0.72` at present) instead of the intraday threshold because calibrated daily probabilities were too dense around the old shared gate.
+20. Weak-confidence or stale latest-bar `1D` forecasts are surfaced as `NO_TRADE`, but forecast text and reports still print the currently selected exit ladder and the opportunity head can still suppress execution.
+21. `daily_backtest_engine.py` reconstructs the same `1D + RV + SMC + Kalman + Narrative Context + macro-regime` feature space, applies the saved daily calibrator to the OOS map, and replays the saved `1D` model through the same exit-surface and opportunity-head artifacts when present.
+22. `sleeve_registry.py` writes the daily sleeve admission verdict into the shared registry, and `daily_backtest_engine.py` now obeys that verdict before replay.
+23. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
 
 ## Data contracts
 
@@ -218,6 +222,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1H_oos_proba.pkl`
 - `{symbol}_1H_calibrator.pkl`
 - `{symbol}_1H_trade_plan_models.pkl`
+- `{symbol}_1H_exit_surface.pkl`
 - `{symbol}_1H_policy_artifact.pkl`
 - `{symbol}_1H_ml_report.png`
 - `{symbol}_1H_backtest_report.png`
@@ -229,6 +234,7 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1D_oos_proba.pkl`
 - `{symbol}_1D_calibrator.pkl`
 - `{symbol}_1D_trade_plan_models.pkl`
+- `{symbol}_1D_exit_surface.pkl`
 - `{symbol}_1D_policy_artifact.pkl`
 - `{symbol}_1D_ml_report.png`
 - `{symbol}_1D_backtest_report.png`
@@ -291,6 +297,7 @@ If you need:
 - `1H` and `1D` are the active canonical lanes.
 - Yahoo-fed `SPOT` is the active market-data contract for both lanes.
 - The vault can sync curated aliases like `BTCUSDT` and raw Yahoo tickers such as `AAPL`, `^GDAXI`, and `EURUSD=X`.
+- Runtime consumers now canonicalize symbol aliases into one artifact identity, so `BTCUSDT` reuses the `BTC/` artifact tree and `SP500` reuses `SPX500/`.
 - Operators can persist their own Yahoo-backed index aliases locally with `--register-index` or `--import-index` instead of editing Python maps.
 - Operators can list currently available aliases with `--list-symbols` and inspect the CPU/network gate with `--resource-gate-status`.
 - The DB is the source of truth for market history.
@@ -306,6 +313,7 @@ If you need:
 - Weak-confidence or stale latest-bar forecasts are marked `NO_TRADE`, but forecast text and PNG reports still print the experimental SL/TP/trailing levels.
 - There is no formal unit-test suite; confidence comes from walk-forward validation, saved OOS probability maps, and backtest reports.
 - `accuracy_guardrail.py` is the machine-facing safety layer around the saved artifacts and reports.
+- `execution_guardrail.py` is the machine-facing replay safety layer around the saved `base` vs `policy` execution variants for both active lanes.
 - `compare` can tell you two different truths:
   - `SAME RUN`: the tracked artifact hashes match the captured baseline
   - `DIFFERENT RUN`: the artifacts have changed, even if the metrics are still acceptable

@@ -114,6 +114,9 @@ venv/
 mlenv/
 .env
 .accuracy_baselines/
+.execution_baselines/
+graphify-out/
+pine-logs*.csv
 
 # --- LOCAL SCRATCH / AGENT VERIFICATION ---
 verification/

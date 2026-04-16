@@ -24,7 +24,7 @@ from universal_ml_engine import (
     _compute_atr14,
     build_timeframe_selection,
     describe_selected_frame,
-    migrate_legacy_artifacts,
+    prepare_symbol_artifact_context,
     resolve_artifact_path,
     MODEL_N_JOBS,
     LIVE_CONFIDENCE_THRESHOLD,
@@ -103,6 +103,37 @@ BACKTEST_RISK_PCT = 0.02
 MIN_META_TRADES = 25
 
 
+def _usable_exit_surface_artifact(
+    exit_surface_artifact: dict | None,
+    *,
+    lane: str,
+) -> dict | None:
+    if not isinstance(exit_surface_artifact, dict):
+        return None
+    lane_key = str(lane).upper()
+    artifact_lane = str(exit_surface_artifact.get("lane", lane_key)).upper()
+    selection_map = exit_surface_artifact.get("selection_map", {})
+    if artifact_lane != lane_key:
+        return None
+    if not isinstance(selection_map, dict) or not selection_map:
+        return None
+    return exit_surface_artifact
+
+
+def _load_saved_exit_surface_artifact(path: str, *, lane: str) -> dict | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        artifact = joblib.load(path)
+    except Exception as exc:
+        print(
+            f"  [Meta] WARNING: Failed to load saved {lane} exit surface from "
+            f"{path}: {exc}"
+        )
+        return None
+    return _usable_exit_surface_artifact(artifact, lane=lane)
+
+
 def _build_prob_array(df_strategy: pd.DataFrame, oos_proba_map: dict) -> np.ndarray:
     if (
         not isinstance(df_strategy, pd.DataFrame)
@@ -125,6 +156,7 @@ def _is_valid_meta_candidate(candidate: dict) -> bool:
         and int(candidate.get("total_trades", 0)) >= MIN_META_TRADES
         and np.isfinite(candidate.get("final_equity", np.nan))
         and np.isfinite(candidate.get("total_return_pct", np.nan))
+        and float(candidate.get("sharpe", -np.inf)) >= 0.5
     )
 
 
@@ -132,7 +164,7 @@ def _candidate_rank(candidate: dict) -> tuple[float, float, float]:
     final_equity = float(candidate.get("final_equity", -np.inf))
     sharpe = float(candidate.get("sharpe", -np.inf))
     max_drawdown = float(candidate.get("max_drawdown", np.inf))
-    return final_equity, sharpe, -max_drawdown
+    return sharpe, final_equity, -max_drawdown
 
 
 def run_strategy_zoo(
@@ -140,6 +172,7 @@ def run_strategy_zoo(
     *,
     walk_forward_fn=walk_forward,
     symbol: str = "",
+    saved_exit_surface_artifact: dict | None = None,
 ) -> dict:
     del walk_forward_fn
     print(
@@ -222,9 +255,21 @@ def run_strategy_zoo(
             }
         else:
             strategy_df = wf_result.get("df")
+            exit_surface_artifact = _usable_exit_surface_artifact(
+                saved_exit_surface_artifact,
+                lane="1H",
+            )
             trade_plan_models = {}
             policy_artifact = None
-            if isinstance(strategy_df, pd.DataFrame) and not strategy_df.empty:
+            if (
+                exit_surface_artifact is None
+                and isinstance(strategy_df, pd.DataFrame)
+                and not strategy_df.empty
+            ):
+                print(
+                    "  [Meta] [Zoo] Saved 1H exit surface missing or unusable; "
+                    f"falling back to local trade-plan models for {key}."
+                )
                 tp_holdout = max(int(len(strategy_df) * 0.15), 1)
                 tp_train_end = max(len(strategy_df) - tp_holdout, 1)
                 try:
@@ -236,7 +281,19 @@ def run_strategy_zoo(
                     print(
                         f"  [Meta] [Zoo] Trade-plan model training failed for {key}: {exc}"
                     )
+            else:
+                tp_holdout = (
+                    max(int(len(strategy_df) * 0.15), 1)
+                    if isinstance(strategy_df, pd.DataFrame) and not strategy_df.empty
+                    else 1
+                )
+                tp_train_end = (
+                    max(len(strategy_df) - tp_holdout, 1)
+                    if isinstance(strategy_df, pd.DataFrame) and not strategy_df.empty
+                    else 1
+                )
             wf_result["trade_plan_models"] = trade_plan_models
+            wf_result["exit_surface_artifact"] = exit_surface_artifact
             wf_result["calibrator"] = calibrate_oos_probabilities(
                 wf_result.get("oos_proba_map", {}),
                 strategy_df,
@@ -253,6 +310,7 @@ def run_strategy_zoo(
                         feature_cols,
                         prob_array,
                         trade_plan_models,
+                        exit_surface_artifact=exit_surface_artifact,
                         lane="1H",
                         confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
                         start_idx=tp_train_end,
@@ -285,6 +343,7 @@ def meta_select_strategy(
         feature_cols = wf_result.get("feature_cols", [])
         oos_proba_map = wf_result.get("oos_proba_map") or {}
         trade_plan_models = wf_result.get("trade_plan_models", {})
+        exit_surface_artifact = wf_result.get("exit_surface_artifact")
         calibrator = wf_result.get("calibrator")
         policy_artifact = wf_result.get("policy_artifact")
 
@@ -311,6 +370,14 @@ def meta_select_strategy(
 
         prob_array = _build_prob_array(strategy_df, oos_proba_map)
         prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
+        
+        # --- VOLATILITY REGIME GATE (EXECUTION LEVEL) ---
+        if "atr14" in strategy_df.columns:
+            atr_median_20 = strategy_df["atr14"].rolling(20, min_periods=1).median()
+            gate_mask = strategy_df["atr14"] > atr_median_20
+            prob_array = np.where(gate_mask, prob_array, np.nan)
+        # ------------------------------------------------
+        
         oos_bars = int(np.isfinite(prob_array).sum())
         if oos_bars == 0:
             metrics[key] = {
@@ -337,6 +404,7 @@ def meta_select_strategy(
                 nan_1d,
                 feature_cols,
                 trade_plan_models=trade_plan_models,
+                exit_surface_artifact=exit_surface_artifact,
                 policy_artifact=policy_artifact,
                 initial_capital=BACKTEST_INITIAL_CAPITAL,
                 risk_pct=BACKTEST_RISK_PCT,
@@ -397,49 +465,26 @@ def meta_select_strategy(
         selection_reason = "Fallback: insufficient valid OOS trades."
     else:
         candidates.sort(
-            key=lambda item: (
-                item[1]["final_equity"],
-                item[1]["sharpe"] if np.isfinite(item[1]["sharpe"]) else -np.inf,
-                -(
-                    item[1]["max_drawdown"]
-                    if np.isfinite(item[1]["max_drawdown"])
-                    else np.inf
-                ),
-            ),
+            key=lambda item: _candidate_rank(item[1]),
             reverse=True,
         )
         winner_key, winner_metrics = candidates[0]
         if len(candidates) > 1:
             runner_metrics = candidates[1][1]
-            equity_gap_pct = abs(
-                winner_metrics["total_return_pct"] - runner_metrics["total_return_pct"]
-            )
-            if equity_gap_pct < 0.5:
-                winner_key, winner_metrics = max(
-                    [candidates[0], candidates[1]],
-                    key=lambda item: (
-                        item[1]["sharpe"]
-                        if np.isfinite(item[1]["sharpe"])
-                        else -np.inf,
-                        -(
-                            item[1]["max_drawdown"]
-                            if np.isfinite(item[1]["max_drawdown"])
-                            else np.inf
-                        ),
-                    ),
-                )
+            sharpe_gap = abs(winner_metrics["sharpe"] - runner_metrics["sharpe"])
+            if sharpe_gap < 0.05:
                 selection_reason = (
-                    f"Tiebreak by Sharpe after near-equal OOS return; "
-                    f"{winner_key} won with return {winner_metrics['total_return_pct']:.2f}%."
+                    f"Highest Sharpe ({winner_metrics['sharpe']:.2f}) "
+                    f"with equity tiebreak ({winner_metrics['total_return_pct']:.2f}%)."
                 )
             else:
                 selection_reason = (
-                    f"Highest OOS backtest return ({winner_metrics['total_return_pct']:.2f}%) "
+                    f"Highest Sharpe ({winner_metrics['sharpe']:.2f}) "
                     f"with {winner_metrics['total_trades']} trades."
                 )
         else:
             selection_reason = (
-                f"Highest OOS backtest return ({winner_metrics['total_return_pct']:.2f}%) "
+                f"Highest Sharpe ({winner_metrics['sharpe']:.2f}) "
                 f"with {winner_metrics['total_trades']} trades."
             )
 
@@ -477,6 +522,15 @@ def verdict_output(
             policy_artifact=policy_artifact,
             policy_lane="1H",
         )
+        
+        # Apply regime gate to live signal
+        if "atr14" in winning_df.columns:
+            live_atr = last_row.get("atr14", 0)
+            median_atr = winning_df["atr14"].rolling(20, min_periods=1).median().iloc[-1]
+            if live_atr <= median_atr:
+                pred["direction"] = "REGIME_BLOCK"
+                pred["confidence"] = np.nan
+                pred["signal_strength"] = "SIDELINED"
     else:
         pred = {
             "direction": "ERROR",
@@ -569,8 +623,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     outdir = os.path.abspath(args.outdir)
-    SYMBOL = args.symbol.upper()
-    SYMBOL_DIR = os.path.join(outdir, SYMBOL)
+    requested_symbol = args.symbol.upper()
+    artifact_ctx = prepare_symbol_artifact_context(
+        outdir,
+        requested_symbol,
+        asset_class="SPOT",
+        timeframes=("1H", "1D"),
+        logger=None,
+    )
+    SYMBOL = str(artifact_ctx["symbol"])
+    SYMBOL_DIR = str(artifact_ctx["symbol_dir"])
     os.makedirs(SYMBOL_DIR, exist_ok=True)
 
     import sys
@@ -585,7 +647,7 @@ if __name__ == "__main__":
     bridge = InferenceBridge(db_path=os.path.join(outdir, "data_vault", "ohlcv.db"))
     tf_raw = {
         "SPOT": bridge.fetch_holographic_stack(
-            SYMBOL,
+            str(artifact_ctx["identity"].market_data_symbol),
             "SPOT",
         ),
     }
@@ -608,12 +670,17 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     symbol = SYMBOL
-    file_prefix = symbol.lower().replace(" ", "_")
-    migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1H", logger=None)
-    migrate_legacy_artifacts(SYMBOL_DIR, file_prefix, "1D", logger=None)
+    file_prefix = str(artifact_ctx["file_prefix"])
     baseline_model_path = resolve_artifact_path(SYMBOL_DIR, file_prefix, "1H", "model")
     baseline_oos_path = resolve_artifact_path(
         SYMBOL_DIR, file_prefix, "1H", "oos_proba"
+    )
+    baseline_exit_surface_path = resolve_artifact_path(
+        SYMBOL_DIR, file_prefix, "1H", "exit_surface"
+    )
+    saved_exit_surface_artifact = _load_saved_exit_surface_artifact(
+        baseline_exit_surface_path,
+        lane="1H",
     )
     registry_entry = load_sleeve_registry_entry(SYMBOL, "1H")
     if registry_entry is not None and not bool(registry_entry.get("enabled")):
@@ -626,6 +693,13 @@ if __name__ == "__main__":
         print(f"  [Meta] Found baseline model: {baseline_model_path}")
     if os.path.exists(baseline_oos_path):
         print(f"  [Meta] Found baseline OOS probabilities: {baseline_oos_path}")
+    if saved_exit_surface_artifact is not None:
+        print(f"  [Meta] Found saved 1H exit surface: {baseline_exit_surface_path}")
+    else:
+        print(
+            "  [Meta] WARNING: Saved 1H exit surface missing or unusable. "
+            "Strategy replay will fall back to local trade-plan exits."
+        )
 
     print(f"  [Meta] Building feature frame for {symbol} ...")
     print(f"  [Meta] 1H primary lane: {describe_selected_frame(df_1h)}")
@@ -674,7 +748,11 @@ if __name__ == "__main__":
     if "atr14" not in df_full.columns:
         df_full = _compute_atr14(df_full.copy())
 
-    zoo_results = run_strategy_zoo(df_full.copy(), symbol=SYMBOL)
+    zoo_results = run_strategy_zoo(
+        df_full.copy(),
+        symbol=SYMBOL,
+        saved_exit_surface_artifact=saved_exit_surface_artifact,
+    )
     winner_key, metrics = meta_select_strategy(zoo_results, df_full.copy())
 
     from datetime import datetime

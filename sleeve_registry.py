@@ -26,6 +26,7 @@ from daily_ml_engine import (
     inject_macro_regime,
 )
 from inference_bridge import InferenceBridge
+from instrument_registry import resolve_instrument_identity
 from julia_bridge import (
     holographic_feature_engine_daily,
     holographic_feature_engine_fast,
@@ -45,6 +46,7 @@ from universal_ml_engine import (
     build_timeframe_selection,
     inject_thermodynamic_basis,
     merge_higher_tf,
+    prepare_symbol_artifact_context,
     prepare_intraday_thermodynamics,
     resolve_artifact_path,
     train_policy_artifact,
@@ -78,7 +80,10 @@ def load_sleeve_registry_entry(
 ) -> dict[str, Any] | None:
     registry = load_sleeve_registry(registry_path)
     sleeves = registry.get("sleeves", {})
-    return sleeves.get(f"{symbol.upper()}_{lane.upper()}")
+    canonical_symbol = resolve_instrument_identity(symbol).canonical_symbol
+    return sleeves.get(f"{canonical_symbol}_{lane.upper()}") or sleeves.get(
+        f"{symbol.upper()}_{lane.upper()}"
+    )
 
 
 def _safe_float(value: object) -> float | None:
@@ -121,10 +126,26 @@ def _build_1h_bundle(
     bridge: InferenceBridge,
     outdir: str,
     symbol: str,
+    *,
+    refresh_policy_artifact: bool = True,
+    persist_policy_artifact: bool = True,
 ) -> dict[str, Any]:
-    file_prefix = symbol.lower().replace(" ", "_")
-    symbol_dir = os.path.join(outdir, symbol)
-    tf_maps = {"SPOT": bridge.fetch_holographic_stack(symbol, "SPOT")}
+    artifact_ctx = prepare_symbol_artifact_context(
+        outdir,
+        symbol,
+        asset_class="SPOT",
+        timeframes=("1H", "1D"),
+        logger=None,
+    )
+    symbol = str(artifact_ctx["symbol"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    symbol_dir = str(artifact_ctx["symbol_dir"])
+    tf_maps = {
+        "SPOT": bridge.fetch_holographic_stack(
+            str(artifact_ctx["identity"].market_data_symbol),
+            "SPOT",
+        )
+    }
     primary_frames, reference_frames = build_timeframe_selection(
         tf_maps, ("1H", "1D", "1W", "1M")
     )
@@ -172,6 +193,7 @@ def _build_1h_bundle(
     oos_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "oos_proba")
     cal_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "calibrator")
     tp_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "trade_plan_models")
+    exit_surface_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "exit_surface")
     policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "policy_artifact")
 
     oos_map = joblib.load(oos_path)
@@ -180,22 +202,28 @@ def _build_1h_bundle(
         df_backtest["time"], oos_map, calibrator=calibrator
     )
     trade_plan_models = joblib.load(tp_path) if os.path.exists(tp_path) else {}
+    exit_surface_artifact = (
+        joblib.load(exit_surface_path) if os.path.exists(exit_surface_path) else None
+    )
     prob_array_1d = _build_intraday_conflict_array(
         df_backtest,
         symbol_dir=symbol_dir,
         file_prefix=file_prefix,
     )
 
-    policy_artifact = train_policy_artifact(
-        df_backtest,
-        feature_cols,
-        prob_array,
-        trade_plan_models,
-        lane="1H",
-        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
-        start_idx=len(df_backtest) - int(len(df_backtest) * 0.15),
-    )
-    if policy_artifact is not None:
+    policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
+    if refresh_policy_artifact:
+        policy_artifact = train_policy_artifact(
+            df_backtest,
+            feature_cols,
+            prob_array,
+            trade_plan_models,
+            exit_surface_artifact=exit_surface_artifact,
+            lane="1H",
+            confidence_threshold=LIVE_CONFIDENCE_THRESHOLD,
+            start_idx=len(df_backtest) - int(len(df_backtest) * 0.15),
+        )
+    if policy_artifact is not None and persist_policy_artifact:
         joblib.dump(policy_artifact, policy_path)
 
     return {
@@ -206,6 +234,7 @@ def _build_1h_bundle(
         "prob_array": prob_array,
         "prob_array_1d": prob_array_1d,
         "trade_plan_models": trade_plan_models,
+        "exit_surface_artifact": exit_surface_artifact,
         "policy_artifact": policy_artifact,
         "conf_threshold": LIVE_CONFIDENCE_THRESHOLD,
         "max_hold_bars": 24,
@@ -217,12 +246,23 @@ def _build_1d_bundle(
     bridge: InferenceBridge,
     outdir: str,
     symbol: str,
+    *,
+    refresh_policy_artifact: bool = True,
+    persist_policy_artifact: bool = True,
 ) -> dict[str, Any]:
-    file_prefix = symbol.lower().replace(" ", "_")
-    symbol_dir = os.path.join(outdir, symbol)
+    artifact_ctx = prepare_symbol_artifact_context(
+        outdir,
+        symbol,
+        asset_class="SPOT",
+        timeframes=("1D",),
+        logger=None,
+    )
+    symbol = str(artifact_ctx["symbol"])
+    file_prefix = str(artifact_ctx["file_prefix"])
+    symbol_dir = str(artifact_ctx["symbol_dir"])
     tf_maps = {
         "SPOT": bridge.fetch_holographic_stack(
-            symbol,
+            str(artifact_ctx["identity"].market_data_symbol),
             "SPOT",
             include_realized_vol=True,
         )
@@ -280,6 +320,7 @@ def _build_1d_bundle(
     oos_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "oos_proba")
     cal_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "calibrator")
     tp_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "trade_plan_models")
+    exit_surface_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "exit_surface")
     policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "policy_artifact")
 
     oos_map = joblib.load(oos_path)
@@ -288,19 +329,25 @@ def _build_1d_bundle(
         df_backtest["time"], oos_map, calibrator=calibrator
     )
     trade_plan_models = joblib.load(tp_path) if os.path.exists(tp_path) else {}
-
-    policy_artifact = train_policy_artifact(
-        df_backtest,
-        feature_cols,
-        prob_array,
-        trade_plan_models,
-        lane="1D",
-        confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
-        start_idx=len(df_backtest) - int(len(df_backtest) * 0.15),
-        max_hold_bars=10,
-        eod_gate_hour=24,
+    exit_surface_artifact = (
+        joblib.load(exit_surface_path) if os.path.exists(exit_surface_path) else None
     )
-    if policy_artifact is not None:
+
+    policy_artifact = joblib.load(policy_path) if os.path.exists(policy_path) else None
+    if refresh_policy_artifact:
+        policy_artifact = train_policy_artifact(
+            df_backtest,
+            feature_cols,
+            prob_array,
+            trade_plan_models,
+            exit_surface_artifact=exit_surface_artifact,
+            lane="1D",
+            confidence_threshold=LIVE_CONFIDENCE_THRESHOLD_DAILY,
+            start_idx=len(df_backtest) - int(len(df_backtest) * 0.15),
+            max_hold_bars=10,
+            eod_gate_hour=24,
+        )
+    if policy_artifact is not None and persist_policy_artifact:
         joblib.dump(policy_artifact, policy_path)
 
     return {
@@ -311,6 +358,7 @@ def _build_1d_bundle(
         "prob_array": prob_array,
         "prob_array_1d": np.full(len(df_backtest), np.nan, dtype=float),
         "trade_plan_models": trade_plan_models,
+        "exit_surface_artifact": exit_surface_artifact,
         "policy_artifact": policy_artifact,
         "conf_threshold": LIVE_CONFIDENCE_THRESHOLD_DAILY,
         "max_hold_bars": 10,
@@ -331,6 +379,7 @@ def _evaluate_variant(bundle: dict[str, Any], *, variant: str) -> dict[str, Any]
         bundle["prob_array_1d"],
         bundle["feature_cols"],
         trade_plan_models=bundle["trade_plan_models"],
+        exit_surface_artifact=bundle.get("exit_surface_artifact"),
         policy_artifact=bundle["policy_artifact"] if use_policy else None,
         conf_threshold=bundle["conf_threshold"],
         max_hold_bars=bundle["max_hold_bars"],
@@ -396,6 +445,8 @@ def _build_entry(
     base_metrics: dict[str, Any] | None,
     policy_metrics: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    identity = resolve_instrument_identity(symbol)
+    symbol = identity.canonical_symbol
     sleeve_id = f"{symbol}_{lane}"
     selected_variant, selected_metrics, reason = _select_variant(base_metrics, policy_metrics)
     enabled = selected_variant is not None and selected_metrics is not None
@@ -403,6 +454,9 @@ def _build_entry(
     return {
         "sleeve_id": sleeve_id,
         "symbol": symbol,
+        "canonical_symbol": identity.canonical_symbol,
+        "display_symbol": identity.display_symbol,
+        "alias_set": list(identity.alias_set),
         "lane": lane,
         "variant": selected_variant,
         "selected_variant": selected_variant,
@@ -426,7 +480,7 @@ def build_registry_for_symbols(outdir: str, symbols: list[str]) -> dict[str, Any
     sleeves: dict[str, Any] = {}
 
     for raw_symbol in symbols:
-        symbol = raw_symbol.upper()
+        symbol = resolve_instrument_identity(raw_symbol, outdir=outdir).canonical_symbol
         try:
             intraday_bundle = _build_1h_bundle(bridge, outdir, symbol)
             base_metrics = _evaluate_variant(intraday_bundle, variant="base")
