@@ -93,7 +93,9 @@ def main():
     df_1m = primary_frames["1M"]
 
     if df_1h is None or df_1h.empty:
-        print(f"  [!] FATAL: Execution engine requires usable 1H primary data for {SYMBOL}.")
+        print(
+            f"  [!] FATAL: Execution engine requires usable 1H primary data for {SYMBOL}."
+        )
         return
 
     print(f"  [Live] 1H primary lane: {describe_selected_frame(df_1h)}")
@@ -374,15 +376,22 @@ def main():
             "direction": pred.get("direction", "N/A"),
             "confidence": float(pred.get("confidence", 0.0)),
             "signal": pred.get("signal_strength", "NO_TRADE"),
-            "stop_loss": float(trade_plan.get("sl", 0.0)) if np.isfinite(trade_plan.get("sl", 0.0)) else None,
-            "tp1": float(trade_plan.get("tp1", 0.0)) if np.isfinite(trade_plan.get("tp1", 0.0)) else None,
-            "tp2": float(trade_plan.get("tp2", 0.0)) if np.isfinite(trade_plan.get("tp2", 0.0)) else None,
+            "stop_loss": float(trade_plan.get("sl", 0.0))
+            if np.isfinite(trade_plan.get("sl", 0.0))
+            else None,
+            "tp1": float(trade_plan.get("tp1", 0.0))
+            if np.isfinite(trade_plan.get("tp1", 0.0))
+            else None,
+            "tp2": float(trade_plan.get("tp2", 0.0))
+            if np.isfinite(trade_plan.get("tp2", 0.0))
+            else None,
         }
         json_path = os.path.join(SYMBOL_DIR, f"{file_prefix}_live_signal_1H.json")
         with open(json_path, "w") as jf:
             json.dump(live_signal_data, jf, indent=4)
     except Exception as e:
         print(f"  [!] Failed to save live signal JSON for dashboard: {e}")
+
 
 if __name__ == "__main__":
     main()

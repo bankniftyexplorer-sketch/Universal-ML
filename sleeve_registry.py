@@ -107,10 +107,7 @@ def _build_intraday_conflict_array(
 
     oos_map = joblib.load(oos_1d_path)
     calibrator = joblib.load(cal_1d_path) if os.path.exists(cal_1d_path) else None
-    mapped = {
-        pd.Timestamp(ts).date(): float(prob)
-        for ts, prob in oos_map.items()
-    }
+    mapped = {pd.Timestamp(ts).date(): float(prob) for ts, prob in oos_map.items()}
     probs = np.array(
         [mapped.get(pd.Timestamp(ts).date(), np.nan) for ts in df_backtest["time"]],
         dtype=float,
@@ -180,21 +177,38 @@ def _build_1h_bundle(
     required_cols = list(
         dict.fromkeys(
             feature_cols
-            + ["time", "open", "high", "low", "close", "volume", "atr14", "basis_z_score"]
+            + [
+                "time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "atr14",
+                "basis_z_score",
+            ]
         )
     )
-    df_backtest = df_full[[col for col in required_cols if col in df_full.columns]].copy()
+    df_backtest = df_full[
+        [col for col in required_cols if col in df_full.columns]
+    ].copy()
     df_backtest = df_backtest.reset_index(drop=True)
     for col in feature_cols:
         if col not in df_backtest.columns:
             df_backtest[col] = 0.0
-        df_backtest[col] = df_backtest[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df_backtest[col] = (
+            df_backtest[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
 
     oos_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "oos_proba")
     cal_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "calibrator")
     tp_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "trade_plan_models")
-    exit_surface_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "exit_surface")
-    policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "policy_artifact")
+    exit_surface_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "1H", "exit_surface"
+    )
+    policy_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "1H", "policy_artifact"
+    )
 
     oos_map = joblib.load(oos_path)
     calibrator = joblib.load(cal_path) if os.path.exists(cal_path) else None
@@ -307,21 +321,38 @@ def _build_1d_bundle(
     required_cols = list(
         dict.fromkeys(
             feature_cols
-            + ["time", "open", "high", "low", "close", "volume", "atr14", "basis_z_score"]
+            + [
+                "time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "atr14",
+                "basis_z_score",
+            ]
         )
     )
-    df_backtest = df_full[[col for col in required_cols if col in df_full.columns]].copy()
+    df_backtest = df_full[
+        [col for col in required_cols if col in df_full.columns]
+    ].copy()
     df_backtest = df_backtest.reset_index(drop=True)
     for col in feature_cols:
         if col not in df_backtest.columns:
             df_backtest[col] = 0.0
-        df_backtest[col] = df_backtest[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df_backtest[col] = (
+            df_backtest[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
 
     oos_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "oos_proba")
     cal_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "calibrator")
     tp_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "trade_plan_models")
-    exit_surface_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "exit_surface")
-    policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "policy_artifact")
+    exit_surface_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "1D", "exit_surface"
+    )
+    policy_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "1D", "policy_artifact"
+    )
 
     oos_map = joblib.load(oos_path)
     calibrator = joblib.load(cal_path) if os.path.exists(cal_path) else None
@@ -420,7 +451,9 @@ def _passes_admission(variant_metrics: dict[str, Any] | None) -> bool:
     )
 
 
-def _select_variant(base_metrics: dict[str, Any] | None, policy_metrics: dict[str, Any] | None) -> tuple[str | None, dict[str, Any] | None, str]:
+def _select_variant(
+    base_metrics: dict[str, Any] | None, policy_metrics: dict[str, Any] | None
+) -> tuple[str | None, dict[str, Any] | None, str]:
     candidates: list[dict[str, Any]] = []
     for metrics in (base_metrics, policy_metrics):
         if _passes_admission(metrics):
@@ -436,7 +469,11 @@ def _select_variant(base_metrics: dict[str, Any] | None, policy_metrics: dict[st
             _safe_float(item.get("final_equity")) or float("-inf"),
         ),
     )
-    return str(winner["variant"]), winner, f"Selected {winner['variant']} by Sharpe/equity."
+    return (
+        str(winner["variant"]),
+        winner,
+        f"Selected {winner['variant']} by Sharpe/equity.",
+    )
 
 
 def _build_entry(
@@ -448,7 +485,9 @@ def _build_entry(
     identity = resolve_instrument_identity(symbol)
     symbol = identity.canonical_symbol
     sleeve_id = f"{symbol}_{lane}"
-    selected_variant, selected_metrics, reason = _select_variant(base_metrics, policy_metrics)
+    selected_variant, selected_metrics, reason = _select_variant(
+        base_metrics, policy_metrics
+    )
     enabled = selected_variant is not None and selected_metrics is not None
     selected_metrics = selected_metrics or {}
     return {

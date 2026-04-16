@@ -1,0 +1,12 @@
+# Institutional CODEOWNERS mappings
+# This enforces review gates on critical segments of the repository.
+
+# Python ecosystem default owner
+* @bankniftyexplorer-sketch
+
+# Math Kernels (Zero-drift integrity limits)
+*.jl @bankniftyexplorer-sketch
+
+# Portfolio & Accuracy Guardrails
+*guardrail.py @bankniftyexplorer-sketch
+*registry* @bankniftyexplorer-sketch

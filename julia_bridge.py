@@ -1177,12 +1177,8 @@ def smc_feature_engine_fast(
             )
 
     result["smc_sweep_disp_sync"] = (
-        (
-            (result["smc_sweep_bull_mag"] > 0)
-            | (result["smc_sweep_bear_mag"] > 0)
-        ).astype(float)
-        * result["smc_disp_confirmed"]
-    )
+        (result["smc_sweep_bull_mag"] > 0) | (result["smc_sweep_bear_mag"] > 0)
+    ).astype(float) * result["smc_disp_confirmed"]
     result["smc_ob_fvg_confluence"] = np.where(
         result["smc_fvg_count_active"] > 0,
         result["smc_ob_quality_score"] * (1.0 - result["smc_fvg_fill_pct"]),
@@ -1191,13 +1187,10 @@ def smc_feature_engine_fast(
     result["smc_phase_weighted_trend"] = (
         result["smc_amd_phase"] * result["smc_structure_trend_score"]
     )
-    result["smc_full_entry_signal"] = (
-        result["smc_mss_confirmed"]
-        * np.where(
-            result["smc_pd_zone"] < 0.5,
-            1.0 - result["smc_pd_zone"],
-            result["smc_pd_zone"],
-        )
+    result["smc_full_entry_signal"] = result["smc_mss_confirmed"] * np.where(
+        result["smc_pd_zone"] < 0.5,
+        1.0 - result["smc_pd_zone"],
+        result["smc_pd_zone"],
     )
     result["smc_pd_ob_confluence"] = np.where(
         result["smc_ob_nearest_dist"] < 3.0,
@@ -1212,8 +1205,8 @@ def smc_feature_engine_fast(
             result.get("smc_htf1_structure_trend", 0.0),
         )
     )
-    result["smc_htf_phase_cascade"] = (
-        result["smc_amd_phase"] * result.get("smc_htf1_amd_phase", 0.0)
+    result["smc_htf_phase_cascade"] = result["smc_amd_phase"] * result.get(
+        "smc_htf1_amd_phase", 0.0
     )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -1300,12 +1293,8 @@ def smc_feature_engine_daily(
             )
 
     result["smc_sweep_disp_sync"] = (
-        (
-            (result["smc_sweep_bull_mag"] > 0)
-            | (result["smc_sweep_bear_mag"] > 0)
-        ).astype(float)
-        * result["smc_disp_confirmed"]
-    )
+        (result["smc_sweep_bull_mag"] > 0) | (result["smc_sweep_bear_mag"] > 0)
+    ).astype(float) * result["smc_disp_confirmed"]
     result["smc_ob_fvg_confluence"] = np.where(
         result["smc_fvg_count_active"] > 0,
         result["smc_ob_quality_score"] * (1.0 - result["smc_fvg_fill_pct"]),
@@ -1314,13 +1303,10 @@ def smc_feature_engine_daily(
     result["smc_phase_weighted_trend"] = (
         result["smc_amd_phase"] * result["smc_structure_trend_score"]
     )
-    result["smc_full_entry_signal"] = (
-        result["smc_mss_confirmed"]
-        * np.where(
-            result["smc_pd_zone"] < 0.5,
-            1.0 - result["smc_pd_zone"],
-            result["smc_pd_zone"],
-        )
+    result["smc_full_entry_signal"] = result["smc_mss_confirmed"] * np.where(
+        result["smc_pd_zone"] < 0.5,
+        1.0 - result["smc_pd_zone"],
+        result["smc_pd_zone"],
     )
     result["smc_pd_ob_confluence"] = np.where(
         result["smc_ob_nearest_dist"] < 3.0,
@@ -1335,8 +1321,8 @@ def smc_feature_engine_daily(
             result.get("smc_htf1_structure_trend", 0.0),
         )
     )
-    result["smc_htf_phase_cascade"] = (
-        result["smc_amd_phase"] * result.get("smc_htf1_amd_phase", 0.0)
+    result["smc_htf_phase_cascade"] = result["smc_amd_phase"] * result.get(
+        "smc_htf1_amd_phase", 0.0
     )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -1436,9 +1422,17 @@ def add_target_fast(
 # ─────────────────────────────────────────────────────────────
 
 _RV_FEAT_KEYS = [
-    "yz_log", "yz_z", "yz_pctrank", "yz_trend",
-    "yz_shock", "vov", "pk_log", "range_eff",
-    "jump_ratio", "rv_asym", "rv_skew",
+    "yz_log",
+    "yz_z",
+    "yz_pctrank",
+    "yz_trend",
+    "yz_shock",
+    "vov",
+    "pk_log",
+    "range_eff",
+    "jump_ratio",
+    "rv_asym",
+    "rv_skew",
 ]
 
 
@@ -1490,8 +1484,11 @@ def _rv_htf_layer(
         )
 
     result[term_col] = (
-        result[f"rv_{htf_label}_yz_log"] - result[primary_log_col]
-    ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-8.0, 8.0)
+        (result[f"rv_{htf_label}_yz_log"] - result[primary_log_col])
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(-8.0, 8.0)
+    )
     return result
 
 
@@ -1529,8 +1526,14 @@ def rv_feature_engine_fast(
     if any(htf_df is not None for htf_df, _, _, _ in htf_layers):
         for htf_df, htf_label, timeframe_label, htf_ann in htf_layers:
             result = _rv_htf_layer(
-                result, base_times_ns, primary_log_col,
-                htf_df, htf_label, timeframe_label, htf_ann, TM,
+                result,
+                base_times_ns,
+                primary_log_col,
+                htf_df,
+                htf_label,
+                timeframe_label,
+                htf_ann,
+                TM,
             )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -1574,8 +1577,14 @@ def rv_feature_engine_daily(
     if any(htf_df is not None for htf_df, _, _, _ in htf_layers):
         for htf_df, htf_label, timeframe_label, htf_ann in htf_layers:
             result = _rv_htf_layer(
-                result, base_times_ns, primary_log_col,
-                htf_df, htf_label, timeframe_label, htf_ann, TM,
+                result,
+                base_times_ns,
+                primary_log_col,
+                htf_df,
+                htf_label,
+                timeframe_label,
+                htf_ann,
+                TM,
             )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)

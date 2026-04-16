@@ -162,19 +162,85 @@ EXIT_SURFACE_MIN_SAMPLES = 80
 EXIT_SURFACE_CONF_QUANTILES = (0.50, 0.80)
 EXIT_SURFACE_TEMPLATE_CATALOG = {
     "1H": (
-        {"id": "h1_compact", "stop_atr": 0.75, "tp1_atr": 1.00, "tp2_atr": 1.80, "trail_atr": 0.60},
-        {"id": "h1_balanced", "stop_atr": 0.75, "tp1_atr": 1.25, "tp2_atr": 2.25, "trail_atr": 0.75},
-        {"id": "h1_wide_runner", "stop_atr": 1.00, "tp1_atr": 1.25, "tp2_atr": 2.50, "trail_atr": 0.80},
-        {"id": "h1_trend", "stop_atr": 1.00, "tp1_atr": 1.50, "tp2_atr": 3.00, "trail_atr": 1.00},
-        {"id": "h1_defensive", "stop_atr": 1.25, "tp1_atr": 1.50, "tp2_atr": 2.50, "trail_atr": 1.00},
-        {"id": "h1_swing", "stop_atr": 1.25, "tp1_atr": 2.00, "tp2_atr": 3.50, "trail_atr": 1.25},
+        {
+            "id": "h1_compact",
+            "stop_atr": 0.75,
+            "tp1_atr": 1.00,
+            "tp2_atr": 1.80,
+            "trail_atr": 0.60,
+        },
+        {
+            "id": "h1_balanced",
+            "stop_atr": 0.75,
+            "tp1_atr": 1.25,
+            "tp2_atr": 2.25,
+            "trail_atr": 0.75,
+        },
+        {
+            "id": "h1_wide_runner",
+            "stop_atr": 1.00,
+            "tp1_atr": 1.25,
+            "tp2_atr": 2.50,
+            "trail_atr": 0.80,
+        },
+        {
+            "id": "h1_trend",
+            "stop_atr": 1.00,
+            "tp1_atr": 1.50,
+            "tp2_atr": 3.00,
+            "trail_atr": 1.00,
+        },
+        {
+            "id": "h1_defensive",
+            "stop_atr": 1.25,
+            "tp1_atr": 1.50,
+            "tp2_atr": 2.50,
+            "trail_atr": 1.00,
+        },
+        {
+            "id": "h1_swing",
+            "stop_atr": 1.25,
+            "tp1_atr": 2.00,
+            "tp2_atr": 3.50,
+            "trail_atr": 1.25,
+        },
     ),
     "1D": (
-        {"id": "d1_compact", "stop_atr": 1.00, "tp1_atr": 1.50, "tp2_atr": 3.00, "trail_atr": 1.00},
-        {"id": "d1_balanced", "stop_atr": 1.25, "tp1_atr": 2.00, "tp2_atr": 3.50, "trail_atr": 1.25},
-        {"id": "d1_trend", "stop_atr": 1.50, "tp1_atr": 2.00, "tp2_atr": 4.00, "trail_atr": 1.50},
-        {"id": "d1_wide_runner", "stop_atr": 1.50, "tp1_atr": 2.50, "tp2_atr": 4.50, "trail_atr": 1.25},
-        {"id": "d1_defensive", "stop_atr": 2.00, "tp1_atr": 2.50, "tp2_atr": 5.00, "trail_atr": 1.50},
+        {
+            "id": "d1_compact",
+            "stop_atr": 1.00,
+            "tp1_atr": 1.50,
+            "tp2_atr": 3.00,
+            "trail_atr": 1.00,
+        },
+        {
+            "id": "d1_balanced",
+            "stop_atr": 1.25,
+            "tp1_atr": 2.00,
+            "tp2_atr": 3.50,
+            "trail_atr": 1.25,
+        },
+        {
+            "id": "d1_trend",
+            "stop_atr": 1.50,
+            "tp1_atr": 2.00,
+            "tp2_atr": 4.00,
+            "trail_atr": 1.50,
+        },
+        {
+            "id": "d1_wide_runner",
+            "stop_atr": 1.50,
+            "tp1_atr": 2.50,
+            "tp2_atr": 4.50,
+            "trail_atr": 1.25,
+        },
+        {
+            "id": "d1_defensive",
+            "stop_atr": 2.00,
+            "tp1_atr": 2.50,
+            "tp2_atr": 5.00,
+            "trail_atr": 1.50,
+        },
     ),
 }
 POLICY_RISK_MULTS = (
@@ -293,9 +359,12 @@ def build_timeframe_selection(
     tf_maps: dict[str, dict[str, pd.DataFrame]] | dict[str, pd.DataFrame],
     labels: tuple[str, ...],
 ) -> tuple[dict[str, pd.DataFrame | None], dict[str, pd.DataFrame | None]]:
-    primary_frames = build_spot_timeframe_selection(_extract_primary_tf_map(tf_maps), labels)
+    primary_frames = build_spot_timeframe_selection(
+        _extract_primary_tf_map(tf_maps), labels
+    )
     reference_frames = {label: None for label in labels}
     return primary_frames, reference_frames
+
 
 # ─────────────────────────────────────────────
 # 1. PARSER  (handles Indian comma-formatted numbers)
@@ -1017,7 +1086,9 @@ def build_prob_array_from_oos_map(
     oos_proba_map: dict | None,
     calibrator=None,
 ) -> np.ndarray:
-    mapped = {pd.Timestamp(ts): float(prob) for ts, prob in (oos_proba_map or {}).items()}
+    mapped = {
+        pd.Timestamp(ts): float(prob) for ts, prob in (oos_proba_map or {}).items()
+    }
     probs = np.array(
         [mapped.get(pd.Timestamp(ts), np.nan) for ts in times],
         dtype=float,
@@ -1074,11 +1145,15 @@ def _build_policy_feature_record(
         "policy_nc_fib_age": _safe_numeric(row.get("nc_fib_range_age")),
         "policy_nc_fib_size": _safe_numeric(row.get("nc_fib_range_size")),
         "policy_nc_cross_sum": nc_cross_sum,
-        "policy_nc_cross_abs": abs(_safe_numeric(row.get("nc_cross_tf_abs"), abs(nc_cross_sum))),
+        "policy_nc_cross_abs": abs(
+            _safe_numeric(row.get("nc_cross_tf_abs"), abs(nc_cross_sum))
+        ),
         "policy_signed_nc_cross_sum": direction_sign * nc_cross_sum,
         "policy_primary_rv_z": _safe_numeric(row.get(f"{rv_prefix}_yz_z")),
         "policy_primary_rv_vov": _safe_numeric(row.get(f"{rv_prefix}_vov")),
-        "policy_primary_rv_jump_ratio": _safe_numeric(row.get(f"{rv_prefix}_jump_ratio")),
+        "policy_primary_rv_jump_ratio": _safe_numeric(
+            row.get(f"{rv_prefix}_jump_ratio")
+        ),
         "policy_primary_rv_range_eff": _safe_numeric(row.get(f"{rv_prefix}_range_eff")),
         "policy_term_fast": _safe_numeric(row.get(term_fast_col)),
         "policy_term_slow": _safe_numeric(row.get(term_slow_col)),
@@ -1144,11 +1219,16 @@ def _score_policy_threshold(
         total_r += trade_r
         equity += trade_r * (10000.0 * 0.02)
         peak_equity = max(peak_equity, equity)
-        max_drawdown = max(max_drawdown, (peak_equity - equity) / max(peak_equity, 1e-9))
+        max_drawdown = max(
+            max_drawdown, (peak_equity - equity) / max(peak_equity, 1e-9)
+        )
         total_trades += 1
         exit_idx = int(candidate_df["policy_exit_index"].iat[i])
         i += 1
-        while i < len(candidate_df) and int(candidate_df["policy_source_index"].iat[i]) <= exit_idx:
+        while (
+            i < len(candidate_df)
+            and int(candidate_df["policy_source_index"].iat[i]) <= exit_idx
+        ):
             i += 1
     avg_r = total_r / total_trades if total_trades > 0 else float("-inf")
     return {
@@ -1187,8 +1267,7 @@ def describe_policy_artifact(policy_artifact: dict | None) -> str:
     threshold = resolve_policy_decision_threshold(policy_artifact)
     if np.isfinite(threshold):
         return (
-            f"{artifact_kind} v{schema_version} "
-            f"[lane={lane} threshold={threshold:.2f}]"
+            f"{artifact_kind} v{schema_version} [lane={lane} threshold={threshold:.2f}]"
         )
     return f"{artifact_kind} v{schema_version} [lane={lane}]"
 
@@ -1243,7 +1322,9 @@ def score_policy_artifact(
     score = float(np.clip(raw_score, 0.0, 1.0))
     threshold = resolve_policy_decision_threshold(policy_artifact)
     allow_trade = score >= threshold
-    risk_mult = 0.0 if not allow_trade else _resolve_policy_risk_mult(policy_artifact, score)
+    risk_mult = (
+        0.0 if not allow_trade else _resolve_policy_risk_mult(policy_artifact, score)
+    )
     return {
         "score": score,
         "allow_trade": bool(allow_trade),
@@ -1387,10 +1468,18 @@ def train_policy_artifact(
             proba_up=proba_up,
             lane=lane_key,
         )
-        stop_dist = float(curr_atr * _safe_numeric(trade_plan.get("stop_atr"), BARRIER_ATR_MULT))
-        tp1_dist = float(curr_atr * _safe_numeric(trade_plan.get("tp1_atr"), TP1_R_MULT))
-        tp2_dist = float(curr_atr * _safe_numeric(trade_plan.get("tp2_atr"), TP2_R_MULT))
-        trail_dist = float(curr_atr * _safe_numeric(trade_plan.get("trail_r"), TRAIL_R_MULT))
+        stop_dist = float(
+            curr_atr * _safe_numeric(trade_plan.get("stop_atr"), BARRIER_ATR_MULT)
+        )
+        tp1_dist = float(
+            curr_atr * _safe_numeric(trade_plan.get("tp1_atr"), TP1_R_MULT)
+        )
+        tp2_dist = float(
+            curr_atr * _safe_numeric(trade_plan.get("tp2_atr"), TP2_R_MULT)
+        )
+        trail_dist = float(
+            curr_atr * _safe_numeric(trade_plan.get("trail_r"), TRAIL_R_MULT)
+        )
 
         trade_path = simulate_trade_path_from_arrays(
             open_arr,
@@ -1539,9 +1628,7 @@ def train_policy_artifact(
                 ),
             )
 
-    deploy_threshold = (
-        float(best_eval["threshold"]) if best_eval is not None else 0.50
-    )
+    deploy_threshold = float(best_eval["threshold"]) if best_eval is not None else 0.50
     risk_bands = [
         {
             "min_score": float(min(1.0, deploy_threshold + uplift)),
@@ -1612,12 +1699,10 @@ def train_trade_plan_models(df: pd.DataFrame, feature_cols: list) -> dict:
     }
     models = {}
     for key, (target_value, label_col, alpha) in specs.items():
-        directional_mask = df["target"] > 0.5 if target_value == 1 else df["target"] < 0.5
-        train_df = (
-            df[directional_mask]
-            .dropna(subset=feature_cols + [label_col])
-            .copy()
+        directional_mask = (
+            df["target"] > 0.5 if target_value == 1 else df["target"] < 0.5
         )
+        train_df = df[directional_mask].dropna(subset=feature_cols + [label_col]).copy()
         min_samples = max(100, min(300, int(len(df) * 0.05)))
         if len(train_df) < min_samples:
             print(
@@ -1804,7 +1889,9 @@ def train_exit_surface_artifact(
     if len(candidates) < EXIT_SURFACE_MIN_SAMPLES:
         return None
 
-    confidence_values = np.asarray([item["confidence"] for item in candidates], dtype=float)
+    confidence_values = np.asarray(
+        [item["confidence"] for item in candidates], dtype=float
+    )
     bucket_edges = sorted(
         {
             float(edge)
@@ -1944,10 +2031,18 @@ def predict_trade_plan(
         lane=lane,
     )
     if template is not None:
-        stop_atr = float(np.clip(_safe_numeric(template.get("stop_atr"), fallback_r), 0.35, 2.50))
-        tp1_atr = float(np.clip(_safe_numeric(template.get("tp1_atr"), stop_atr), 0.50, 8.00))
-        tp2_atr = float(np.clip(_safe_numeric(template.get("tp2_atr"), tp1_atr), 1.00, 12.00))
-        trail_r = float(np.clip(_safe_numeric(template.get("trail_atr"), stop_atr), 0.30, 4.00))
+        stop_atr = float(
+            np.clip(_safe_numeric(template.get("stop_atr"), fallback_r), 0.35, 2.50)
+        )
+        tp1_atr = float(
+            np.clip(_safe_numeric(template.get("tp1_atr"), stop_atr), 0.50, 8.00)
+        )
+        tp2_atr = float(
+            np.clip(_safe_numeric(template.get("tp2_atr"), tp1_atr), 1.00, 12.00)
+        )
+        trail_r = float(
+            np.clip(_safe_numeric(template.get("trail_atr"), stop_atr), 0.30, 4.00)
+        )
         note = f"Exit surface template: {template.get('id', 'unknown')}."
     elif all(key in plan_models for key in required):
         stop_atr = float(np.clip(plan_models[required[0]].predict(X)[0], 0.35, 1.50))
@@ -2382,9 +2477,7 @@ def build_report_data_lines(frame_map: dict[str, pd.DataFrame | None]) -> list[s
         synced_at = None
         if isinstance(quality, dict):
             status = str(
-                quality.get("quality_status")
-                or quality.get("status")
-                or "N/A"
+                quality.get("quality_status") or quality.get("status") or "N/A"
             ).upper()
             synced_at = quality.get("synced_at")
         lines.append(
@@ -2784,7 +2877,9 @@ def inject_thermodynamic_basis(
         return df_primary.copy()
 
     if logger is not None and df_reference is not None and not df_reference.empty:
-        logger("  [Thermo] Reference basis lane ignored in SPOT-only mode; zeroing basis.")
+        logger(
+            "  [Thermo] Reference basis lane ignored in SPOT-only mode; zeroing basis."
+        )
     return _zero_basis_columns(primary)
 
 
@@ -2858,8 +2953,12 @@ def prepare_intraday_thermodynamics(
         spot_1d,
         spot_1w,
     )
-    if logger is not None and any(df is not None and not df.empty for df in reference_inputs):
-        logger("  [Thermo] SPOT-only mode active; skipping legacy reference-lane mechanics.")
+    if logger is not None and any(
+        df is not None and not df.empty for df in reference_inputs
+    ):
+        logger(
+            "  [Thermo] SPOT-only mode active; skipping legacy reference-lane mechanics."
+        )
 
     primary_1h = inject_thermodynamic_basis(df_1h, None, logger=None)
     primary_1h = encode_session_time_vectors(primary_1h)
@@ -3013,7 +3112,9 @@ def migrate_alias_artifacts(
     current_paths = get_artifact_paths(symbol_dir, identity.artifact_prefix, timeframe)
     moved_any = False
 
-    for alias_symbol, alias_paths in _alias_artifact_locations(identity, outdir, timeframe):
+    for alias_symbol, alias_paths in _alias_artifact_locations(
+        identity, outdir, timeframe
+    ):
         for artifact_key, alias_path in alias_paths.items():
             target_path = current_paths[artifact_key]
             if not os.path.exists(alias_path) or os.path.exists(target_path):
@@ -3106,8 +3207,7 @@ if __name__ == "__main__":
     print("=" * 70)
     if requested_symbol != SYMBOL:
         print(
-            f"  INITIATING DATABASE UPLINK FOR: {SYMBOL} "
-            f"[requested {requested_symbol}]"
+            f"  INITIATING DATABASE UPLINK FOR: {SYMBOL} [requested {requested_symbol}]"
         )
     else:
         print(f"  INITIATING DATABASE UPLINK FOR: {SYMBOL}")
@@ -3212,7 +3312,9 @@ if __name__ == "__main__":
     kf_df = kalman_structural_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
     for col in kf_df.columns:
         df_full[col] = kf_df[col].values
-    print(f"  [TOON v5.3] Kalman structural features injected: {len(kf_df.columns)} columns")
+    print(
+        f"  [TOON v5.3] Kalman structural features injected: {len(kf_df.columns)} columns"
+    )
 
     print("  [TOON v5.4] Building Realized Volatility Surface (Julia RV engine)...")
     rv_df = rv_feature_engine_fast(df_1h_labelled, df_1d, df_1w, df_1m)
@@ -3397,7 +3499,9 @@ if __name__ == "__main__":
                 f"({exit_surface_artifact['metadata']['candidate_rows']} candidates)"
             )
         else:
-            print("  [Exit Surface] Skipped 1H artifact: insufficient honest candidate trades.")
+            print(
+                "  [Exit Surface] Skipped 1H artifact: insufficient honest candidate trades."
+            )
         policy_artifact = train_policy_artifact(
             df_model_ready,
             feature_cols_to_use,
@@ -3418,7 +3522,9 @@ if __name__ == "__main__":
                 f"({policy_artifact['metadata']['candidate_rows']} candidates)"
             )
         else:
-            print("  [Policy] Skipped 1H policy artifact: insufficient honest candidate trades.")
+            print(
+                "  [Policy] Skipped 1H policy artifact: insufficient honest candidate trades."
+            )
 
         last_row = df_model_ready.iloc[-1]
         pred = predict_next_bar(
@@ -3462,7 +3568,9 @@ if __name__ == "__main__":
             )
         print(f"  Signal      : {pred['signal_strength']}")
         print("----------------------------------------------------------------------")
-        print(f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)")
+        print(
+            f"  Entry Price : {close_price:,.2f} (Current {primary_asset_label} Close)"
+        )
 
         trail_str = "N/A"
         pred, filter_note = finalize_forecast_context(

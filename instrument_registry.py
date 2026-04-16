@@ -16,10 +16,7 @@ def _reverse_aliases() -> dict[str, tuple[str, ...]]:
     reverse: dict[str, set[str]] = {}
     for alias, canonical in CANONICAL_SYMBOL_ALIASES.items():
         reverse.setdefault(str(canonical).upper(), set()).add(str(alias).upper())
-    return {
-        canonical: tuple(sorted(aliases))
-        for canonical, aliases in reverse.items()
-    }
+    return {canonical: tuple(sorted(aliases)) for canonical, aliases in reverse.items()}
 
 
 @dataclass(frozen=True)
@@ -50,7 +47,10 @@ def _scan_alias_dirs(
         if not os.path.isdir(path):
             continue
         candidate = _normalize_symbol(name)
-        if canonical_pair_symbol(candidate, asset_class=asset_class) == canonical_symbol:
+        if (
+            canonical_pair_symbol(candidate, asset_class=asset_class)
+            == canonical_symbol
+        ):
             aliases.add(candidate)
     return aliases
 

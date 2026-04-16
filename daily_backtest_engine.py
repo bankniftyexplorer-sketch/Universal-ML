@@ -140,8 +140,12 @@ def main() -> None:
     trade_plan_path = resolve_artifact_path(
         symbol_dir, file_prefix, "1D", "trade_plan_models"
     )
-    exit_surface_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "exit_surface")
-    policy_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "policy_artifact")
+    exit_surface_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "1D", "exit_surface"
+    )
+    policy_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "1D", "policy_artifact"
+    )
 
     registry_entry = load_sleeve_registry_entry(symbol, "1D")
     if registry_entry is not None and not bool(registry_entry.get("enabled")):
@@ -180,11 +184,15 @@ def main() -> None:
         print(f"  [Registry] Using base variant for {symbol}_1D.")
     elif selected_variant == "policy":
         if policy_artifact is None:
-            print(f"  [Registry] Policy variant selected for {symbol}_1D but artifact is missing.")
+            print(
+                f"  [Registry] Policy variant selected for {symbol}_1D but artifact is missing."
+            )
             return
         print(f"  [Registry] Using policy variant for {symbol}_1D.")
     if policy_artifact is not None:
-        print(f"  [=] Opportunity head loaded. {describe_policy_artifact(policy_artifact)}")
+        print(
+            f"  [=] Opportunity head loaded. {describe_policy_artifact(policy_artifact)}"
+        )
     if exit_surface_artifact is not None:
         print(
             f"  [=] Exit surface loaded. "

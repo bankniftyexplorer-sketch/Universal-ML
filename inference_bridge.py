@@ -27,7 +27,9 @@ class InferenceBridge:
         """
         self.db_path = db_path
         if not os.path.exists(self.db_path):
-            raise FileNotFoundError(f"[!] CRITICAL: Database not found at {self.db_path}")
+            raise FileNotFoundError(
+                f"[!] CRITICAL: Database not found at {self.db_path}"
+            )
         with sqlite3.connect(self.db_path) as conn:
             self._configure_connection(conn)
 
@@ -85,7 +87,10 @@ class InferenceBridge:
         sources = self._distinct_identity_sources(conn, pair_symbol, asset_class)
 
         if registry_entry is not None:
-            expected_source = (registry_entry.source_exchange, registry_entry.source_symbol)
+            expected_source = (
+                registry_entry.source_exchange,
+                registry_entry.source_symbol,
+            )
             unexpected_sources = [
                 source for source in sources if source != expected_source
             ]
@@ -320,10 +325,7 @@ class InferenceBridge:
             if self._quality_status(quality) != "FAIL":
                 continue
 
-            repair_symbol = (
-                tf_df.attrs.get("pair_symbol")
-                or base_symbol
-            )
+            repair_symbol = tf_df.attrs.get("pair_symbol") or base_symbol
             raise DataIntegrityError(
                 "Strict runtime gating blocked inference for "
                 f"{base_symbol} {asset_class}. "
@@ -353,7 +355,9 @@ class InferenceBridge:
             )
 
             if raw_df.empty:
-                print(f"[!] DATABASE WARNING: No data found for {base_symbol} {asset_class}.")
+                print(
+                    f"[!] DATABASE WARNING: No data found for {base_symbol} {asset_class}."
+                )
                 return {}
             holographic_stack = self.fetch_holographic_stack_pandas(raw_df)
             if strict_gating:

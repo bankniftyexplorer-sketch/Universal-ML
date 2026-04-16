@@ -21,7 +21,15 @@ try:
 except ImportError:
     from data_vault.symbol_identity import canonical_pair_symbol
 
-REALIZED_VOL_ANNUALIZATION = {"1H": 1512.0, "1D": 252.0, "1W": 52.0, "1M": 12.0, "3M": 4.0, "6M": 2.0, "12M": 1.0}
+REALIZED_VOL_ANNUALIZATION = {
+    "1H": 1512.0,
+    "1D": 252.0,
+    "1W": 52.0,
+    "1M": 12.0,
+    "3M": 4.0,
+    "6M": 2.0,
+    "12M": 1.0,
+}
 UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
 MARKET_DNA_COLUMNS = (
     "base_symbol",
@@ -66,13 +74,9 @@ YAHOO_INSTRUMENTS: dict[str, YahooInstrument] = {
     "SENSEX": YahooInstrument("SENSEX", "^BSESN", "INR"),
     "FINNIFTY": YahooInstrument("FINNIFTY", "NIFTY_FIN_SERVICE.NS", "INR"),
     "CNXFINANCE": YahooInstrument("FINNIFTY", "NIFTY_FIN_SERVICE.NS", "INR"),
-    "NIFTY_FIN_SERVICE.NS": YahooInstrument(
-        "FINNIFTY", "NIFTY_FIN_SERVICE.NS", "INR"
-    ),
+    "NIFTY_FIN_SERVICE.NS": YahooInstrument("FINNIFTY", "NIFTY_FIN_SERVICE.NS", "INR"),
     "MIDCPNIFTY": YahooInstrument("MIDCPNIFTY", "NIFTY_MID_SELECT.NS", "INR"),
-    "NIFTY_MID_SELECT.NS": YahooInstrument(
-        "MIDCPNIFTY", "NIFTY_MID_SELECT.NS", "INR"
-    ),
+    "NIFTY_MID_SELECT.NS": YahooInstrument("MIDCPNIFTY", "NIFTY_MID_SELECT.NS", "INR"),
     "NIFTYNXT50": YahooInstrument("NIFTYNXT50", "^NSMIDCP", "INR"),
     "NIFTYNEXT50": YahooInstrument("NIFTYNXT50", "^NSMIDCP", "INR"),
     "NIFTYJR": YahooInstrument("NIFTYNXT50", "^NSMIDCP", "INR"),
@@ -136,8 +140,7 @@ DEFAULT_AUTO_SYNC_MIN_DOWNLOAD_KBPS = 32.0
 DEFAULT_AUTO_SYNC_PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_AUTO_SYNC_PROBE_READ_LIMIT_BYTES = 131072
 DEFAULT_AUTO_SYNC_PROBE_URL = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
-    "?interval=1d&range=10y"
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1d&range=10y"
 )
 MARKET_SYNC_QUALITY_COLUMNS = (
     "run_id",
@@ -202,7 +205,9 @@ class YFinanceVault:
 
         return os.path.join(module_dir, normalized)
 
-    def _resolve_custom_instruments_path(self, custom_instruments_path: str | None) -> str:
+    def _resolve_custom_instruments_path(
+        self, custom_instruments_path: str | None
+    ) -> str:
         module_dir = os.path.dirname(os.path.abspath(__file__))
         repo_root = os.path.dirname(module_dir)
         raw_path = custom_instruments_path or CUSTOM_YAHOO_INSTRUMENTS_FILENAME
@@ -234,20 +239,26 @@ class YFinanceVault:
             return {}
 
         if not isinstance(payload, dict):
-            print("[!] Custom Yahoo instrument registry ignored: root JSON must be an object.")
+            print(
+                "[!] Custom Yahoo instrument registry ignored: root JSON must be an object."
+            )
             return {}
 
         records: dict[str, YahooInstrument] = {}
         for alias, item in payload.items():
             if not isinstance(item, dict):
-                print(f"[!] Skipping custom Yahoo instrument '{alias}': entry must be an object.")
+                print(
+                    f"[!] Skipping custom Yahoo instrument '{alias}': entry must be an object."
+                )
                 continue
 
             ticker = self._extract_yahoo_ticker(
                 str(item.get("ticker") or item.get("source_symbol") or "").strip()
             )
             if not ticker:
-                print(f"[!] Skipping custom Yahoo instrument '{alias}': missing ticker.")
+                print(
+                    f"[!] Skipping custom Yahoo instrument '{alias}': missing ticker."
+                )
                 continue
 
             alias_key = canonical_pair_symbol(str(alias).strip(), asset_class="SPOT")
@@ -255,11 +266,16 @@ class YFinanceVault:
                 print(f"[!] Skipping custom Yahoo instrument '{alias}': invalid alias.")
                 continue
 
-            base_symbol = canonical_pair_symbol(
-                str(item.get("base_symbol") or alias_key).strip(),
-                asset_class="SPOT",
-            ) or alias_key
-            source_exchange = str(item.get("source_exchange") or "YAHOO").strip().upper()
+            base_symbol = (
+                canonical_pair_symbol(
+                    str(item.get("base_symbol") or alias_key).strip(),
+                    asset_class="SPOT",
+                )
+                or alias_key
+            )
+            source_exchange = (
+                str(item.get("source_exchange") or "YAHOO").strip().upper()
+            )
             if source_exchange != "YAHOO":
                 print(
                     f"[!] Skipping custom Yahoo instrument '{alias_key}': "
@@ -361,11 +377,15 @@ class YFinanceVault:
         rows: dict[str, tuple[str, str, str]] = {}
 
         def _add_row(alias: str, instrument: YahooInstrument, source: str) -> None:
-            alias_key = canonical_pair_symbol(alias, asset_class="SPOT") or alias.upper()
+            alias_key = (
+                canonical_pair_symbol(alias, asset_class="SPOT") or alias.upper()
+            )
             rows[alias_key] = (alias_key, instrument.ticker, source)
 
         for alias, instrument in YAHOO_INSTRUMENTS.items():
-            alias_key = canonical_pair_symbol(alias, asset_class="SPOT") or alias.upper()
+            alias_key = (
+                canonical_pair_symbol(alias, asset_class="SPOT") or alias.upper()
+            )
             if alias_key != alias.upper():
                 continue
             _add_row(alias_key, instrument, "builtin")
@@ -426,7 +446,9 @@ class YFinanceVault:
         )
         start = time.perf_counter()
         bytes_read = 0
-        with urllib.request.urlopen(request, timeout=max(float(timeout_seconds), 1.0)) as response:
+        with urllib.request.urlopen(
+            request, timeout=max(float(timeout_seconds), 1.0)
+        ) as response:
             while bytes_read < read_limit_bytes:
                 chunk = response.read(min(65536, read_limit_bytes - bytes_read))
                 if not chunk:
@@ -466,7 +488,12 @@ class YFinanceVault:
                     probe_url=probe_url,
                     timeout_seconds=probe_timeout_seconds,
                 )
-            except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            except (
+                OSError,
+                urllib.error.URLError,
+                urllib.error.HTTPError,
+                ValueError,
+            ) as exc:
                 snapshot["download_kbps"] = 0.0
                 snapshot["network_ok"] = False
                 snapshot["network_error"] = str(exc)
@@ -537,7 +564,9 @@ class YFinanceVault:
         while True:
             now_monotonic = time.monotonic()
             if last_attempt_started_monotonic is not None:
-                seconds_since_last_attempt = now_monotonic - last_attempt_started_monotonic
+                seconds_since_last_attempt = (
+                    now_monotonic - last_attempt_started_monotonic
+                )
                 if seconds_since_last_attempt < min_sync_gap_seconds:
                     remaining = min_sync_gap_seconds - seconds_since_last_attempt
                     print(
@@ -585,7 +614,6 @@ class YFinanceVault:
                 print(f"  [auto] Sync cycle failed: {exc}")
             else:
                 print(f"  [auto] Sync cycle finished at {self._sync_now_utc()}.")
-
 
     def _configure_connection(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -911,7 +939,9 @@ class YFinanceVault:
     def _is_continuous_market(self, instrument: YahooInstrument) -> bool:
         return instrument.base_symbol in CONTINUOUS_BASE_SYMBOLS
 
-    def _quality_payload_dict(self, audit_payload_json: str | None) -> dict[str, object]:
+    def _quality_payload_dict(
+        self, audit_payload_json: str | None
+    ) -> dict[str, object]:
         if not audit_payload_json:
             return {}
         try:
@@ -960,7 +990,11 @@ class YFinanceVault:
     ) -> str:
         if row_count <= 0:
             return QUALITY_STATUS_FAIL
-        if duplicate_timestamps > 0 or nonfinite_ohlc_rows > 0 or nonpositive_price_rows > 0:
+        if (
+            duplicate_timestamps > 0
+            or nonfinite_ohlc_rows > 0
+            or nonpositive_price_rows > 0
+        ):
             return QUALITY_STATUS_FAIL
         if missing_bar_ratio >= QUALITY_MAX_FAIL_MISSING_RATIO:
             return QUALITY_STATUS_FAIL
@@ -969,7 +1003,8 @@ class YFinanceVault:
         if (
             missing_bar_ratio >= QUALITY_MAX_WARN_MISSING_RATIO
             or synthetic_volume_ratio >= QUALITY_MAX_WARN_SYNTHETIC_VOL_RATIO
-            or staleness_hours >= QUALITY_WARN_STALENESS_HOURS.get(timeframe, float("inf"))
+            or staleness_hours
+            >= QUALITY_WARN_STALENESS_HOURS.get(timeframe, float("inf"))
         ):
             return QUALITY_STATUS_WARN
         return QUALITY_STATUS_PASS
@@ -1009,7 +1044,9 @@ class YFinanceVault:
             exact=True,
             utc=True,
         )
-        existing["is_synthetic_vol"] = existing["is_synthetic_vol"].fillna(False).astype(bool)
+        existing["is_synthetic_vol"] = (
+            existing["is_synthetic_vol"].fillna(False).astype(bool)
+        )
         existing["realized_volatility"] = pd.to_numeric(
             existing["realized_volatility"], errors="coerce"
         )
@@ -1020,8 +1057,12 @@ class YFinanceVault:
             timeframe=timeframe,
         )
         if latest_quality is not None:
-            payload = self._quality_payload_dict(latest_quality.get("audit_payload_json"))
-            existing.attrs["source_timezone"] = str(payload.get("source_timezone", "UTC"))
+            payload = self._quality_payload_dict(
+                latest_quality.get("audit_payload_json")
+            )
+            existing.attrs["source_timezone"] = str(
+                payload.get("source_timezone", "UTC")
+            )
         return existing.loc[:, list(MARKET_DNA_COLUMNS)]
 
     def _latest_quality_snapshot(
@@ -1119,12 +1160,14 @@ class YFinanceVault:
             merged = existing_df.copy()
         else:
             merged = pd.concat([existing_df, fetched_df], ignore_index=True)
-            merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
+            merged["timestamp"] = pd.to_datetime(
+                merged["timestamp"], utc=True, errors="coerce"
+            )
             merged = merged.dropna(subset=["timestamp"])
             merged = merged.sort_values("timestamp")
-            merged = merged.drop_duplicates(subset=["timestamp"], keep="last").reset_index(
-                drop=True
-            )
+            merged = merged.drop_duplicates(
+                subset=["timestamp"], keep="last"
+            ).reset_index(drop=True)
 
         merged.attrs["source_timezone"] = str(
             fetched_df.attrs.get(
@@ -1147,7 +1190,9 @@ class YFinanceVault:
         minimum_status: str | None = None,
         extra_payload: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        payload = self._quality_payload_dict(str(quality_row.get("audit_payload_json", "")))
+        payload = self._quality_payload_dict(
+            str(quality_row.get("audit_payload_json", ""))
+        )
         payload.update(
             {
                 "existing_row_count": int(existing_row_count),
@@ -1182,16 +1227,22 @@ class YFinanceVault:
             return len(timestamps), 0, 0.0
 
         if timeframe == "1D":
-            expected_count = int(
-                (timestamps[-1].normalize() - timestamps[0].normalize()) / pd.Timedelta(days=1)
-            ) + 1
+            expected_count = (
+                int(
+                    (timestamps[-1].normalize() - timestamps[0].normalize())
+                    / pd.Timedelta(days=1)
+                )
+                + 1
+            )
             gap_units = (
                 (timestamps.to_series().diff().dropna() / pd.Timedelta(days=1))
                 .round()
                 .astype(int)
             )
         elif timeframe == "1H":
-            expected_count = int((timestamps[-1] - timestamps[0]) / pd.Timedelta(hours=1)) + 1
+            expected_count = (
+                int((timestamps[-1] - timestamps[0]) / pd.Timedelta(hours=1)) + 1
+            )
             gap_units = (
                 (timestamps.to_series().diff().dropna() / pd.Timedelta(hours=1))
                 .round()
@@ -1201,8 +1252,12 @@ class YFinanceVault:
             expected_count = len(timestamps)
             gap_units = pd.Series(dtype=int)
 
-        missing_bar_count = int(np.maximum(gap_units - 1, 0).sum()) if not gap_units.empty else 0
-        max_gap_bars = float(np.maximum(gap_units - 1, 0).max()) if not gap_units.empty else 0.0
+        missing_bar_count = (
+            int(np.maximum(gap_units - 1, 0).sum()) if not gap_units.empty else 0
+        )
+        max_gap_bars = (
+            float(np.maximum(gap_units - 1, 0).max()) if not gap_units.empty else 0.0
+        )
         return expected_count, missing_bar_count, max_gap_bars
 
     def _audit_session_daily_gap_metrics(
@@ -1220,7 +1275,11 @@ class YFinanceVault:
         excess_missing = np.maximum(gap_days.to_numpy(dtype=float) - 3.0, 0.0)
         missing_bar_count = int(np.round(excess_missing.sum()))
         max_gap_bars = float(excess_missing.max()) if len(excess_missing) else 0.0
-        return int(len(session_dates) + missing_bar_count), missing_bar_count, max_gap_bars
+        return (
+            int(len(session_dates) + missing_bar_count),
+            missing_bar_count,
+            max_gap_bars,
+        )
 
     def _audit_session_hourly_gap_metrics(
         self,
@@ -1230,16 +1289,21 @@ class YFinanceVault:
         hourly_df = pd.DataFrame({"timestamp": local_hourly_timestamps})
         hourly_df["session_date"] = hourly_df["timestamp"].dt.normalize()
         hourly_df["weekday"] = hourly_df["timestamp"].dt.weekday
-        hourly_df["slot"] = hourly_df["timestamp"].dt.hour * 60 + hourly_df["timestamp"].dt.minute
+        hourly_df["slot"] = (
+            hourly_df["timestamp"].dt.hour * 60 + hourly_df["timestamp"].dt.minute
+        )
 
         if hourly_df.empty:
             return 0, 0, 0.0, {"coverage_days": 0, "session_slots": 0}
 
         observed_dates = hourly_df["session_date"].drop_duplicates().sort_values()
         if local_daily_timestamps is not None and len(local_daily_timestamps) > 0:
-            daily_dates = pd.Index(local_daily_timestamps.normalize().unique()).sort_values()
+            daily_dates = pd.Index(
+                local_daily_timestamps.normalize().unique()
+            ).sort_values()
             expected_dates = daily_dates[
-                (daily_dates >= observed_dates.min()) & (daily_dates <= observed_dates.max())
+                (daily_dates >= observed_dates.min())
+                & (daily_dates <= observed_dates.max())
             ]
         else:
             expected_dates = pd.Index(observed_dates)
@@ -1283,7 +1347,9 @@ class YFinanceVault:
                 continue
             expected_bar_count += len(expected_slots)
             actual_slots = actual_slots_by_date.get(pd.Timestamp(expected_date), set())
-            missing_slots = [slot for slot in expected_slots if slot not in actual_slots]
+            missing_slots = [
+                slot for slot in expected_slots if slot not in actual_slots
+            ]
             missing_bar_count += len(missing_slots)
             if missing_slots:
                 sorted_missing = sorted(missing_slots)
@@ -1315,7 +1381,9 @@ class YFinanceVault:
         daily_reference: pd.DataFrame | None = None,
         payload_extra: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        timestamps_utc = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], utc=True, errors="coerce"))
+        timestamps_utc = pd.DatetimeIndex(
+            pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        )
         if timestamps_utc.tz is None:
             timestamps_utc = timestamps_utc.tz_localize("UTC")
         timestamps_utc = timestamps_utc.sort_values()
@@ -1335,23 +1403,34 @@ class YFinanceVault:
 
         duplicate_timestamps = int(pd.Series(timestamps_utc).duplicated().sum())
         price_frame = df[["open", "high", "low", "close"]].copy()
-        nonfinite_ohlc_rows = int((~np.isfinite(price_frame.to_numpy(dtype=float))).any(axis=1).sum())
-        nonpositive_price_rows = int((price_frame.to_numpy(dtype=float) <= 0).any(axis=1).sum())
-        synthetic_volume_rows = int(df["is_synthetic_vol"].fillna(False).astype(bool).sum())
+        nonfinite_ohlc_rows = int(
+            (~np.isfinite(price_frame.to_numpy(dtype=float))).any(axis=1).sum()
+        )
+        nonpositive_price_rows = int(
+            (price_frame.to_numpy(dtype=float) <= 0).any(axis=1).sum()
+        )
+        synthetic_volume_rows = int(
+            df["is_synthetic_vol"].fillna(False).astype(bool).sum()
+        )
         zero_volume_rows = int(
-            ((~df["is_synthetic_vol"].fillna(False).astype(bool)) & (df["volume"].fillna(0.0) <= 0.0)).sum()
+            (
+                (~df["is_synthetic_vol"].fillna(False).astype(bool))
+                & (df["volume"].fillna(0.0) <= 0.0)
+            ).sum()
         )
 
         payload = {
-            "continuity_mode": "continuous" if self._is_continuous_market(instrument) else "session",
+            "continuity_mode": "continuous"
+            if self._is_continuous_market(instrument)
+            else "session",
             "source_timezone": source_timezone,
         }
         dropped_invalid_ohlc_rows = int(df.attrs.get("dropped_invalid_ohlc_rows", 0))
         if dropped_invalid_ohlc_rows > 0:
             payload["dropped_invalid_ohlc_rows"] = dropped_invalid_ohlc_rows
         if self._is_continuous_market(instrument):
-            expected_bar_count, missing_bar_count, max_gap_bars = self._audit_continuous_gap_metrics(
-                timestamps_utc, timeframe=timeframe
+            expected_bar_count, missing_bar_count, max_gap_bars = (
+                self._audit_continuous_gap_metrics(timestamps_utc, timeframe=timeframe)
             )
         elif timeframe == "1H":
             (
@@ -1365,8 +1444,8 @@ class YFinanceVault:
             )
             payload.update(hourly_payload)
         else:
-            expected_bar_count, missing_bar_count, max_gap_bars = self._audit_session_daily_gap_metrics(
-                local_timestamps
+            expected_bar_count, missing_bar_count, max_gap_bars = (
+                self._audit_session_daily_gap_metrics(local_timestamps)
             )
 
         missing_bar_ratio = (
@@ -1375,9 +1454,7 @@ class YFinanceVault:
             else 0.0
         )
         synthetic_volume_ratio = (
-            float(synthetic_volume_rows) / float(len(df))
-            if len(df) > 0
-            else 0.0
+            float(synthetic_volume_rows) / float(len(df)) if len(df) > 0 else 0.0
         )
         last_timestamp = timestamps_utc.max() if len(timestamps_utc) else None
         staleness_hours = self._staleness_hours(
@@ -1408,8 +1485,12 @@ class YFinanceVault:
             "source_symbol": instrument.ticker,
             "timeframe": timeframe,
             "row_count": int(len(df)),
-            "first_timestamp": self._timestamp_text(timestamps_utc.min() if len(timestamps_utc) else None),
-            "last_timestamp": self._timestamp_text(timestamps_utc.max() if len(timestamps_utc) else None),
+            "first_timestamp": self._timestamp_text(
+                timestamps_utc.min() if len(timestamps_utc) else None
+            ),
+            "last_timestamp": self._timestamp_text(
+                timestamps_utc.max() if len(timestamps_utc) else None
+            ),
             "duplicate_timestamps": duplicate_timestamps,
             "nonfinite_ohlc_rows": nonfinite_ohlc_rows,
             "nonpositive_price_rows": nonpositive_price_rows,
@@ -1420,7 +1501,9 @@ class YFinanceVault:
             "missing_bar_ratio": float(missing_bar_ratio),
             "max_gap_bars": float(max_gap_bars),
             "quality_status": quality_status,
-            "audit_payload_json": json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "audit_payload_json": json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ),
         }
 
     def _build_missing_quality_row(
@@ -1454,7 +1537,9 @@ class YFinanceVault:
             "missing_bar_ratio": 1.0,
             "max_gap_bars": 0.0,
             "quality_status": QUALITY_STATUS_FAIL,
-            "audit_payload_json": json.dumps({"reason": reason}, sort_keys=True, separators=(",", ":")),
+            "audit_payload_json": json.dumps(
+                {"reason": reason}, sort_keys=True, separators=(",", ":")
+            ),
         }
 
     def _history_period(self, timeframe: str) -> str:
@@ -1690,7 +1775,9 @@ class YFinanceVault:
         repaired_daily.attrs["source_timezone"] = source_timezone
 
         merged = pd.concat([daily_df, repaired_daily], ignore_index=True)
-        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
+        merged["timestamp"] = pd.to_datetime(
+            merged["timestamp"], utc=True, errors="coerce"
+        )
         merged = merged.dropna(subset=["timestamp"])
         merged = merged.sort_values("timestamp").drop_duplicates(
             subset=["timestamp"], keep="last"
@@ -1770,7 +1857,7 @@ class YFinanceVault:
 
             for i in range(window, n_bars):
                 s = slice(i - window + 1, i + 1)
-                co_s = log_co[max(i - window + 2, 1):i + 1]
+                co_s = log_co[max(i - window + 2, 1) : i + 1]
                 if len(co_s) < 2:
                     continue
                 mu_o = co_s.mean()
@@ -1846,7 +1933,9 @@ class YFinanceVault:
         df_db["timestamp"] = ts.dt.tz_convert("UTC").dt.strftime(UTC_TIMESTAMP_FORMAT)
         return df_db.loc[:, list(MARKET_DNA_COLUMNS)]
 
-    def _insert_quality_rows(self, cursor: sqlite3.Cursor, quality_rows: list[dict]) -> None:
+    def _insert_quality_rows(
+        self, cursor: sqlite3.Cursor, quality_rows: list[dict]
+    ) -> None:
         if not quality_rows:
             return
         cursor.executemany(
@@ -1931,7 +2020,9 @@ class YFinanceVault:
                 cursor.execute("DROP TABLE IF EXISTS temp_market_data")
             self._insert_quality_rows(cursor, quality_rows)
 
-    def sync_symbol(self, base_symbol: str, *, force_full_refresh: bool = False) -> None:
+    def sync_symbol(
+        self, base_symbol: str, *, force_full_refresh: bool = False
+    ) -> None:
         instrument = self._resolve_instrument(base_symbol)
         print(f"Syncing {instrument.base_symbol} <- {instrument.ticker}")
 
@@ -1976,7 +2067,9 @@ class YFinanceVault:
                     start=fetch_start,
                 )
             except Exception as exc:
-                print(f"  [!] {timeframe} fetch error for {instrument.base_symbol}: {exc}")
+                print(
+                    f"  [!] {timeframe} fetch error for {instrument.base_symbol}: {exc}"
+                )
                 if not existing_frame.empty:
                     retained_quality = self._audit_fetched_frame(
                         existing_frame,
@@ -2000,16 +2093,20 @@ class YFinanceVault:
                     if timeframe == "1D":
                         df_1d = existing_frame
                 else:
-                    quality_rows_by_timeframe[timeframe] = self._build_missing_quality_row(
-                        instrument=instrument,
-                        timeframe=timeframe,
-                        run_id=run_id,
-                        synced_at=synced_at,
-                        reason=f"provider_exception:{type(exc).__name__}",
+                    quality_rows_by_timeframe[timeframe] = (
+                        self._build_missing_quality_row(
+                            instrument=instrument,
+                            timeframe=timeframe,
+                            run_id=run_id,
+                            synced_at=synced_at,
+                            reason=f"provider_exception:{type(exc).__name__}",
+                        )
                     )
                 continue
             if fetched.empty:
-                print(f"  [!] No {timeframe} data returned for {instrument.base_symbol}.")
+                print(
+                    f"  [!] No {timeframe} data returned for {instrument.base_symbol}."
+                )
                 if not existing_frame.empty:
                     retained_quality = self._audit_fetched_frame(
                         existing_frame,
@@ -2033,12 +2130,14 @@ class YFinanceVault:
                     if timeframe == "1D":
                         df_1d = existing_frame
                 else:
-                    quality_rows_by_timeframe[timeframe] = self._build_missing_quality_row(
-                        instrument=instrument,
-                        timeframe=timeframe,
-                        run_id=run_id,
-                        synced_at=synced_at,
-                        reason="provider_returned_empty_frame",
+                    quality_rows_by_timeframe[timeframe] = (
+                        self._build_missing_quality_row(
+                            instrument=instrument,
+                            timeframe=timeframe,
+                            run_id=run_id,
+                            synced_at=synced_at,
+                            reason="provider_returned_empty_frame",
+                        )
                     )
                 continue
 
@@ -2192,7 +2291,9 @@ class YFinanceVault:
                 market_df=None,
                 quality_rows=quality_rows,
             )
-            raise ValueError(f"No Yahoo Finance data fetched for {instrument.base_symbol}.")
+            raise ValueError(
+                f"No Yahoo Finance data fetched for {instrument.base_symbol}."
+            )
 
         master_df = pd.concat(frames, ignore_index=True)
         self._replace_symbol_history_atomic(
@@ -2200,7 +2301,9 @@ class YFinanceVault:
             market_df=master_df,
             quality_rows=quality_rows,
         )
-        print(f"  [+] {instrument.base_symbol} sync complete. Rows written: {len(master_df)}")
+        print(
+            f"  [+] {instrument.base_symbol} sync complete. Rows written: {len(master_df)}"
+        )
 
     def sync(
         self,
@@ -2221,7 +2324,9 @@ class YFinanceVault:
                 if alias not in requested_symbols
             )
         else:
-            requested_symbols = [str(symbol).strip() for symbol in base_symbols if str(symbol).strip()]
+            requested_symbols = [
+                str(symbol).strip() for symbol in base_symbols if str(symbol).strip()
+            ]
 
         symbols: list[str] = []
         seen_base_symbols: set[str] = set()

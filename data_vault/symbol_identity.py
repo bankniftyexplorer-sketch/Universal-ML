@@ -102,9 +102,7 @@ STRICT_INDEX_REGISTRY = (
     InstrumentRegistryEntry(
         "NIFTY", "FUT", "NSE", "NIFTY1!", "CONTINUOUS_FUTURE", "INR"
     ),
-    InstrumentRegistryEntry(
-        "BANKNIFTY", "SPOT", "YAHOO", "^NSEBANK", "SPOT", "INR"
-    ),
+    InstrumentRegistryEntry("BANKNIFTY", "SPOT", "YAHOO", "^NSEBANK", "SPOT", "INR"),
     InstrumentRegistryEntry(
         "BANKNIFTY", "FUT", "NSE", "BANKNIFTY1!", "CONTINUOUS_FUTURE", "INR"
     ),
@@ -126,9 +124,7 @@ STRICT_INDEX_REGISTRY = (
         "INR",
     ),
     InstrumentRegistryEntry("SENSEX", "SPOT", "YAHOO", "^BSESN", "SPOT", "INR"),
-    InstrumentRegistryEntry(
-        "NIFTYNXT50", "SPOT", "YAHOO", "^NSMIDCP", "SPOT", "INR"
-    ),
+    InstrumentRegistryEntry("NIFTYNXT50", "SPOT", "YAHOO", "^NSMIDCP", "SPOT", "INR"),
     InstrumentRegistryEntry("SPX500", "SPOT", "YAHOO", "^GSPC", "SPOT", "USD"),
     InstrumentRegistryEntry(
         "SENSEX", "FUT", "BSE_DLY", "BSX1!", "CONTINUOUS_FUTURE", "INR"
@@ -146,50 +142,35 @@ STRICT_CRYPTO_REGISTRY = (
     InstrumentRegistryEntry("XRP", "SPOT", "YAHOO", "XRP-USD", "SPOT", "USD"),
     InstrumentRegistryEntry("SOL", "SPOT", "YAHOO", "SOL-USD", "SPOT", "USD"),
     InstrumentRegistryEntry("TRX", "SPOT", "YAHOO", "TRX-USD", "SPOT", "USD"),
-    InstrumentRegistryEntry(
-        "DOGE", "SPOT", "YAHOO", "DOGE-USD", "SPOT", "USD"
-    ),
+    InstrumentRegistryEntry("DOGE", "SPOT", "YAHOO", "DOGE-USD", "SPOT", "USD"),
     InstrumentRegistryEntry("ADA", "SPOT", "YAHOO", "ADA-USD", "SPOT", "USD"),
     InstrumentRegistryEntry("BCH", "SPOT", "YAHOO", "BCH-USD", "SPOT", "USD"),
-    InstrumentRegistryEntry(
-        "LINK", "SPOT", "YAHOO", "LINK-USD", "SPOT", "USD"
-    ),
-    InstrumentRegistryEntry(
-        "BTC", "FUT", "BINANCE", "BTCUSDT.P", "PERPETUAL", "USDT"
-    ),
+    InstrumentRegistryEntry("LINK", "SPOT", "YAHOO", "LINK-USD", "SPOT", "USD"),
+    InstrumentRegistryEntry("BTC", "FUT", "BINANCE", "BTCUSDT.P", "PERPETUAL", "USDT"),
     InstrumentRegistryEntry(
         "ETH", "FUT", "CME_DL", "ETH1!", "CONTINUOUS_FUTURE", "USD"
     ),
-    InstrumentRegistryEntry(
-        "BNB", "FUT", "BINANCE", "BNBUSDT.P", "PERPETUAL", "USDT"
-    ),
-    InstrumentRegistryEntry(
-        "XRP", "FUT", "BINANCE", "XRPUSDT.P", "PERPETUAL", "USDT"
-    ),
-    InstrumentRegistryEntry(
-        "SOL", "FUT", "BINANCE", "SOLUSDT.P", "PERPETUAL", "USDT"
-    ),
-    InstrumentRegistryEntry(
-        "TRX", "FUT", "BINANCE", "TRXUSDT.P", "PERPETUAL", "USDT"
-    ),
+    InstrumentRegistryEntry("BNB", "FUT", "BINANCE", "BNBUSDT.P", "PERPETUAL", "USDT"),
+    InstrumentRegistryEntry("XRP", "FUT", "BINANCE", "XRPUSDT.P", "PERPETUAL", "USDT"),
+    InstrumentRegistryEntry("SOL", "FUT", "BINANCE", "SOLUSDT.P", "PERPETUAL", "USDT"),
+    InstrumentRegistryEntry("TRX", "FUT", "BINANCE", "TRXUSDT.P", "PERPETUAL", "USDT"),
     InstrumentRegistryEntry(
         "DOGE", "FUT", "BINANCE", "DOGEUSDT.P", "PERPETUAL", "USDT"
     ),
-    InstrumentRegistryEntry(
-        "ADA", "FUT", "BINANCE", "ADAUSDT.P", "PERPETUAL", "USDT"
-    ),
-    InstrumentRegistryEntry(
-        "BCH", "FUT", "BINANCE", "BCHUSDT.P", "PERPETUAL", "USDT"
-    ),
+    InstrumentRegistryEntry("ADA", "FUT", "BINANCE", "ADAUSDT.P", "PERPETUAL", "USDT"),
+    InstrumentRegistryEntry("BCH", "FUT", "BINANCE", "BCHUSDT.P", "PERPETUAL", "USDT"),
     InstrumentRegistryEntry(
         "LINK", "FUT", "BINANCE", "LINKUSDT.P", "PERPETUAL", "USDT"
     ),
 )
 
 STRICT_INSTRUMENT_REGISTRY = STRICT_INDEX_REGISTRY + STRICT_CRYPTO_REGISTRY
-STRICT_PAIR_SYMBOLS = frozenset(entry.pair_symbol for entry in STRICT_INSTRUMENT_REGISTRY)
+STRICT_PAIR_SYMBOLS = frozenset(
+    entry.pair_symbol for entry in STRICT_INSTRUMENT_REGISTRY
+)
 REGISTRY_BY_PAIR_ASSET = {
-    (entry.pair_symbol, entry.asset_class): entry for entry in STRICT_INSTRUMENT_REGISTRY
+    (entry.pair_symbol, entry.asset_class): entry
+    for entry in STRICT_INSTRUMENT_REGISTRY
 }
 REGISTRY_BY_SOURCE = {
     (entry.source_exchange, entry.source_symbol): entry
@@ -289,7 +270,7 @@ def _decode_symbol_payload(raw_payload: str) -> tuple[str, dict | None]:
     for _ in range(2):
         if not candidate:
             return "plain", None
-        if candidate[0] not in {'{', '"'}:
+        if candidate[0] not in {"{", '"'}:
             return "plain", None
         try:
             decoded = json.loads(candidate)
@@ -394,7 +375,11 @@ def parse_symbol_payload(raw_payload: str) -> ParsedSymbolIdentity:
         raise ValueError("Empty symbol payload.")
 
     payload_kind, payload_object = _decode_symbol_payload(payload_text)
-    jsonish_payload = payload_text if payload_object is None and payload_text.startswith("{") else None
+    jsonish_payload = (
+        payload_text
+        if payload_object is None and payload_text.startswith("{")
+        else None
+    )
 
     explicit_exchange = None
     explicit_symbol = None
@@ -430,17 +415,23 @@ def parse_symbol_payload(raw_payload: str) -> ParsedSymbolIdentity:
     if explicit_symbol is None:
         raise ValueError(f"Unable to locate source symbol in payload: {payload_text}")
 
-    exchange_from_symbol, symbol_without_exchange = _split_exchange_prefix(explicit_symbol)
+    exchange_from_symbol, symbol_without_exchange = _split_exchange_prefix(
+        explicit_symbol
+    )
     source_exchange = _normalize_exchange(explicit_exchange or exchange_from_symbol)
     source_symbol = _normalize_source_symbol(symbol_without_exchange)
     if source_symbol is None:
-        raise ValueError(f"Unable to normalize source symbol from payload: {payload_text}")
+        raise ValueError(
+            f"Unable to normalize source symbol from payload: {payload_text}"
+        )
 
-    derived_contract_kind, derived_expiry_code, pair_core_symbol = _infer_contract_signature(
-        source_symbol
+    derived_contract_kind, derived_expiry_code, pair_core_symbol = (
+        _infer_contract_signature(source_symbol)
     )
     market_type = _normalize_market_type(explicit_market_type)
-    contract_kind = _normalize_contract_kind(explicit_contract_kind) or derived_contract_kind
+    contract_kind = (
+        _normalize_contract_kind(explicit_contract_kind) or derived_contract_kind
+    )
     if derived_contract_kind in {"CONTINUOUS_FUTURE", "PERPETUAL"}:
         contract_kind = derived_contract_kind
     elif derived_contract_kind != "SPOT" and contract_kind == "SPOT":
@@ -480,7 +471,8 @@ def parse_symbol_payload(raw_payload: str) -> ParsedSymbolIdentity:
     if expected_entry is not None:
         if registry_entry is None:
             if source_symbol == expected_entry.source_symbol and (
-                source_exchange is None or source_exchange == expected_entry.source_exchange
+                source_exchange is None
+                or source_exchange == expected_entry.source_exchange
             ):
                 source_exchange = expected_entry.source_exchange
                 registry_entry = expected_entry
@@ -572,7 +564,9 @@ def canonical_pair_symbol(raw_symbol: str, asset_class: str | None = None) -> st
     try:
         parsed = parse_symbol_payload(payload)
         if asset_class is None or parsed.asset_class == asset_class:
-            parsed_pair = _normalize_pair_symbol(parsed.pair_symbol) or parsed.pair_symbol
+            parsed_pair = (
+                _normalize_pair_symbol(parsed.pair_symbol) or parsed.pair_symbol
+            )
             return CANONICAL_SYMBOL_ALIASES.get(parsed_pair, parsed_pair)
     except ValueError:
         pass

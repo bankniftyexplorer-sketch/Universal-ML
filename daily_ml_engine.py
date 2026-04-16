@@ -201,6 +201,7 @@ def inject_macro_regime(
 
 def add_daily_confluence(df: pd.DataFrame) -> pd.DataFrame:
     """Cross-TF confluence including regime alignment."""
+
     def g(col: str, default: float = 0.0) -> np.ndarray:
         if col in df.columns:
             return df[col].to_numpy(dtype=float)
@@ -635,7 +636,9 @@ def main() -> None:
         print(f"  12M primary lane : {describe_selected_frame(df_12m)}")
     _print_tf_span("12M", df_12m)
 
-    print("\n  [TOON DAILY] Injecting Universal Basis Mechanics (Primary-to-Reference)...")
+    print(
+        "\n  [TOON DAILY] Injecting Universal Basis Mechanics (Primary-to-Reference)..."
+    )
     df_1d = inject_thermodynamic_basis(
         df_1d,
         reference_frames["1D"],
@@ -667,9 +670,13 @@ def main() -> None:
     kf_df = kalman_structural_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
     for col in kf_df.columns:
         df_full[col] = kf_df[col].values
-    print(f"  [TOON DAILY] Kalman structural features injected: {len(kf_df.columns)} columns")
+    print(
+        f"  [TOON DAILY] Kalman structural features injected: {len(kf_df.columns)} columns"
+    )
 
-    print("  [TOON DAILY] Layer 1d: Narrative Context Awareness (23 context signals)...")
+    print(
+        "  [TOON DAILY] Layer 1d: Narrative Context Awareness (23 context signals)..."
+    )
     nc_df = narrative_context_engine_daily(df_1d_labelled, df_1w, df_1m, df_6m)
     for col in nc_df.columns:
         df_full[col] = nc_df[col].values
@@ -794,7 +801,9 @@ def main() -> None:
         for col in wf_results["feature_cols"]:
             handle.write(f"{col}\n")
     joblib.dump(wf_results["oos_proba_map"], oos_path)
-    calibrator = calibrate_oos_probabilities(wf_results["oos_proba_map"], df_model_ready)
+    calibrator = calibrate_oos_probabilities(
+        wf_results["oos_proba_map"], df_model_ready
+    )
     if calibrator is not None:
         cal_path = artifact_paths_1d["calibrator"]
         joblib.dump(calibrator, cal_path)
@@ -829,7 +838,9 @@ def main() -> None:
             f"({exit_surface_artifact['metadata']['candidate_rows']} candidates)"
         )
     else:
-        print("  [Exit Surface] Skipped 1D artifact: insufficient honest candidate trades.")
+        print(
+            "  [Exit Surface] Skipped 1D artifact: insufficient honest candidate trades."
+        )
     policy_artifact = train_policy_artifact(
         df_model_ready,
         wf_results["feature_cols"],
@@ -850,7 +861,9 @@ def main() -> None:
             f"({policy_artifact['metadata']['candidate_rows']} candidates)"
         )
     else:
-        print("  [Policy] Skipped 1D policy artifact: insufficient honest candidate trades.")
+        print(
+            "  [Policy] Skipped 1D policy artifact: insufficient honest candidate trades."
+        )
 
     print(f"\n  1D model saved to '{model_path}'")
     print(f"  1D feature list saved to '{feat_path}'")

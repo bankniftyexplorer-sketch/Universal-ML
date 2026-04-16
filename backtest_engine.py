@@ -627,7 +627,9 @@ def main():
     df_1m = primary_frames["1M"]
 
     if df_1h is None or df_1d is None or df_1w is None or df_1m is None:
-        print(f"[!] Missing required 1H/1D/1W/1M primary data for {SYMBOL} in database.")
+        print(
+            f"[!] Missing required 1H/1D/1W/1M primary data for {SYMBOL} in database."
+        )
         return
 
     print(f"  [=] 1H primary lane: {describe_selected_frame(df_1h)}")
@@ -687,7 +689,9 @@ def main():
         print(f"  [Registry] Using base variant for {SYMBOL}_1H.")
     elif selected_variant == "policy":
         if policy_artifact is None:
-            print(f"  [Registry] Policy variant selected for {SYMBOL}_1H but artifact is missing.")
+            print(
+                f"  [Registry] Policy variant selected for {SYMBOL}_1H but artifact is missing."
+            )
             return
         print(f"  [Registry] Using policy variant for {SYMBOL}_1H.")
     if trade_plan_models:
@@ -699,7 +703,9 @@ def main():
             "  [!] WARNING: No ML trade-plan models found. Falling back to static ATR exits."
         )
     if policy_artifact is not None:
-        print(f"  [=] Opportunity head loaded. {describe_policy_artifact(policy_artifact)}")
+        print(
+            f"  [=] Opportunity head loaded. {describe_policy_artifact(policy_artifact)}"
+        )
     if exit_surface_artifact is not None:
         print(
             f"  [=] Exit surface loaded. "

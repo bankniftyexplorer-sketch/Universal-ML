@@ -57,7 +57,9 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _artifact_snapshot(symbol_dir: str, file_prefix: str, lane: str) -> dict[str, dict[str, Any]]:
+def _artifact_snapshot(
+    symbol_dir: str, file_prefix: str, lane: str
+) -> dict[str, dict[str, Any]]:
     current_paths = get_artifact_paths(symbol_dir, file_prefix, lane)
     out: dict[str, dict[str, Any]] = {}
     for key in TRACKED_ARTIFACT_KEYS:
@@ -94,7 +96,9 @@ def _capture_symbol_lane_snapshot(
     lane: str,
 ) -> dict[str, Any]:
     lane_key = lane.upper()
-    canonical_symbol = resolve_instrument_identity(symbol, outdir=outdir).canonical_symbol
+    canonical_symbol = resolve_instrument_identity(
+        symbol, outdir=outdir
+    ).canonical_symbol
     builder = _build_1h_bundle if lane_key == "1H" else _build_1d_bundle
     bundle = builder(
         bridge,
@@ -142,11 +146,17 @@ def _artifact_identity_status(
 
 def capture_baseline(args: argparse.Namespace) -> int:
     Path(args.base_dir).mkdir(parents=True, exist_ok=True)
-    baseline_path = Path(args.baseline) if args.baseline else _baseline_path(
-        args.base_dir,
-        args.name,
+    baseline_path = (
+        Path(args.baseline)
+        if args.baseline
+        else _baseline_path(
+            args.base_dir,
+            args.name,
+        )
     )
-    bridge = InferenceBridge(db_path=os.path.join(args.outdir, "data_vault", "ohlcv.db"))
+    bridge = InferenceBridge(
+        db_path=os.path.join(args.outdir, "data_vault", "ohlcv.db")
+    )
     payload = {
         "captured_at_utc": _utc_now(),
         "symbols": [
@@ -171,15 +181,21 @@ def capture_baseline(args: argparse.Namespace) -> int:
 
 
 def compare_baseline(args: argparse.Namespace) -> int:
-    baseline_path = Path(args.baseline) if args.baseline else _baseline_path(
-        args.base_dir,
-        args.name,
+    baseline_path = (
+        Path(args.baseline)
+        if args.baseline
+        else _baseline_path(
+            args.base_dir,
+            args.name,
+        )
     )
     if not baseline_path.exists():
         raise FileNotFoundError(f"Baseline file not found: {baseline_path}")
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    bridge = InferenceBridge(db_path=os.path.join(args.outdir, "data_vault", "ohlcv.db"))
+    bridge = InferenceBridge(
+        db_path=os.path.join(args.outdir, "data_vault", "ohlcv.db")
+    )
     failures: list[str] = []
     for symbol in [
         resolve_instrument_identity(item, outdir=args.outdir).canonical_symbol

@@ -1,106 +1,111 @@
 # Universal-ML
 
-Universal-ML is a research and production trading system that predicts market
-direction from OHLCV data using holographic geometry and SMC
-institutional-intent features.
+> **Institutional-Grade Quantitative ML Trading Engine**
 
-The active model lanes are:
+![Python 3.12](https://img.shields.io/badge/Python-3.12-blue?style=for-the-badge&logo=python)
+![Julia](https://img.shields.io/badge/Julia-1.10%2B-9558B2?style=for-the-badge&logo=julia)
+![LightGBM](https://img.shields.io/badge/LightGBM-Engine-ff69b4?style=for-the-badge)
+![License](https://img.shields.io/badge/License-Proprietary-red?style=for-the-badge)
+![Stage](https://img.shields.io/badge/Stage-Production-success?style=for-the-badge)
 
-- `1H` intraday
-- `1D` daily
+Universal-ML is a high-performance, deterministic research and production trading system. It predicts market direction from `OHLCV` logs using purely holographic geometry and Smart Money Concepts (SMC) institutional-intent features.
 
-Core numerical feature extraction and label generation run through Julia
-kernels in [ToonMath.jl](ToonMath.jl), while Python
-orchestrates data flow, model training, walk-forward validation, reporting, and
-artifact management.
+---
 
-## Fast Start
+## 🏛 Architecture
 
+The system segregates heavy numerical compute to Julia (`ToonMath.jl`) and couples it with Python's robust Machine Learning and walk-forward orchestration layers. 
+
+```mermaid
+graph TD
+    A[(TradingView CSVs)] -->|Ingestion| B[(Data Vault SQLite)]
+    
+    subgraph "Julia Mathematical Engine (ToonMath.jl)"
+        B --> C{Holographic Geometries}
+        C --> D[DNA / Grammar]
+        C --> E[Spectral / Skeleton]
+    end
+    
+    subgraph "Python Machine Learning Orchestration"
+        D & E -->|Feature Matrices| F[Universal ML Engine 1H / 1D]
+        F --> G[Walk-Forward Validation]
+        G --> H((Optimized LightGBM Model))
+    end
+    
+    subgraph "Execution & Guardrails"
+        H --> I[Meta-Strategy Selector]
+        I --> J[Trade Plan Generation]
+        J --> K[Execution Guardrail]
+    end
+```
+
+## ⚙️ Operating Lanes
+Universal-ML actively computes and trains on the following lanes:
+- `1H` Intraday Dynamics
+- `1D` Daily Macro Positioning
+
+## 🚀 Fast Start
+
+> [!TIP]
+> The repository is optimized with the `uv` package manager and provides `make` commands for accelerated operational efficiency.
+
+### System Initialization
 ```bash
+# Clone and enter directory
 cd /home/km/Universal-ML
-uv sync --locked
+
+# Sync precise dependency trees via uv
+make sync
 ```
 
-Train the active daily lane:
+### 1H Intraday Operations
+```bash
+# Train Canonical 1H Models
+make train-1H
+
+# Conduct Backtest Validations
+uv run python backtest_engine.py --symbol NIFTY --outdir ./
+
+# Fast Live Inference
+make live-1H
+```
+
+### 1D Daily Operations
+```bash
+# Train Canonical 1D Models
+make train-1D
+
+# Conduct Backtest Validations
+uv run python daily_backtest_engine.py --symbol NIFTY --outdir ./
+```
+
+## 🛡 Reliability & Regression Guardrails
+
+> [!CAUTION]
+> Accuracy-sensitive code modifications **must** be validated strictly with the guardrail pipeline to prevent mathematical drift or predictive regressions.
 
 ```bash
-uv run python daily_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-uv run python daily_backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+# 1. Capture base models before surgery
+make validate-pre
+
+# 2. Compare deviations post-surgery
+make validate-post
 ```
 
-Train the active intraday lane:
+## 📖 Institutional Knowledge Graph
 
-```bash
-uv run python universal_ml_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-uv run python backtest_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
-```
+If you are a new quantitative developer entering the stack, you must review the core architectural contracts in exact order:
 
-Fast live intraday inference without retraining:
+1. [**PROJECT_MAP.md**](PROJECT_MAP.md) - The shortest accurate blueprint of system topology.
+2. [**LAUNCH_INSTRUCTIONS.md**](LAUNCH_INSTRUCTIONS.md) - The operational production runbook.
+3. [**AGENTS.md**](AGENTS.md) - Strict autonomous engineering laws and constraints.
 
-```bash
-uv run python live_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
-```
+## 🖧 Hardware Specifications
 
-Accuracy guardrail before and after any sensitive change:
+Performance boundaries are strictly aligned to the target cluster constraints:
+- **Baseline Minimum Target:** Intel `i7-4770` Architecture
+- **Memory Optimization Target:** `16 GB DDR3 RAM`
+- **Cache Architecture:** M.2 NVMe Storage
 
-```bash
-uv run python accuracy_guardrail.py capture --symbol NIFTY --outdir /home/km/Universal-ML/
-uv run python accuracy_guardrail.py compare --symbol NIFTY --outdir /home/km/Universal-ML/
-```
-
-## Read Order
-
-If you are new to the repo, read these in order:
-
-1. [PROJECT_MAP.md](PROJECT_MAP.md)
-2. [LAUNCH_INSTRUCTIONS.md](LAUNCH_INSTRUCTIONS.md)
-3. [AGENTS.md](AGENTS.md)
-
-## Architecture Summary
-
-- `data_vault/vault_engine.py`: CSV ingestion, database writes, macro timeframe
-  generation, performance ledger
-- `inference_bridge.py`: database reads and timeframe stack assembly
-- `universal_ml_engine.py`: canonical `1H` training pipeline
-- `daily_ml_engine.py`: canonical `1D` training pipeline
-- `backtest_engine.py`: `1H` historical replay and report generation
-- `daily_backtest_engine.py`: `1D` historical replay and report generation
-- `julia_bridge.py`: Python-to-Julia bridge
-- `ToonMath.jl`: high-performance feature and target kernels
-- `shadow_brain.py`: optional trade-history overlay
-
-## Operating Model
-
-1. Ingest closed TradingView CSV exports into `data_vault/ohlcv.db`.
-2. Build timeframe-aligned market stacks from the database.
-3. Extract holographic and SMC features with Julia kernels.
-4. Create forward targets from trade-simulation logic.
-5. Run walk-forward validation and train final LightGBM models.
-6. Save model, feature list, OOS probability map, trade-plan models, and
-   reports under the symbol folder.
-7. Reuse saved artifacts for backtesting and live inference.
-
-## Repository Standards
-
-- Generated symbol artifacts are intentionally ignored by git.
-- The database file is local state, not source code.
-- `PROJECT_MAP.md` is the shortest accurate architecture map.
-- `LAUNCH_INSTRUCTIONS.md` is the operational runbook.
-- Accuracy-sensitive code changes must be validated with real walk-forward and
-  backtest outputs before being trusted.
-
-## Environment
-
-- Python environment: [pyproject.toml](pyproject.toml), [uv.lock](uv.lock), `.python-version`, UV-managed `.venv`
-- Runtime Julia bridge dependency: `juliacall` (declared in Python project metadata)
-- Legacy fallback dependency mirror: [requirements.txt](requirements.txt)
-- Julia environment: [Project.toml](Project.toml), [Manifest.toml](Manifest.toml)
-- Baseline CPU-only target: Intel i7-4770 class hardware with 16 GB RAM
-
-## Current Status
-
-- Active canonical lanes: `1H`, `1D`
-- Database is the system source of truth
-- No formal unit-test suite is present
-- Validation confidence comes from walk-forward splits, OOS probability maps,
-  and backtest reports
+---
+*Proprietary algorithmic structure. All rights reserved.*

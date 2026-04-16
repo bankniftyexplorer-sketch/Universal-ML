@@ -207,9 +207,7 @@ def run_strategy_zoo(
         df_copy = df_copy.dropna(subset=["target"]).copy()
         if "target_edge_r" in df_copy.columns:
             edge_r = (
-                df_copy["target_edge_r"]
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(0.0)
+                df_copy["target_edge_r"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
             )
             df_copy = df_copy.loc[edge_r >= min_edge_r].copy()
         if df_copy.empty:
@@ -370,14 +368,14 @@ def meta_select_strategy(
 
         prob_array = _build_prob_array(strategy_df, oos_proba_map)
         prob_array = apply_calibrator_to_prob_array(prob_array, calibrator)
-        
+
         # --- VOLATILITY REGIME GATE (EXECUTION LEVEL) ---
         if "atr14" in strategy_df.columns:
             atr_median_20 = strategy_df["atr14"].rolling(20, min_periods=1).median()
             gate_mask = strategy_df["atr14"] > atr_median_20
             prob_array = np.where(gate_mask, prob_array, np.nan)
         # ------------------------------------------------
-        
+
         oos_bars = int(np.isfinite(prob_array).sum())
         if oos_bars == 0:
             metrics[key] = {
@@ -522,11 +520,13 @@ def verdict_output(
             policy_artifact=policy_artifact,
             policy_lane="1H",
         )
-        
+
         # Apply regime gate to live signal
         if "atr14" in winning_df.columns:
             live_atr = last_row.get("atr14", 0)
-            median_atr = winning_df["atr14"].rolling(20, min_periods=1).median().iloc[-1]
+            median_atr = (
+                winning_df["atr14"].rolling(20, min_periods=1).median().iloc[-1]
+            )
             if live_atr <= median_atr:
                 pred["direction"] = "REGIME_BLOCK"
                 pred["confidence"] = np.nan

@@ -185,7 +185,9 @@ def _score_saved_oos(
         n_splits=n_splits,
     )
     if not split_points:
-        raise ValueError("Could not determine valid split points for saved-artifact scoring.")
+        raise ValueError(
+            "Could not determine valid split points for saved-artifact scoring."
+        )
 
     oos_map = {pd.Timestamp(ts): float(prob) for ts, prob in oos_proba_map.items()}
     results: list[dict[str, Any]] = []
@@ -208,8 +210,7 @@ def _score_saved_oos(
         pred_binary = (preds > 0.5).astype(int)
         acc = float((true_binary[valid_mask] == pred_binary[valid_mask]).mean())
         high_conf_mask = valid_mask & (
-            (preds >= confidence_threshold)
-            | (preds <= (1.0 - confidence_threshold))
+            (preds >= confidence_threshold) | (preds <= (1.0 - confidence_threshold))
         )
         conf_acc = (
             float((pred_binary[high_conf_mask] == true_binary[high_conf_mask]).mean())
@@ -231,7 +232,9 @@ def _score_saved_oos(
 
     return {
         "split_count": len(results),
-        "oos_prediction_bars": int(sum(r["test_bars"] for r in results) - total_missing),
+        "oos_prediction_bars": int(
+            sum(r["test_bars"] for r in results) - total_missing
+        ),
         "total_validation_bars": int(sum(r["test_bars"] for r in results)),
         "missing_oos_bars": total_missing,
         "oos_coverage": float(
@@ -504,7 +507,11 @@ def _print_lane_metrics(symbol: str, lane: str, metrics: dict[str, Any]) -> None
 
 
 def capture_baseline(args: argparse.Namespace) -> int:
-    baseline_path = Path(args.baseline) if args.baseline else _baseline_path(args.base_dir, args.symbol)
+    baseline_path = (
+        Path(args.baseline)
+        if args.baseline
+        else _baseline_path(args.base_dir, args.symbol)
+    )
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
 
     snapshot = {
@@ -524,7 +531,9 @@ def capture_baseline(args: argparse.Namespace) -> int:
             snapshot["lanes"].update(existing_lanes)
 
     for lane in _lane_list(args.lane):
-        print(f"[capture] rebuilding {lane} guardrail snapshot for {snapshot['symbol']}...")
+        print(
+            f"[capture] rebuilding {lane} guardrail snapshot for {snapshot['symbol']}..."
+        )
         lane_snapshot = _capture_lane_snapshot(args.outdir, snapshot["symbol"], lane)
         snapshot["lanes"][lane] = lane_snapshot
         _print_lane_metrics(snapshot["symbol"], lane, lane_snapshot["metrics"])
@@ -534,7 +543,9 @@ def capture_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
-def _metric_regressed(current: float | None, baseline: float | None, tol: float) -> bool:
+def _metric_regressed(
+    current: float | None, baseline: float | None, tol: float
+) -> bool:
     if baseline is None or current is None:
         return False
     return float(current) + tol < float(baseline)
@@ -557,7 +568,11 @@ def _artifact_identity_status(
 
 
 def compare_baseline(args: argparse.Namespace) -> int:
-    baseline_path = Path(args.baseline) if args.baseline else _baseline_path(args.base_dir, args.symbol)
+    baseline_path = (
+        Path(args.baseline)
+        if args.baseline
+        else _baseline_path(args.base_dir, args.symbol)
+    )
     if not baseline_path.exists():
         raise FileNotFoundError(f"Baseline file not found: {baseline_path}")
 
@@ -588,7 +603,10 @@ def compare_baseline(args: argparse.Namespace) -> int:
         else:
             print(f"[compare] {lane} artifact identity: {run_status}")
 
-        if current_metrics["oos_coverage"] + args.metric_tolerance < base_metrics["oos_coverage"]:
+        if (
+            current_metrics["oos_coverage"] + args.metric_tolerance
+            < base_metrics["oos_coverage"]
+        ):
             failures.append(
                 f"{lane}: OOS coverage regressed "
                 f"{current_metrics['oos_coverage']:.3f} < {base_metrics['oos_coverage']:.3f}"
@@ -625,7 +643,9 @@ def compare_baseline(args: argparse.Namespace) -> int:
 
         for key, artifact in base_artifacts.items():
             current_artifact = current_artifacts.get(key, {})
-            if artifact.get("exists") and artifact.get("sha256") != current_artifact.get("sha256"):
+            if artifact.get("exists") and artifact.get(
+                "sha256"
+            ) != current_artifact.get("sha256"):
                 print(
                     f"[compare] note: {lane} artifact changed for {key} "
                     f"({artifact.get('sha256', '')[:12]} -> {current_artifact.get('sha256', '')[:12]})"
