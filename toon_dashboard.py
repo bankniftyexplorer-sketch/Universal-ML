@@ -1,18 +1,18 @@
+import glob
+import json
 import os
+import pickle
 import sys
 import time
-import json
-import pickle
-import glob
 
 
 def print_header(title):
     print(
-        f"\n================================================================================"
+        "\n================================================================================"
     )
     print(f"  {title}")
     print(
-        f"================================================================================"
+        "================================================================================"
     )
 
 
@@ -21,10 +21,10 @@ def run_dashboard():
 
     registry_path = "portfolio_sleeve_registry.json"
     if os.path.exists(registry_path):
-        with open(registry_path, "r") as f:
+        with open(registry_path) as f:
             data = json.load(f)
             sleeves = data.get("sleeves", {})
-            print(f"\n[ 1. PORTFOLIO ADMISSION STATUS ]")
+            print("\n[ 1. PORTFOLIO ADMISSION STATUS ]")
             print(
                 f"{'SYMBOL':<12} {'LANE':<6} {'STATUS':<10} {'VARIANT':<8} {'SHARPE':<8} {'PROFIT.F':<8} {'TRADES'}"
             )
@@ -48,7 +48,7 @@ def run_dashboard():
     else:
         print("\n>> No Portfolio Registry found.")
 
-    print(f"\n[ 2. LIVE ML TARGET RADAR (LATEST META-VERDICTS) ]")
+    print("\n[ 2. LIVE ML TARGET RADAR (LATEST META-VERDICTS) ]")
     print(
         f"{'SYMBOL':<12} {'WINNING STRATEGY':<20} {'EDGE (SHARPE)':<15} {'DIRECTION':<10} {'SIGNAL':<12} {'CONF'}"
     )
@@ -85,7 +85,7 @@ def run_dashboard():
         except Exception:
             pass
 
-    print(f"\n[ 3. REAL-TIME INFERENCE TARGETS (TP / SL) ]")
+    print("\n[ 3. REAL-TIME INFERENCE TARGETS (TP / SL) ]")
     print(
         f"{'SYMBOL':<12} {'LANE':<6} {'DIRECTION':<10} {'SIGNAL':<12} {'STOP LOSS':<15} {'TAKE PROFIT (1)':<18} {'TAKE PROFIT (2)':<18}"
     )
@@ -94,7 +94,7 @@ def run_dashboard():
     signal_files = sorted(glob.glob("*/*_live_signal_*.json"))
     for sf in signal_files:
         try:
-            with open(sf, "r") as jf:
+            with open(sf) as jf:
                 s_data = json.load(jf)
                 sym = s_data.get("symbol", "N/A")
                 lane = s_data.get("lane", "N/A")

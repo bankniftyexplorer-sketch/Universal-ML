@@ -1,8 +1,9 @@
-import sys
 import os
-import pandas as pd
-import numpy as np
+import sys
+
 import lightgbm as lgb
+import numpy as np
+import pandas as pd
 
 # Dynamically add data_vault into path
 sys.path.append(os.path.join(os.path.dirname(__file__), "data_vault"))

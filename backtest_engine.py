@@ -1,46 +1,49 @@
-import os
 import argparse
-import numpy as np
-import pandas as pd
+import os
+
 import joblib
 import matplotlib
+import numpy as np
+import pandas as pd
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-
 # Suppress lightgbm warnings locally if needed
 import warnings
 
-from universal_ml_engine import EnsembleModel  # noqa: F401
-from universal_ml_engine import (
-    apply_calibrator_to_prob_array,
-    get_artifact_paths,
-    merge_higher_tf,
-    _compute_atr14,
-    BARRIER_HORIZON_BARS,
-    LIVE_CONFIDENCE_THRESHOLD,
-    EXEC_FEE_PCT,
-    build_report_data_lines,
-    build_timeframe_selection,
-    describe_policy_artifact,
-    describe_selected_frame,
-    simulate_trade_path_from_arrays,
-    predict_trade_plan,
-    prepare_intraday_thermodynamics,
-    prepare_symbol_artifact_context,
-    resolve_artifact_path,
-    score_policy_artifact,
-)
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+
 from julia_bridge import (
     compute_backtest_bar_state_fast,
-    holographic_feature_engine_fast as holographic_feature_engine,
     kalman_structural_engine_fast,
     narrative_context_engine_fast,
     rv_feature_engine_fast,
     smc_feature_engine_fast,
 )
+from julia_bridge import (
+    holographic_feature_engine_fast as holographic_feature_engine,
+)
 from sleeve_registry import load_sleeve_registry_entry
+from universal_ml_engine import (
+    BARRIER_HORIZON_BARS,
+    EXEC_FEE_PCT,
+    LIVE_CONFIDENCE_THRESHOLD,
+    EnsembleModel,  # noqa: F401
+    _compute_atr14,
+    apply_calibrator_to_prob_array,
+    build_report_data_lines,
+    build_timeframe_selection,
+    describe_policy_artifact,
+    describe_selected_frame,
+    get_artifact_paths,
+    merge_higher_tf,
+    predict_trade_plan,
+    prepare_intraday_thermodynamics,
+    prepare_symbol_artifact_context,
+    resolve_artifact_path,
+    score_policy_artifact,
+    simulate_trade_path_from_arrays,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -666,7 +669,7 @@ def main():
     print(f"\n  [=] Loading Model: {os.path.basename(model_path)}")
     model = joblib.load(model_path)
 
-    with open(feat_path, "r") as f:
+    with open(feat_path) as f:
         feature_cols = [line.strip() for line in f.readlines() if line.strip()]
 
     trade_plan_models = (

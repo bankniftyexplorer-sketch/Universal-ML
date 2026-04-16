@@ -1,0 +1,36 @@
+name: "\U0001F3AF Architectural Proposal"
+description: Propose mathematical logic, meta-strategy updates, or execution limits
+title: "[PROPOSAL] <Feature Concept>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing, verify this feature conceptually fits our "Holographic Geometry + SMC" methodology as described in `PROJECT_MAP.md`.
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: "Institutional Objective"
+      description: "What capability does this solve? More predictability? Better risk bounds?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: architecture
+    attributes:
+      label: "Proposed Architecture"
+      description: "How does this feature interact with the base `1H`/`1D` models? Does it alter `ToonMath.jl`?"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backward_compatibility
+    attributes:
+      label: "Is this backward compatible with existing .db and model baselines?"
+      options:
+        - "Yes (Non-destructive extension)"
+        - "No (Requires database migration or invalidates old walk-forward runs)"
+        - "Unsure"
+    validations:
+      required: true

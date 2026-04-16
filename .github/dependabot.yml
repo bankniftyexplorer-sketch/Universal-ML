@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Maintain Python dependencies defined by uv
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    assignees:
+      - "bankniftyexplorer-sketch"
+    # Wait for uv native dependabot support, 'pip' ecosystem handles requirements.txt
+    # and pyproject.toml basic upgrades gracefully in the interim.
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

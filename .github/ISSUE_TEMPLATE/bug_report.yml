@@ -1,0 +1,54 @@
+name: "\U0001F6A8 Defect Report"
+description: Report a bug, pipeline failure, or mathematical drift in the execution systems
+title: "[BUG] <Title Here>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for using Universal-ML. Please ensure your defect isn't caused by dirty database states or old dependencies (`make sync`).
+
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: "Affected Subsystem"
+      description: "Which exact lane or logic block is failing?"
+      options:
+        - "1H Universal Line (universal_ml_engine.py)"
+        - "1D Universal Line (daily_ml_engine.py)"
+        - "ToonMath.jl Kernel Execution"
+        - "OOS Probability Mapping / Trade Validation"
+        - "Guardrail Enforcement"
+        - "Other / Infra"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Defect Description & Reproduction Steps"
+      description: "Explain the failure. What command breaks?"
+      placeholder: "When running `make train-1H` with missing database fields..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Traceback Logs"
+      description: "Paste the exact terminal failure or Traceback message."
+      render: "shell"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: env_checks
+    attributes:
+      label: "Environment Verifications"
+      options:
+        - label: "I am using `uv` actively synchronized (`uv sync --locked`)."
+          required: true
+        - label: "I am using Python 3.12+ constraints."
+          required: true
+        - label: "I have removed disposable artifacts before attempting to rerun."
+          required: false

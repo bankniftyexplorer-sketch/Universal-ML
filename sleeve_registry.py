@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +46,8 @@ from universal_ml_engine import (
     build_timeframe_selection,
     inject_thermodynamic_basis,
     merge_higher_tf,
-    prepare_symbol_artifact_context,
     prepare_intraday_thermodynamics,
+    prepare_symbol_artifact_context,
     resolve_artifact_path,
     train_policy_artifact,
 )
@@ -60,7 +60,7 @@ MIN_TRADES = 8
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def load_sleeve_registry(registry_path: str | None = None) -> dict[str, Any]:
@@ -171,7 +171,7 @@ def _build_1h_bundle(
     df_full = merge_higher_tf(df_full, df_1d, df_1w, df_1m)
 
     features_path = resolve_artifact_path(symbol_dir, file_prefix, "1H", "features")
-    with open(features_path, "r", encoding="utf-8") as handle:
+    with open(features_path, encoding="utf-8") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
 
     required_cols = list(
@@ -315,7 +315,7 @@ def _build_1d_bundle(
     df_full = add_daily_confluence(df_full)
 
     features_path = resolve_artifact_path(symbol_dir, file_prefix, "1D", "features")
-    with open(features_path, "r", encoding="utf-8") as handle:
+    with open(features_path, encoding="utf-8") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
 
     required_cols = list(

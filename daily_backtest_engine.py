@@ -25,8 +25,9 @@ from julia_bridge import (
     rv_feature_engine_daily,
     smc_feature_engine_daily,
 )
-from universal_ml_engine import EnsembleModel  # noqa: F401
+from sleeve_registry import load_sleeve_registry_entry
 from universal_ml_engine import (
+    EnsembleModel,  # noqa: F401
     _compute_atr14,
     apply_calibrator_to_prob_array,
     build_report_data_lines,
@@ -39,7 +40,6 @@ from universal_ml_engine import (
     resolve_artifact_path,
     select_primary_timeframe,
 )
-from sleeve_registry import load_sleeve_registry_entry
 
 warnings.filterwarnings("ignore")
 
@@ -165,7 +165,7 @@ def main() -> None:
     calibrator = (
         joblib.load(calibrator_path) if os.path.exists(calibrator_path) else None
     )
-    with open(feat_path, "r") as handle:
+    with open(feat_path) as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
     trade_plan_models = (
         joblib.load(trade_plan_path) if os.path.exists(trade_plan_path) else {}

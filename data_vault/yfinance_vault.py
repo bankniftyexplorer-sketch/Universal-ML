@@ -7,9 +7,9 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import numpy as np
@@ -924,7 +924,7 @@ class YFinanceVault:
         return dst
 
     def _sync_now_utc(self) -> str:
-        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        return datetime.now(UTC).replace(microsecond=0).isoformat()
 
     def _timestamp_text(self, value: pd.Timestamp | None) -> str | None:
         if value is None or pd.isna(value):
@@ -1429,9 +1429,11 @@ class YFinanceVault:
         if dropped_invalid_ohlc_rows > 0:
             payload["dropped_invalid_ohlc_rows"] = dropped_invalid_ohlc_rows
         if self._is_continuous_market(instrument):
-            expected_bar_count, missing_bar_count, max_gap_bars = (
-                self._audit_continuous_gap_metrics(timestamps_utc, timeframe=timeframe)
-            )
+            (
+                expected_bar_count,
+                missing_bar_count,
+                max_gap_bars,
+            ) = self._audit_continuous_gap_metrics(timestamps_utc, timeframe=timeframe)
         elif timeframe == "1H":
             (
                 expected_bar_count,
@@ -1444,9 +1446,11 @@ class YFinanceVault:
             )
             payload.update(hourly_payload)
         else:
-            expected_bar_count, missing_bar_count, max_gap_bars = (
-                self._audit_session_daily_gap_metrics(local_timestamps)
-            )
+            (
+                expected_bar_count,
+                missing_bar_count,
+                max_gap_bars,
+            ) = self._audit_session_daily_gap_metrics(local_timestamps)
 
         missing_bar_ratio = (
             float(missing_bar_count) / float(expected_bar_count)
@@ -2093,14 +2097,14 @@ class YFinanceVault:
                     if timeframe == "1D":
                         df_1d = existing_frame
                 else:
-                    quality_rows_by_timeframe[timeframe] = (
-                        self._build_missing_quality_row(
-                            instrument=instrument,
-                            timeframe=timeframe,
-                            run_id=run_id,
-                            synced_at=synced_at,
-                            reason=f"provider_exception:{type(exc).__name__}",
-                        )
+                    quality_rows_by_timeframe[
+                        timeframe
+                    ] = self._build_missing_quality_row(
+                        instrument=instrument,
+                        timeframe=timeframe,
+                        run_id=run_id,
+                        synced_at=synced_at,
+                        reason=f"provider_exception:{type(exc).__name__}",
                     )
                 continue
             if fetched.empty:
@@ -2130,14 +2134,14 @@ class YFinanceVault:
                     if timeframe == "1D":
                         df_1d = existing_frame
                 else:
-                    quality_rows_by_timeframe[timeframe] = (
-                        self._build_missing_quality_row(
-                            instrument=instrument,
-                            timeframe=timeframe,
-                            run_id=run_id,
-                            synced_at=synced_at,
-                            reason="provider_returned_empty_frame",
-                        )
+                    quality_rows_by_timeframe[
+                        timeframe
+                    ] = self._build_missing_quality_row(
+                        instrument=instrument,
+                        timeframe=timeframe,
+                        run_id=run_id,
+                        synced_at=synced_at,
+                        reason="provider_returned_empty_frame",
                     )
                 continue
 

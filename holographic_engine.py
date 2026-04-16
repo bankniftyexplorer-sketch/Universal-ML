@@ -22,7 +22,6 @@ julia_bridge.py, owns the live holographic feature engine:
 
 import re
 import warnings
-from typing import Dict, List, Tuple
 
 import lightgbm as lgb
 import numpy as np
@@ -44,9 +43,9 @@ FINAL_FEAT_BUDGET = 40
 
 def correlation_filter(
     df: pd.DataFrame,
-    feature_cols: List[str],
+    feature_cols: list[str],
     threshold: float = CORR_THRESHOLD,
-) -> List[str]:
+) -> list[str]:
     """
     Remove one member of each highly-correlated pair.
     When |r| > threshold, drop the one from the larger window.
@@ -83,11 +82,11 @@ def correlation_filter(
 
 def phase1_ranking(
     df: pd.DataFrame,
-    feature_cols: List[str],
+    feature_cols: list[str],
     target_col: str = "target",
     n_folds: int = PHASE1_FOLDS,
     top_n: int = PHASE1_TOP_N,
-) -> List[str]:
+) -> list[str]:
     """
     Shallow probe (max_depth=3) on first n_folds chronological windows.
     Returns top_n features by averaged importance.
@@ -164,13 +163,13 @@ def phase1_ranking(
 
 def feature_selection_pipeline(
     df: pd.DataFrame,
-    feature_cols: List[str],
+    feature_cols: list[str],
     walk_forward_fn,
     target_col: str = "target",
     min_train_bars: int = 2500,
     test_size_ratio: float = 0.15,
     n_splits: int = 10,
-) -> Tuple[List[str], Dict]:
+) -> tuple[list[str], dict]:
     """
     Phase 1 — correlation filter (→ ~1000)
     Phase 2 — shallow probe ranking (→ top 100)

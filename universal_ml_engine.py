@@ -8,12 +8,12 @@ Walk-forward validated | i7-4770 / 16 GB RAM / CPU only
 import argparse
 import json
 import os
-from functools import lru_cache
-from pathlib import Path
 import re
 import subprocess
 import sys
 import warnings
+from functools import lru_cache
+from pathlib import Path
 
 import lightgbm as lgb
 import matplotlib
@@ -22,21 +22,25 @@ import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+from numba import njit
 
+from data_vault.symbol_identity import extract_symbol_payload, parse_symbol_payload
+from instrument_registry import InstrumentIdentity, resolve_instrument_identity
 from julia_bridge import (
-    holographic_feature_engine_fast as holographic_feature_engine,
+    add_target_fast as add_target,
+)
+from julia_bridge import (
+    compute_backtest_bar_state_fast,
     kalman_structural_engine_fast,
     narrative_context_engine_fast,
     rv_feature_engine_fast,
     smc_feature_engine_fast,
-    add_target_fast as add_target,
-    compute_backtest_bar_state_fast,
 )
-from data_vault.symbol_identity import extract_symbol_payload, parse_symbol_payload
-from instrument_registry import InstrumentIdentity, resolve_instrument_identity
-from numba import njit
+from julia_bridge import (
+    holographic_feature_engine_fast as holographic_feature_engine,
+)
 
 warnings.filterwarnings("ignore")
 

@@ -20,7 +20,7 @@ import hashlib
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,8 @@ from daily_ml_engine import (
     compute_macro_regime,
     holographic_feature_engine_daily,
 )
+from inference_bridge import InferenceBridge
+from instrument_registry import resolve_instrument_identity
 from julia_bridge import (
     add_target_fast,
     holographic_feature_engine_fast,
@@ -64,11 +66,9 @@ from universal_ml_engine import (
     get_artifact_paths,
     inject_thermodynamic_basis,
     merge_higher_tf,
-    prepare_symbol_artifact_context,
     prepare_intraday_thermodynamics,
+    prepare_symbol_artifact_context,
 )
-from inference_bridge import InferenceBridge
-from instrument_registry import resolve_instrument_identity
 
 DEFAULT_BASELINE_DIR = ".accuracy_baselines"
 HASH_KEYS = (
@@ -85,7 +85,7 @@ HASH_KEYS = (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def _lane_list(selected: str) -> list[str]:
@@ -106,7 +106,7 @@ def _sha256(path: str) -> str:
 
 
 def _read_feature_cols(path: str) -> list[str]:
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         return [line.strip() for line in handle if line.strip()]
 
 
@@ -151,7 +151,7 @@ def _artifact_snapshot(paths: dict[str, str]) -> dict[str, dict[str, Any]]:
             "exists": exists,
             "size_bytes": os.path.getsize(path) if exists else None,
             "mtime_utc": (
-                datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+                datetime.fromtimestamp(os.path.getmtime(path), UTC)
                 .replace(microsecond=0)
                 .isoformat()
                 if exists

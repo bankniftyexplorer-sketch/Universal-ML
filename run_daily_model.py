@@ -1,19 +1,21 @@
 # DEPRECATED: Superseded by daily_ml_engine.py + daily_backtest_engine.py.
 # Uses Python holographic engine (not Julia). Artifacts saved outside the
 # ARTIFACT_NAME_SCHEME. Do NOT use for production model generation.
-import os
 import argparse
+import os
+
+import matplotlib
 import numpy as np
 import pandas as pd
-import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import warnings
 
-from universal_ml_engine import parse_tv_log, walk_forward, _compute_atr14
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+
 from julia_bridge import holographic_feature_engine_fast as holographic_feature_engine
+from universal_ml_engine import _compute_atr14, parse_tv_log, walk_forward
 
 warnings.filterwarnings("ignore")
 
@@ -81,7 +83,9 @@ def run_backtest(
                     pnl = (
                         (exit_price - position["entry_price"]) * position["size"] * 0.5
                     )
-                    position["pnl"] += (
+                    position[
+                        "pnl"
+                    ] += (
                         pnl  # RDM-3 FIX: += not = to preserve any prior accumulated pnl
                     )
                     position["sl"] = position["entry_price"]
@@ -106,7 +110,9 @@ def run_backtest(
                     pnl = (
                         (position["entry_price"] - exit_price) * position["size"] * 0.5
                     )
-                    position["pnl"] += (
+                    position[
+                        "pnl"
+                    ] += (
                         pnl  # RDM-3 FIX: += not = to preserve any prior accumulated pnl
                     )
                     position["sl"] = position["entry_price"]

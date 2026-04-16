@@ -19,8 +19,38 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.5.1",
     "ruff==0.15.9",
 ]
 
 [tool.uv]
 default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C90",# mccabe
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+]
+ignore = [
+    "E402", # module level import not at top of file (used heavily after warnings.filterwarnings)
+    "E501", # line too long (strings in prints)
+    "E701", # multiple statements on one line (used stylistically)
+    "E741", # ambiguous variable name (e.g., l for low)
+    "F841", # unused variables (dead code/future use allowed via AGENTS)
+    "B904", # raise inside except without from
+    "B905", # zip without strict parameter
+    "B007", # loop control variable not used
+    "UP038",# use X | Y in isinstance call instead of (X, Y)
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 31

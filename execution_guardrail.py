@@ -15,7 +15,7 @@ import hashlib
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +37,7 @@ TRACKED_ARTIFACT_KEYS = (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def _baseline_path(base_dir: str, name: str) -> Path:
@@ -70,7 +70,7 @@ def _artifact_snapshot(
             "exists": exists,
             "size_bytes": os.path.getsize(path) if exists else None,
             "mtime_utc": (
-                datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+                datetime.fromtimestamp(os.path.getmtime(path), UTC)
                 .replace(microsecond=0)
                 .isoformat()
                 if exists
