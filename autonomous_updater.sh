@@ -74,30 +74,30 @@ set -e
 if [ $TEST_EXIT_CODE -ne 0 ]; then
     echo "[!] ACID TEST FAILED! Backtest crashed with new libraries."
     echo "[!] Reverting repository to original state."
-    
+
     # Switch back and nuke the corrupted branch
     git checkout "$MAIN_BRANCH"
     git branch -D "$EVAL_BRANCH"
-    
+
     # Restore the stable environment rapidly
     uv sync
-    
+
     echo "[!] Autonomous Update Aborted. Working state perfectly protected."
     exit 1
 else
     # Simple check to guarantee output makes sense
     if grep -q "PORTFOLIO SIMULATION RESULTS" /tmp/uv_ml_eval.log; then
         echo "[✓] ACID TEST PASSED. Mathematical determinism verified."
-        
+
         # We only commit if uv.lock or pyproject.toml changed
         if [ -n "$(git status --porcelain uv.lock pyproject.toml)" ]; then
             git add uv.lock pyproject.toml
             git commit -m "Autonomous Environment Update: Backtest verified [Exit 0]"
-            
+
             # Switch back to main, leaving the eval branch intact for manual long-testing
             git checkout "$MAIN_BRANCH"
             uv sync # Restore the active environment perfectly
-            
+
             echo "[✓] SYSTEM TESTED SUCESSFULLY. Updates committed to '$EVAL_BRANCH' for your manual long-test."
         else
             echo "[=] Dependencies already matching the absolute bleeding-edge. No commit necessary."

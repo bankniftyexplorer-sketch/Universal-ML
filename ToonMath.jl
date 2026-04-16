@@ -1785,23 +1785,23 @@ function add_target_loop(
             ## LONG MFE/MAE (DECOUPLED)
             sl_dist_l  = 2.0 * curr_atr
             sl_price_l = entry_price - sl_dist_l
-            
+
             # Kinematic trackers (Capped)
             peak_high_l = entry_price
             peak_low_l  = entry_price
             kin_alive_l = true
-            
+
             # True Limit trackers (Uncapped)
             uncap_peak_high_l = entry_price
             uncap_peak_low_l  = entry_price
 
             for j in entry_idx_jl:horizon_end-1
                 val_high = highs[j]; val_low = lows[j]
-                
+
                 # Uncapped Tracking (For ML Trade Plan)
                 uncap_peak_high_l = max(uncap_peak_high_l, val_high)
                 uncap_peak_low_l  = min(uncap_peak_low_l, val_low)
-                
+
                 # Kinematic Tracking (For Classifier)
                 if kin_alive_l
                     if val_low <= sl_price_l
@@ -1814,10 +1814,10 @@ function add_target_loop(
                     end
                 end
             end
-            
+
             kin_mfe_l = max(0.0, (peak_high_l - entry_price) / (curr_atr + 1e-9))
             kin_mae_l = max(0.0, (entry_price - peak_low_l)  / (curr_atr + 1e-9))
-            
+
             # Exported True Limits
             long_mfe_atr[i] = max(0.0, (uncap_peak_high_l - entry_price) / (curr_atr + 1e-9))
             long_mae_atr[i] = max(0.0, (entry_price - uncap_peak_low_l)  / (curr_atr + 1e-9))
@@ -1825,23 +1825,23 @@ function add_target_loop(
             ## SHORT MFE/MAE (DECOUPLED)
             sl_dist_s  = 2.0 * curr_atr
             sl_price_s = entry_price + sl_dist_s
-            
+
             # Kinematic trackers (Capped)
             peak_low_s  = entry_price
             peak_high_s = entry_price
             kin_alive_s = true
-            
+
             # True Limit trackers (Uncapped)
             uncap_peak_low_s  = entry_price
             uncap_peak_high_s = entry_price
 
             for j in entry_idx_jl:horizon_end-1
                 val_high = highs[j]; val_low = lows[j]
-                
+
                 # Uncapped Tracking (For ML Trade Plan)
                 uncap_peak_low_s  = min(uncap_peak_low_s, val_low)
                 uncap_peak_high_s = max(uncap_peak_high_s, val_high)
-                
+
                 # Kinematic Tracking (For Classifier)
                 if kin_alive_s
                     if val_high >= sl_price_s
@@ -1854,14 +1854,14 @@ function add_target_loop(
                     end
                 end
             end
-            
+
             kin_mfe_s = max(0.0, (entry_price - peak_low_s) / (curr_atr + 1e-9))
             kin_mae_s = max(0.0, (peak_high_s - entry_price) / (curr_atr + 1e-9))
-            
+
             # Exported True Limits
             short_mfe_atr[i] = max(0.0, (entry_price - uncap_peak_low_s) / (curr_atr + 1e-9))
             short_mae_atr[i] = max(0.0, (uncap_peak_high_s - entry_price) / (curr_atr + 1e-9))
-        
+
             # Kinetic score and target assignment
             raw_long = kin_mfe_l / (kin_mfe_l + kin_mae_l + 1e-9)
             vel_l    = 1.0 - ((long_eidx - i) / horizon)

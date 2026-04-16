@@ -336,7 +336,7 @@ def rv_feature_engine_fast(
     df_1m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Julia RV engine for 1H lane. Returns DataFrame with rv_* columns.
-    
+
     Primary: 11 features.
     Per HTF:  11 features + 1 term structure = 12.
     Total with all 3 HTFs: 11 + 3*12 = 47 columns.
@@ -377,7 +377,7 @@ def rv_feature_engine_daily(
     df_12m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Julia RV engine for 1D lane. Returns DataFrame with rv_* columns.
-    
+
     Primary: 11 features.
     Per HTF:  11 features + 1 term structure = 12.
     Total with all 5 HTFs: 11 + 5*12 = 71 columns.

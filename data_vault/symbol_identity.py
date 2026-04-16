@@ -425,9 +425,11 @@ def parse_symbol_payload(raw_payload: str) -> ParsedSymbolIdentity:
             f"Unable to normalize source symbol from payload: {payload_text}"
         )
 
-    derived_contract_kind, derived_expiry_code, pair_core_symbol = (
-        _infer_contract_signature(source_symbol)
-    )
+    (
+        derived_contract_kind,
+        derived_expiry_code,
+        pair_core_symbol,
+    ) = _infer_contract_signature(source_symbol)
     market_type = _normalize_market_type(explicit_market_type)
     contract_kind = (
         _normalize_contract_kind(explicit_contract_kind) or derived_contract_kind

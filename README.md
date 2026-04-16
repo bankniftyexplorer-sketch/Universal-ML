@@ -14,24 +14,24 @@ Universal-ML is a high-performance, deterministic research and production tradin
 
 ## 🏛 Architecture
 
-The system segregates heavy numerical compute to Julia (`ToonMath.jl`) and couples it with Python's robust Machine Learning and walk-forward orchestration layers. 
+The system segregates heavy numerical compute to Julia (`ToonMath.jl`) and couples it with Python's robust Machine Learning and walk-forward orchestration layers.
 
 ```mermaid
 graph TD
     A[(TradingView CSVs)] -->|Ingestion| B[(Data Vault SQLite)]
-    
+
     subgraph "Julia Mathematical Engine (ToonMath.jl)"
         B --> C{Holographic Geometries}
         C --> D[DNA / Grammar]
         C --> E[Spectral / Skeleton]
     end
-    
+
     subgraph "Python Machine Learning Orchestration"
         D & E -->|Feature Matrices| F[Universal ML Engine 1H / 1D]
         F --> G[Walk-Forward Validation]
         G --> H((Optimized LightGBM Model))
     end
-    
+
     subgraph "Execution & Guardrails"
         H --> I[Meta-Strategy Selector]
         I --> J[Trade Plan Generation]
