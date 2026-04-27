@@ -3220,6 +3220,285 @@ function compute_rv_features(
 end
 
 """
+    compute_vol_targets(opens, highs, lows, closes) -> NamedTuple
+
+Construct four forward-looking daily volatility/range targets.
+Each output vector has the same length as input; the last element is NaN.
+
+Targets:
+  next_yz_logvol         — log1p(sqrt(YZ_single_day_variance × 252))
+  next_log_range         — log(H_{t+1} / L_{t+1})
+  next_up_excursion      — log(H_{t+1} / O_{t+1})
+  next_dn_excursion      — log(O_{t+1} / L_{t+1})
+
+All use next-bar (t+1) OHLC. Overnight component uses C_t → O_{t+1}.
+"""
+function compute_vol_targets(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+)
+    n = length(closes)
+
+    next_yz_logvol = fill(NaN, n)
+    next_log_range = fill(NaN, n)
+    next_up_excursion = fill(NaN, n)
+    next_dn_excursion = fill(NaN, n)
+
+    if n <= 1
+        return (
+            next_yz_logvol = next_yz_logvol,
+            next_log_range = next_log_range,
+            next_up_excursion = next_up_excursion,
+            next_dn_excursion = next_dn_excursion,
+        )
+    end
+
+    @inbounds for i in 1:(n - 1)
+        c_0 = closes[i]
+        o_1 = opens[i + 1]
+        h_1 = highs[i + 1]
+        l_1 = lows[i + 1]
+        c_1 = closes[i + 1]
+
+        if c_0 <= 0.0 || o_1 <= 0.0 || h_1 <= 0.0 || l_1 <= 0.0 || c_1 <= 0.0
+            continue
+        end
+
+        overnight_var = log(o_1 / c_0)^2
+        log_hc = log(h_1 / c_1)
+        log_ho = log(h_1 / o_1)
+        log_lc = log(l_1 / c_1)
+        log_lo = log(l_1 / o_1)
+        rs_var = log_hc * log_ho + log_lc * log_lo
+        oc_var = log(c_1 / o_1)^2
+
+        yz_single_day_var = overnight_var + 0.34 * rs_var + 0.66 * oc_var
+        next_yz_logvol[i] = log1p(sqrt(max(yz_single_day_var * 252.0, 0.0)))
+        next_log_range[i] = log(h_1 / l_1)
+        next_up_excursion[i] = log(h_1 / o_1)
+        next_dn_excursion[i] = log(o_1 / l_1)
+    end
+
+    return (
+        next_yz_logvol = next_yz_logvol,
+        next_log_range = next_log_range,
+        next_up_excursion = next_up_excursion,
+        next_dn_excursion = next_dn_excursion,
+    )
+end
+
+function compute_vol_targets(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+)
+    return compute_vol_targets(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+    )
+end
+
+"""
+    compute_intraday_rv_summary(
+        opens_1h, highs_1h, lows_1h, closes_1h,
+        timestamps_ns_1h,
+        daily_timestamps_ns,
+        session_minutes,
+    ) -> Dict{String, Vector{Float64}}
+
+Aggregate 1H bars into per-day volatility summaries aligned to daily bars.
+Output vectors have length == length(daily_timestamps_ns).
+"""
+function compute_intraday_rv_summary(
+    opens_1h::Vector{Float64},
+    highs_1h::Vector{Float64},
+    lows_1h::Vector{Float64},
+    closes_1h::Vector{Float64},
+    timestamps_ns_1h::Vector{Int64},
+    daily_timestamps_ns::Vector{Int64},
+    session_minutes::Int,
+)::Dict{String, Vector{Float64}}
+    n_days = length(daily_timestamps_ns)
+    n_1h = length(timestamps_ns_1h)
+    eps = 1e-12
+    day_ns = 86400_000_000_000
+    half_session_ns = Int64(max(session_minutes, 0)) * 60_000_000_000 ÷ 2
+
+    intra_rv = zeros(Float64, n_days)
+    intra_rr = zeros(Float64, n_days)
+    intra_up_sv = zeros(Float64, n_days)
+    intra_dn_sv = zeros(Float64, n_days)
+    intra_asym = zeros(Float64, n_days)
+    intra_jump = zeros(Float64, n_days)
+    intra_vov = zeros(Float64, n_days)
+    intra_half_imb = zeros(Float64, n_days)
+    intra_trend_eff = zeros(Float64, n_days)
+
+    if n_days == 0 || n_1h == 0
+        return Dict{String, Vector{Float64}}(
+            "intra_rv" => intra_rv,
+            "intra_rr" => intra_rr,
+            "intra_up_sv" => intra_up_sv,
+            "intra_dn_sv" => intra_dn_sv,
+            "intra_asym" => intra_asym,
+            "intra_jump" => intra_jump,
+            "intra_vov" => intra_vov,
+            "intra_half_imb" => intra_half_imb,
+            "intra_trend_eff" => intra_trend_eff,
+        )
+    end
+
+    h_ptr = 1
+
+    @inbounds for i in 1:n_days
+        day_bucket = div(daily_timestamps_ns[i], day_ns)
+
+        while h_ptr <= n_1h && div(timestamps_ns_1h[h_ptr], day_ns) < day_bucket
+            h_ptr += 1
+        end
+
+        start_idx = h_ptr
+        while h_ptr <= n_1h && div(timestamps_ns_1h[h_ptr], day_ns) == day_bucket
+            h_ptr += 1
+        end
+        stop_idx = h_ptr - 1
+
+        if start_idx > stop_idx
+            continue
+        end
+
+        rv = 0.0
+        rr = 0.0
+        up_sv = 0.0
+        dn_sv = 0.0
+        first_half_var = 0.0
+        abs_ret_sum = 0.0
+        bpv_pair_sum = 0.0
+        ret2_mean = 0.0
+        ret2_m2 = 0.0
+        obs_count = 0
+        prev_abs_ret = 0.0
+        have_prev_ret = false
+        prev_valid_close = NaN
+        first_open = NaN
+        last_close = NaN
+        split_cutoff_ns = timestamps_ns_1h[start_idx] + half_session_ns
+
+        for j in start_idx:stop_idx
+            o_j = opens_1h[j]
+            h_j = highs_1h[j]
+            l_j = lows_1h[j]
+            c_j = closes_1h[j]
+            if o_j <= 0.0 || h_j <= 0.0 || l_j <= 0.0 || c_j <= 0.0
+                continue
+            end
+
+            if !isfinite(first_open)
+                first_open = o_j
+            end
+            last_close = c_j
+
+            if isfinite(prev_valid_close) && prev_valid_close > 0.0
+                ret = log(c_j / prev_valid_close)
+            else
+                ret = log(c_j / o_j)
+            end
+            prev_valid_close = c_j
+
+            ret2 = ret * ret
+            rv += ret2
+            rr += log(h_j / l_j)^2
+            abs_ret_sum += abs(ret)
+
+            if ret > 0.0
+                up_sv += ret2
+            elseif ret < 0.0
+                dn_sv += ret2
+            end
+
+            if have_prev_ret
+                bpv_pair_sum += abs(ret) * prev_abs_ret
+            end
+            prev_abs_ret = abs(ret)
+            have_prev_ret = true
+
+            obs_count += 1
+            delta = ret2 - ret2_mean
+            ret2_mean += delta / obs_count
+            ret2_m2 += delta * (ret2 - ret2_mean)
+
+            if timestamps_ns_1h[j] < split_cutoff_ns
+                first_half_var += ret2
+            end
+        end
+
+        if obs_count == 0 || !isfinite(first_open) || !isfinite(last_close)
+            continue
+        end
+
+        bpv = 0.0
+        if obs_count > 1
+            bpv = (pi / 2.0) * (bpv_pair_sum / (obs_count - 1)) * obs_count
+        end
+
+        second_half_var = max(rv - first_half_var, 0.0)
+        vov_std = sqrt(max(ret2_m2 / obs_count, 0.0))
+        trend_eff = abs(log(last_close / first_open)) / (abs_ret_sum + eps)
+
+        intra_rv[i] = rv
+        intra_rr[i] = rr
+        intra_up_sv[i] = up_sv
+        intra_dn_sv[i] = dn_sv
+        intra_asym[i] = clamp(dn_sv / (up_sv + eps), 0.1, 10.0)
+        intra_jump[i] = clamp((rv - bpv) / (rv + eps), 0.0, 1.0)
+        intra_vov[i] = clamp(vov_std / (ret2_mean + eps), 0.0, 10.0)
+        intra_half_imb[i] = clamp(
+            (first_half_var - second_half_var) / (rv + eps),
+            -1.0,
+            1.0,
+        )
+        intra_trend_eff[i] = clamp(trend_eff, 0.0, 2.0)
+    end
+
+    return Dict{String, Vector{Float64}}(
+        "intra_rv" => intra_rv,
+        "intra_rr" => intra_rr,
+        "intra_up_sv" => intra_up_sv,
+        "intra_dn_sv" => intra_dn_sv,
+        "intra_asym" => intra_asym,
+        "intra_jump" => intra_jump,
+        "intra_vov" => intra_vov,
+        "intra_half_imb" => intra_half_imb,
+        "intra_trend_eff" => intra_trend_eff,
+    )
+end
+
+function compute_intraday_rv_summary(
+    opens_1h::AbstractVector{Float64},
+    highs_1h::AbstractVector{Float64},
+    lows_1h::AbstractVector{Float64},
+    closes_1h::AbstractVector{Float64},
+    timestamps_ns_1h::AbstractVector{Int64},
+    daily_timestamps_ns::AbstractVector{Int64},
+    session_minutes::Int,
+)::Dict{String, Vector{Float64}}
+    return compute_intraday_rv_summary(
+        collect(Float64, opens_1h),
+        collect(Float64, highs_1h),
+        collect(Float64, lows_1h),
+        collect(Float64, closes_1h),
+        collect(Int64, timestamps_ns_1h),
+        collect(Int64, daily_timestamps_ns),
+        session_minutes,
+    )
+end
+
+"""
     compute_narrative_context(
         closes, atrs, regime, swing_confirm_bars,
         swing_highs_price, swing_highs_confirm,

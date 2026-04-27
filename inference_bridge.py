@@ -319,10 +319,18 @@ class InferenceBridge:
         base_symbol: str,
         asset_class: str,
         holographic_stack: dict[str, pd.DataFrame],
+        allow_fail_timeframes: tuple[str, ...] = (),
     ) -> None:
+        optional_labels = {
+            str(label).strip().upper()
+            for label in allow_fail_timeframes
+            if str(label).strip()
+        }
         for timeframe, tf_df in holographic_stack.items():
             quality = tf_df.attrs.get("data_quality")
             if self._quality_status(quality) != "FAIL":
+                continue
+            if str(timeframe).strip().upper() in optional_labels:
                 continue
 
             repair_symbol = tf_df.attrs.get("pair_symbol") or base_symbol
@@ -342,6 +350,7 @@ class InferenceBridge:
         *,
         include_realized_vol: bool = False,
         strict_gating: bool = True,
+        allow_fail_timeframes: tuple[str, ...] = (),
     ) -> dict[str, pd.DataFrame]:
         """
         Pulls the complete multi-timeframe dataset for a specific asset.
@@ -365,6 +374,7 @@ class InferenceBridge:
                     base_symbol=base_symbol,
                     asset_class=asset_class,
                     holographic_stack=holographic_stack,
+                    allow_fail_timeframes=allow_fail_timeframes,
                 )
             return holographic_stack
 

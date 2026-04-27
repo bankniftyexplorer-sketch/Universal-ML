@@ -1418,6 +1418,103 @@ def add_target_fast(
 
 
 # ─────────────────────────────────────────────────────────────
+# PUBLIC API: daily volatility targets + intraday RV summary
+# ─────────────────────────────────────────────────────────────
+
+_INTRADAY_RV_SUMMARY_COLS = [
+    "intra_rv",
+    "intra_rr",
+    "intra_up_sv",
+    "intra_dn_sv",
+    "intra_asym",
+    "intra_jump",
+    "intra_vov",
+    "intra_half_imb",
+    "intra_trend_eff",
+]
+
+
+def vol_target_engine_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Add 4 forward volatility target columns to a daily DataFrame.
+
+    Calls ToonMath.compute_vol_targets.
+    Returns the same DataFrame with 4 new columns added in-place.
+    """
+    _, TM = _init_julia()
+
+    df = df.copy()
+    result = TM.compute_vol_targets(
+        _to_f64(df["open"].to_numpy()),
+        _to_f64(df["high"].to_numpy()),
+        _to_f64(df["low"].to_numpy()),
+        _to_f64(df["close"].to_numpy()),
+    )
+
+    def _col(name: str) -> np.ndarray:
+        return np.array(getattr(result, name), dtype=np.float64)
+
+    df["next_yz_logvol"] = _col("next_yz_logvol")
+    df["next_log_range"] = _col("next_log_range")
+    df["next_up_exc"] = _col("next_up_excursion")
+    df["next_dn_exc"] = _col("next_dn_excursion")
+    return df
+
+
+def _zero_intraday_rv_summary(index: pd.Index) -> pd.DataFrame:
+    return pd.DataFrame(0.0, index=index, columns=_INTRADAY_RV_SUMMARY_COLS)
+
+
+def _infer_session_minutes_from_1h(df_1h: pd.DataFrame) -> int:
+    if df_1h.empty or "time" not in df_1h.columns:
+        return 390
+
+    dates = pd.to_datetime(df_1h["time"]).dt.normalize()
+    counts = dates.value_counts()
+    if counts.empty:
+        return 390
+
+    minutes = int(np.median(counts.to_numpy(dtype=float)) * 60.0)
+    return int(np.clip(minutes, 60, 1440))
+
+
+def intraday_rv_summary_daily(
+    df_1d: pd.DataFrame,
+    df_1h: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Aggregate 1H bars into per-day volatility summaries.
+
+    Calls ToonMath.compute_intraday_rv_summary.
+    Returns DataFrame with 9 intra_* columns, indexed like df_1d.
+    """
+    if df_1d.empty:
+        return _zero_intraday_rv_summary(df_1d.index)
+
+    if df_1h is None or len(df_1h) < 10:
+        return _zero_intraday_rv_summary(df_1d.index)
+
+    _, TM = _init_julia()
+    src_1h = df_1h.sort_values("time").reset_index(drop=True)
+    result = TM.compute_intraday_rv_summary(
+        _to_f64(src_1h["open"].to_numpy()),
+        _to_f64(src_1h["high"].to_numpy()),
+        _to_f64(src_1h["low"].to_numpy()),
+        _to_f64(src_1h["close"].to_numpy()),
+        _times_to_ns(src_1h["time"]),
+        _times_to_ns(df_1d["time"]),
+        int(_infer_session_minutes_from_1h(src_1h)),
+    )
+
+    summary = pd.DataFrame(
+        {
+            col: np.array(result[col], dtype=np.float64)
+            for col in _INTRADAY_RV_SUMMARY_COLS
+        },
+        index=df_1d.index,
+    )
+    return summary.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+# ─────────────────────────────────────────────────────────────
 # REALIZED VOLATILITY V2 — Julia-Native Multi-Estimator Surface
 # ─────────────────────────────────────────────────────────────
 

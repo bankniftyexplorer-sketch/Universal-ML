@@ -3003,6 +3003,17 @@ ARTIFACT_NAME_SCHEME = {
         "ml_report": "{prefix}_1D_ml_report.png",
         "backtest_report": "{prefix}_1D_backtest_report.png",
     },
+    "VOL": {
+        "model_logvol": "{prefix}_VOL_model_logvol.pkl",
+        "model_range": "{prefix}_VOL_model_range.pkl",
+        "model_up_exc": "{prefix}_VOL_model_up_exc.pkl",
+        "model_dn_exc": "{prefix}_VOL_model_dn_exc.pkl",
+        "features": "{prefix}_VOL_features.txt",
+        "oos_forecasts": "{prefix}_VOL_oos_forecasts.pkl",
+        "live_forecast": "{prefix}_VOL_live_forecast.json",
+        "ml_report": "{prefix}_VOL_report.png",
+        "backtest_report": "{prefix}_VOL_backtest_report.png",
+    },
 }
 
 
@@ -3028,6 +3039,17 @@ LEGACY_ARTIFACT_NAME_SCHEME = {
         "policy_artifact": "{prefix}_1D_policy_artifact.pkl",
         "ml_report": "{prefix}_daily_ml_report.png",
         "backtest_report": "{prefix}_daily_backtest_report.png",
+    },
+    "VOL": {
+        "model_logvol": "{prefix}_VOL_model_logvol.pkl",
+        "model_range": "{prefix}_VOL_model_range.pkl",
+        "model_up_exc": "{prefix}_VOL_model_up_exc.pkl",
+        "model_dn_exc": "{prefix}_VOL_model_dn_exc.pkl",
+        "features": "{prefix}_VOL_features.txt",
+        "oos_forecasts": "{prefix}_VOL_oos_forecasts.pkl",
+        "live_forecast": "{prefix}_VOL_live_forecast.json",
+        "ml_report": "{prefix}_VOL_report.png",
+        "backtest_report": "{prefix}_VOL_backtest_report.png",
     },
 }
 

@@ -205,6 +205,51 @@ Notes:
 
 ---
 
+## 3A. Generate VOL Daily Volatility Model And Reports
+
+Train the `VOL` model:
+
+```bash
+cd /home/km/Universal-ML
+uv run python daily_volatility_engine.py --symbol NIFTY --outdir /home/km/Universal-ML/
+```
+
+Run the `VOL` backtest report:
+
+```bash
+uv run python daily_volatility_backtest.py --symbol NIFTY --outdir /home/km/Universal-ML/
+```
+
+Main `VOL` output files for `NIFTY`:
+
+- `NIFTY/nifty_VOL_model_logvol.pkl`
+- `NIFTY/nifty_VOL_model_range.pkl`
+- `NIFTY/nifty_VOL_model_up_exc.pkl`
+- `NIFTY/nifty_VOL_model_dn_exc.pkl`
+- `NIFTY/nifty_VOL_features.txt`
+- `NIFTY/nifty_VOL_oos_forecasts.pkl`
+- `NIFTY/nifty_VOL_live_forecast.json`
+- `NIFTY/nifty_VOL_report.png`
+- `NIFTY/nifty_VOL_backtest_report.png`
+
+Notes:
+
+- `daily_volatility_engine.py` retrains the daily VOL regression lane and prints the latest next-day volatility forecast.
+- `daily_volatility_engine.py` treats `1H` as optional enrichment only: if `1H` quality is `FAIL`, the lane zeros the `intra_*` features and still runs on the strict daily stack.
+- `daily_volatility_backtest.py` reuses the saved VOL OOS forecast map for honest replay before falling back to final-model predictions on non-OOS bars.
+
+Refresh the saved-model live VOL forecast without retraining:
+
+```bash
+uv run python live_volatility_inference.py --symbol NIFTY --outdir /home/km/Universal-ML/
+```
+
+This updates:
+
+- `NIFTY/nifty_VOL_live_forecast.json`
+
+---
+
 ## 4. Generate 1H Intraday Model And Reports
 
 Train the `1H` model:

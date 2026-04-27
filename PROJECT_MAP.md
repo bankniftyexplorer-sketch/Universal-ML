@@ -12,6 +12,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 - Active production lanes:
   - `1H` intraday lane
   - `1D` daily lane
+  - `VOL` daily volatility/range lane
 - Storage:
   - canonical market data DB: `data_vault/ohlcv.db`
   - optional local custom Yahoo alias registry: `data_vault/custom_yahoo_instruments.json`
@@ -27,6 +28,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
   - realized-volatility surface features
   - narrative-context awareness features
 - Both active lanes now inject Julia-native realized-volatility surfaces and narrative-context awareness through `julia_bridge.py`.
+- The `VOL` daily volatility lane can optionally enrich itself with `1H` intraday RV summaries, but a failed `1H` quality row no longer blocks the lane; it zeros those features and continues on the strict daily stack.
 - The raw `realized_volatility` series from the vault remains state only and is excluded from feature selection.
 - Feature math lives in Julia kernels, called from Python bridges.
 - `julia_bridge.py` is the only supported Python interface to `ToonMath.jl`, and it shifts higher-timeframe timestamps to bar-close availability before Julia dispatch or Python-side HTF projection mapping.
@@ -50,8 +52,11 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `inference_bridge.py` | Reads DB, attaches `data_quality`, and enforces the strict runtime gate on `FAIL` quality by default | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants, nested consensus feature selection, ensemble model wrapper, and probability calibration | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer with the same nested-selection, ensemble, and calibration contract | You care about the daily core |
+| `daily_volatility_engine.py` | `VOL` trainer with HAR-RV baseline comparison | You care about daily vol/range forecasting |
 | `backtest_engine.py` | `1H` backtest/report generator | You care about intraday replay and equity curve |
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
+| `daily_volatility_backtest.py` | `VOL` backtest/coverage reporter | You care about vol forecast replay |
+| `live_volatility_inference.py` | `VOL` live forecast publisher that writes projected high/low levels to JSON from saved VOL heads | You care about dashboard-ready daily vol levels without retraining |
 | `live_inference.py` | Fast `1H` signal path without retraining | You care about current live signal |
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
 | `sleeve_registry.py` | Builds the cross-symbol sleeve admission registry from honest replay metrics and chooses `base` vs `policy` execution per symbol/lane | You want deployable sleeve selection |
@@ -168,6 +173,19 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 22. `sleeve_registry.py` writes the daily sleeve admission verdict into the shared registry, and `daily_backtest_engine.py` now obeys that verdict before replay.
 23. `accuracy_guardrail.py` can reconstruct the same `1D` model-ready frame from the DB and score the saved OOS probability map, including the saved calibrator when present, without retraining.
 
+### `VOL` daily volatility lane
+
+1. Same data loading as the `1D` lane via `InferenceBridge`.
+2. Same feature families: RV surface, holographic, SMC, Kalman, narrative context, and macro regime overlays.
+3. `julia_bridge.intraday_rv_summary_daily()` additionally injects 9 session-aggregated `1H` volatility features when hourly data exists and passes quality; otherwise those columns are zeroed and the lane continues.
+4. `julia_bridge.vol_target_engine_daily()` creates 4 forward regression targets: next-day YZ log-vol, log-range, up-excursion, and down-excursion.
+5. Consensus feature selection keeps a shared 40-feature budget, using `next_yz_logvol` as the primary ranking target.
+6. `daily_volatility_engine.py` runs expanding walk-forward regression validation with per-fold HAR-RV baseline comparison.
+7. The lane trains 4 separate LightGBM ensemble heads that all reuse the same consensus feature set.
+8. Artifacts are saved under `<SYMBOL>/` with the `VOL` naming scheme, including a latest live-forecast JSON payload with projected high/low levels.
+9. `live_volatility_inference.py` rebuilds the latest VOL feature frame from saved artifacts without retraining and refreshes the dashboard-facing JSON payload.
+10. `daily_volatility_backtest.py` replays the saved VOL artifacts, restores honest OOS forecasts from disk, and reports excursion-band coverage metrics.
+
 ## Data contracts
 
 ### Database
@@ -238,6 +256,18 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_1D_policy_artifact.pkl`
 - `{symbol}_1D_ml_report.png`
 - `{symbol}_1D_backtest_report.png`
+
+### `VOL`
+
+- `{symbol}_VOL_model_logvol.pkl`
+- `{symbol}_VOL_model_range.pkl`
+- `{symbol}_VOL_model_up_exc.pkl`
+- `{symbol}_VOL_model_dn_exc.pkl`
+- `{symbol}_VOL_features.txt`
+- `{symbol}_VOL_oos_forecasts.pkl`
+- `{symbol}_VOL_live_forecast.json`
+- `{symbol}_VOL_report.png`
+- `{symbol}_VOL_backtest_report.png`
 
 ### Local verification baselines
 
