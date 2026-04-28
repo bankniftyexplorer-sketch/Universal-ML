@@ -84,6 +84,8 @@ YAHOO_INSTRUMENTS: dict[str, YahooInstrument] = {
     "SPX500": YahooInstrument("SPX500", "^GSPC", "USD"),
     "SP500": YahooInstrument("SPX500", "^GSPC", "USD"),
     "^GSPC": YahooInstrument("SPX500", "^GSPC", "USD"),
+    "VIX": YahooInstrument("VIX", "^VIX", "USD"),
+    "^VIX": YahooInstrument("VIX", "^VIX", "USD"),
     "BTC": YahooInstrument("BTC", "BTC-USD", "USD"),
     "ETH": YahooInstrument("ETH", "ETH-USD", "USD"),
     "BNB": YahooInstrument("BNB", "BNB-USD", "USD"),
@@ -94,6 +96,9 @@ YAHOO_INSTRUMENTS: dict[str, YahooInstrument] = {
     "ADA": YahooInstrument("ADA", "ADA-USD", "USD"),
     "BCH": YahooInstrument("BCH", "BCH-USD", "USD"),
     "LINK": YahooInstrument("LINK", "LINK-USD", "USD"),
+    "INDIA_VIX": YahooInstrument("INDIA_VIX", "^INDIAVIX", "INR"),
+    "^INDIAVIX": YahooInstrument("INDIA_VIX", "^INDIAVIX", "INR"),
+    "INDIAVIX": YahooInstrument("INDIA_VIX", "^INDIAVIX", "INR"),
 }
 CORE_WATCHLIST_SYMBOLS = (
     "NIFTY",

@@ -37,6 +37,8 @@ from julia_bridge import (
     narrative_context_engine_daily,
     rv_feature_engine_daily,
     smc_feature_engine_daily,
+    vix_feature_engine_daily,
+    vix_interaction_features,
     vol_target_engine_daily,
 )
 from universal_ml_engine import (
@@ -193,6 +195,7 @@ def _qlike_loss(
 def _qlike_objective(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    weight: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     residual = np.clip(
         np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float), -10.0, 10.0
@@ -200,12 +203,17 @@ def _qlike_objective(
     exp_r = np.exp(residual)
     grad = 1.0 - exp_r
     hess = np.maximum(exp_r, 0.01)
+    if weight is not None:
+        w = np.asarray(weight, dtype=float)
+        grad = grad * w
+        hess = hess * w
     return grad, hess
 
 
 def _qlike_eval_metric(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    weight: np.ndarray | None = None,
 ) -> tuple[str, float, bool]:
     return "qlike", _qlike_loss(y_true, y_pred), False
 
@@ -230,18 +238,24 @@ def _huber_loss(
 def _huber_objective(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    delta: float = VOL_HUBER_DELTA,
+    weight: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    delta = VOL_HUBER_DELTA
     err = np.asarray(y_pred, dtype=float) - np.asarray(y_true, dtype=float)
     abs_err = np.abs(err)
     grad = np.where(abs_err <= delta, err, delta * np.sign(err))
     hess = np.where(abs_err <= delta, 1.0, 0.01)
+    if weight is not None:
+        w = np.asarray(weight, dtype=float)
+        grad = grad * w
+        hess = hess * w
     return grad, hess
 
 
 def _huber_eval_metric(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    weight: np.ndarray | None = None,
 ) -> tuple[str, float, bool]:
     return "huber", _huber_loss(y_true, y_pred), False
 
@@ -774,12 +788,15 @@ def enrich_vol_oos_frame(
 def compute_vol_forecast_confidence(
     row: pd.Series,
     intraday_1h_used: bool,
+    vix_available: bool,
     conformal_artifact: dict[str, object] | None,
     *,
     predicted_logvol: float | None = None,
 ) -> tuple[float, dict[str, float]]:
     artifact = conformal_artifact if isinstance(conformal_artifact, dict) else {}
-    f_avail = 1.0 if intraday_1h_used else 0.80
+    f_intra = 1.0 if intraday_1h_used else 0.80
+    f_vix = 1.0 if vix_available else 0.85
+    f_avail = min(f_intra, f_vix)
 
     vov = float(row.get("rv_1d_vov", 0.5))
     f_regime = float(np.clip(1.0 - max(0.0, vov - 1.0) / 3.0, 0.4, 1.0))
@@ -797,6 +814,8 @@ def compute_vol_forecast_confidence(
     confidence = float(min(f_avail, f_regime, f_extremity))
     return confidence, {
         "feature_availability": float(f_avail),
+        "intraday_1h_availability": float(f_intra),
+        "vix_availability": float(f_vix),
         "regime_stability": float(f_regime),
         "prediction_extremity": float(f_extremity),
         "prediction_extremity_z": float(z_score),
@@ -836,6 +855,7 @@ def build_vol_forecast_payload(
     row: pd.Series,
     forecasts: dict[str, float],
     intraday_1h_used: bool,
+    vix_available: bool,
     reference_price: float | None = None,
     reference_price_source: str = "latest_close",
     raw_forecasts: dict[str, float] | None = None,
@@ -852,6 +872,7 @@ def build_vol_forecast_payload(
     confidence, confidence_factors = compute_vol_forecast_confidence(
         row,
         intraday_1h_used,
+        vix_available,
         conformal_artifact,
         predicted_logvol=forecasts.get("next_yz_logvol"),
     )
@@ -888,6 +909,7 @@ def build_vol_forecast_payload(
         "reference_price": ref_price,
         "reference_price_source": reference_price_source,
         "intraday_1h_used": bool(intraday_1h_used),
+        "vix_available": bool(vix_available),
         "forecast_confidence": confidence,
         "confidence_factors": confidence_factors,
         "yz_logvol": float(forecasts["next_yz_logvol"]),
@@ -912,6 +934,10 @@ def build_vol_forecast_payload(
         "projected_low_5d": float(ref_price / dn_mult_5d),
         "vol_5d_1d_ratio": float(sigma_5d / max(sigma_1d, 1e-6)),
         "intervals": intervals,
+        "projected_peak": projected_high_90,
+        "projected_bottom": projected_low_90,
+        "projected_peak_5d": projected_high_5d_90,
+        "projected_bottom_5d": projected_low_5d_90,
         "projected_high_90": projected_high_90,
         "projected_low_90": projected_low_90,
         "projected_high_5d_90": projected_high_5d_90,
@@ -972,12 +998,12 @@ def print_vol_forecast(
     print(f"  Projected High:    {payload['projected_high']:,.2f}")
     print(f"  Projected Low:     {payload['projected_low']:,.2f}")
     if (
-        payload.get("projected_high_90") is not None
-        and payload.get("projected_low_90") is not None
+        payload.get("projected_peak") is not None
+        and payload.get("projected_bottom") is not None
     ):
         print(
-            f"  90% High/Low:      {payload['projected_high_90']:,.2f} / "
-            f"{payload['projected_low_90']:,.2f}"
+            f"  90% Peak/Bottom:   {payload['projected_peak']:,.2f} / "
+            f"{payload['projected_bottom']:,.2f}"
         )
     print(
         f"  5D Annualized Vol: {payload['annualized_vol_pct_5d']:.1f}%  "
@@ -988,12 +1014,12 @@ def print_vol_forecast(
         f"{payload['projected_low_5d']:,.2f}"
     )
     if (
-        payload.get("projected_high_5d_90") is not None
-        and payload.get("projected_low_5d_90") is not None
+        payload.get("projected_peak_5d") is not None
+        and payload.get("projected_bottom_5d") is not None
     ):
         print(
-            f"  5D 90% High/Low:   {payload['projected_high_5d_90']:,.2f} / "
-            f"{payload['projected_low_5d_90']:,.2f}"
+            f"  5D 90% Peak/Bottom:{payload['projected_peak_5d']:,.2f} / "
+            f"{payload['projected_bottom_5d']:,.2f}"
         )
     if not payload.get("intraday_1h_used", False):
         print(
@@ -1034,6 +1060,7 @@ def fetch_vol_timeframe_context(
         if df_1h_status == "FAIL" or df_1h_raw is None or df_1h_raw.empty
         else df_1h_raw
     )
+    df_vix = bridge.fetch_vix_series(market_data_symbol)
     return {
         "tf_maps": tf_maps,
         "primary_frames": primary_frames,
@@ -1041,6 +1068,7 @@ def fetch_vol_timeframe_context(
         "df_1h": df_1h,
         "df_1h_raw": df_1h_raw,
         "df_1h_status": df_1h_status,
+        "df_vix": df_vix,
     }
 
 
@@ -1049,6 +1077,7 @@ def build_daily_volatility_feature_frame(
     *,
     reference_1d: pd.DataFrame | None = None,
     df_1h: pd.DataFrame | None = None,
+    df_vix: pd.DataFrame | None = None,
     df_1w: pd.DataFrame | None = None,
     df_1m: pd.DataFrame | None = None,
     df_3m: pd.DataFrame | None = None,
@@ -1100,6 +1129,24 @@ def build_daily_volatility_feature_frame(
         df_full[col] = intra_df[col].values
     df_full["intra_available"] = 1.0 if df_1h is not None and not df_1h.empty else 0.0
     log(f"  [TOON VOL] Intraday RV features injected: {len(intra_df.columns)} columns")
+
+    log("  [TOON VOL] Layer 1f: Implied Volatility (VIX) features...")
+    if df_vix is None or df_vix.empty:
+        log(
+            "  [TOON VOL] VIX companion unavailable or failed quality; "
+            "vix_* features will be zeroed."
+        )
+    vix_df = vix_feature_engine_daily(df_1d_labelled, df_vix)
+    for col in vix_df.columns:
+        df_full[col] = vix_df[col].values
+    vix_interact = vix_interaction_features(df_full)
+    for col in vix_interact.columns:
+        df_full[col] = vix_interact[col].values
+    df_full["vix_available"] = 1.0 if df_vix is not None and not df_vix.empty else 0.0
+    log(
+        "  [TOON VOL] VIX features injected: "
+        f"{len(vix_df.columns) + len(vix_interact.columns)} columns"
+    )
 
     log("  [TOON VOL] Layer 2: Injecting macro regime overlays (6M/12M)...")
     df_full = inject_macro_regime(df_full, df_6m, "6m")
@@ -1745,6 +1792,7 @@ def main() -> None:
     df_1h = tf_ctx["df_1h"]
     df_1h_raw = tf_ctx["df_1h_raw"]
     df_1h_status = tf_ctx["df_1h_status"]
+    df_vix = tf_ctx["df_vix"]
     df_1w = primary_frames["1W"]
     df_1m = primary_frames["1M"]
     df_3m = primary_frames["3M"]
@@ -1763,6 +1811,11 @@ def main() -> None:
                 f"[OPTIONAL {df_1h_status or 'UNKNOWN'} -> ignored]"
             )
             _print_tf_span("1H", df_1h_raw)
+    if df_vix is not None and not df_vix.empty:
+        print(f"  VIX companion    : {describe_selected_frame(df_vix)}")
+        _print_tf_span("VIX", df_vix)
+    else:
+        print("  VIX companion    : [OPTIONAL unavailable -> ignored]")
     if df_1w is not None and not df_1w.empty:
         print(f"  1W primary lane : {describe_selected_frame(df_1w)}")
     _print_tf_span("1W", df_1w)
@@ -1783,6 +1836,7 @@ def main() -> None:
         df_1d,
         reference_1d=reference_frames["1D"],
         df_1h=df_1h,
+        df_vix=df_vix,
         df_1w=df_1w,
         df_1m=df_1m,
         df_3m=df_3m,
@@ -1929,6 +1983,7 @@ def main() -> None:
         row=last_row,
         forecasts=latest_forecasts,
         intraday_1h_used=df_1h is not None and not df_1h.empty,
+        vix_available=df_vix is not None and not df_vix.empty,
         reference_price=reference_price,
         reference_price_source=reference_source,
         raw_forecasts=latest_ml_forecasts,

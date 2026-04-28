@@ -40,6 +40,21 @@ from daily_ml_engine import (
     compute_macro_regime,
     holographic_feature_engine_daily,
 )
+from daily_volatility_engine import (
+    VOL_ALL_TARGETS,
+    VOL_MIN_TRAIN_BARS,
+    VOL_N_SPLITS,
+    VOL_PURGE_GAP,
+    VOL_QLIKE_TARGETS,
+    VOL_TARGET_LABELS,
+    _qlike_loss,
+    _regression_metrics,
+    build_daily_volatility_feature_frame,
+    build_har_oos_series,
+    enrich_vol_oos_frame,
+    fetch_vol_timeframe_context,
+    prepare_vol_model_ready,
+)
 from inference_bridge import InferenceBridge
 from instrument_registry import resolve_instrument_identity
 from julia_bridge import (
@@ -75,10 +90,22 @@ HASH_KEYS = (
     "model",
     "features",
     "oos_proba",
+    "oos_forecasts",
     "calibrator",
+    "calibrators",
+    "conformal",
     "trade_plan_models",
+    "model_logvol",
+    "model_range",
+    "model_up_exc",
+    "model_dn_exc",
+    "model_5d_logvol",
+    "model_5d_range",
+    "model_5d_up_exc",
+    "model_5d_dn_exc",
     "exit_surface",
     "policy_artifact",
+    "live_forecast",
     "ml_report",
     "backtest_report",
 )
@@ -89,7 +116,7 @@ def _utc_now() -> str:
 
 
 def _lane_list(selected: str) -> list[str]:
-    return ["1H", "1D"] if selected == "all" else [selected]
+    return ["1H", "1D", "VOL"] if selected == "all" else [selected]
 
 
 def _baseline_path(base_dir: str, symbol: str) -> Path:
@@ -427,6 +454,233 @@ def _build_1d_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
     return df_model_ready.dropna(subset=all_holo_cols).reset_index(drop=True)
 
 
+def _build_vol_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
+    bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
+    tf_ctx = fetch_vol_timeframe_context(bridge, symbol)
+    primary_frames = tf_ctx["primary_frames"]
+    reference_frames = tf_ctx["reference_frames"]
+    df_1d = primary_frames["1D"]
+    if df_1d is None or df_1d.empty:
+        raise ValueError(f"No usable 1D primary data found for {symbol}.")
+
+    df_feature_frame = build_daily_volatility_feature_frame(
+        df_1d,
+        reference_1d=reference_frames["1D"],
+        df_1h=tf_ctx["df_1h"],
+        df_vix=tf_ctx["df_vix"],
+        df_1w=primary_frames["1W"],
+        df_1m=primary_frames["1M"],
+        df_3m=primary_frames["3M"],
+        df_6m=primary_frames["6M"],
+        df_12m=primary_frames["12M"],
+        logger=None,
+    )
+    df_model_ready, _ = prepare_vol_model_ready(df_feature_frame)
+    return df_model_ready
+
+
+def _metric_worsened(current: float | None, baseline: float | None, tol: float) -> bool:
+    if baseline is None or current is None:
+        return False
+    return float(current) - tol > float(baseline)
+
+
+def _mean_metric(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return float("nan")
+    return float(np.nanmean(arr))
+
+
+def _winkler_score(
+    actual: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    level: float,
+) -> float:
+    alpha = 1.0 - float(level)
+    winkler = hi - lo
+    below = actual < lo
+    above = actual > hi
+    if below.any():
+        winkler[below] += (2.0 / alpha) * (lo[below] - actual[below])
+    if above.any():
+        winkler[above] += (2.0 / alpha) * (actual[above] - hi[above])
+    return float(np.mean(winkler))
+
+
+def _score_saved_vol_oos(
+    df: pd.DataFrame,
+    oos_forecast_map: dict[Any, Any],
+    *,
+    conformal_artifact: dict[str, Any] | None = None,
+    calibrators: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    active_targets = [target for target in VOL_ALL_TARGETS if target in df.columns]
+    if not active_targets:
+        raise ValueError("No VOL targets available in reconstructed model-ready frame.")
+
+    replay_df = df[["time", *active_targets]].copy()
+    for target in active_targets:
+        replay_df[f"pred_{target}"] = np.nan
+
+    saved_map = {
+        pd.Timestamp(ts): payload
+        for ts, payload in (oos_forecast_map or {}).items()
+        if isinstance(payload, dict)
+    }
+    is_oos = np.zeros(len(replay_df), dtype=bool)
+    for idx, ts in enumerate(replay_df["time"]):
+        payload = saved_map.get(pd.Timestamp(ts))
+        if not isinstance(payload, dict):
+            continue
+        is_oos[idx] = True
+        for target in active_targets:
+            value = payload.get(target)
+            if value is not None:
+                replay_df.at[idx, f"pred_{target}"] = float(value)
+    replay_df["is_oos"] = is_oos
+
+    har_models = (
+        conformal_artifact.get("har_models", {})
+        if isinstance(conformal_artifact, dict)
+        else {}
+    )
+    for target in active_targets:
+        replay_df[f"har_{target}"] = build_har_oos_series(
+            df,
+            target,
+            n_splits=VOL_N_SPLITS,
+            min_train_bars=VOL_MIN_TRAIN_BARS,
+            purge_gap=VOL_PURGE_GAP,
+            har_model=har_models.get(target),
+        )
+
+    replay_df = enrich_vol_oos_frame(
+        replay_df,
+        conformal_artifact,
+        calibrators=calibrators,
+        targets=active_targets,
+    )
+    report_scope = replay_df[replay_df["is_oos"]].copy()
+    if report_scope.empty:
+        raise ValueError("Saved VOL OOS forecast map produced zero matched bars.")
+
+    target_metrics: dict[str, dict[str, Any]] = {}
+    mae_values: list[float] = []
+    rmse_values: list[float] = []
+    edge_values: list[float] = []
+    qlike_values: list[float] = []
+    qlike_edge_values: list[float] = []
+    picp_abs_errors: list[float] = []
+
+    for target in active_targets:
+        pred_col = (
+            f"final_pred_{target}"
+            if f"final_pred_{target}" in report_scope.columns
+            else f"pred_{target}"
+        )
+        actual = report_scope[target].to_numpy(dtype=float)
+        pred = report_scope[pred_col].to_numpy(dtype=float)
+        mask = np.isfinite(actual) & np.isfinite(pred)
+        sample_size = int(mask.sum())
+
+        mae, rmse = _regression_metrics(actual[mask], pred[mask])
+        bias = (
+            float(np.mean(pred[mask] - actual[mask])) if sample_size else float("nan")
+        )
+        har_pred = report_scope.get(
+            f"har_{target}",
+            pd.Series(np.nan, index=report_scope.index),
+        ).to_numpy(dtype=float)
+        har_mask = mask & np.isfinite(har_pred)
+        har_mae, har_rmse = _regression_metrics(actual[har_mask], har_pred[har_mask])
+        edge_vs_har = (
+            float(1.0 - (mae / har_mae))
+            if np.isfinite(mae) and np.isfinite(har_mae) and har_mae > 0.0
+            else float("nan")
+        )
+
+        target_row: dict[str, Any] = {
+            "sample_size": sample_size,
+            "mae": mae,
+            "rmse": rmse,
+            "bias": bias,
+            "har_mae": har_mae,
+            "har_rmse": har_rmse,
+            "edge_vs_har": edge_vs_har,
+        }
+
+        if np.isfinite(mae):
+            mae_values.append(mae)
+        if np.isfinite(rmse):
+            rmse_values.append(rmse)
+        if np.isfinite(edge_vs_har):
+            edge_values.append(edge_vs_har)
+
+        if target in VOL_QLIKE_TARGETS:
+            qlike = _qlike_loss(actual[mask], pred[mask])
+            har_qlike = _qlike_loss(actual[har_mask], har_pred[har_mask])
+            qlike_edge_vs_har = (
+                float(1.0 - (qlike / har_qlike))
+                if np.isfinite(qlike) and np.isfinite(har_qlike) and har_qlike > 0.0
+                else float("nan")
+            )
+            target_row["qlike"] = qlike
+            target_row["har_qlike"] = har_qlike
+            target_row["qlike_edge_vs_har"] = qlike_edge_vs_har
+            if np.isfinite(qlike):
+                qlike_values.append(qlike)
+            if np.isfinite(qlike_edge_vs_har):
+                qlike_edge_values.append(qlike_edge_vs_har)
+
+        lo_col = f"interval_lo_90_{target}"
+        hi_col = f"interval_hi_90_{target}"
+        if lo_col in report_scope.columns and hi_col in report_scope.columns:
+            lo = report_scope[lo_col].to_numpy(dtype=float)
+            hi = report_scope[hi_col].to_numpy(dtype=float)
+            interval_mask = mask & np.isfinite(lo) & np.isfinite(hi)
+            if interval_mask.any():
+                picp = float(
+                    np.mean(
+                        (actual[interval_mask] >= lo[interval_mask])
+                        & (actual[interval_mask] <= hi[interval_mask])
+                    )
+                )
+                mpiw = float(np.mean(hi[interval_mask] - lo[interval_mask]))
+                winkler = _winkler_score(
+                    actual[interval_mask],
+                    lo[interval_mask].copy(),
+                    hi[interval_mask].copy(),
+                    0.90,
+                )
+                picp_abs_error = abs(picp - 0.90)
+                target_row["picp_90"] = picp
+                target_row["mpiw_90"] = mpiw
+                target_row["winkler_90"] = winkler
+                target_row["picp_90_abs_error"] = picp_abs_error
+                picp_abs_errors.append(picp_abs_error)
+
+        target_metrics[target] = target_row
+
+    saved_oos_bars = len(saved_map)
+    matched_bars = int(report_scope.shape[0])
+    return {
+        "split_count": VOL_N_SPLITS,
+        "oos_prediction_bars": matched_bars,
+        "total_validation_bars": saved_oos_bars,
+        "missing_oos_bars": max(saved_oos_bars - matched_bars, 0),
+        "oos_coverage": float(matched_bars / max(saved_oos_bars, 1)),
+        "overall_mae": _mean_metric(mae_values),
+        "overall_rmse": _mean_metric(rmse_values),
+        "overall_edge_vs_har": _mean_metric(edge_values),
+        "overall_qlike": _mean_metric(qlike_values),
+        "overall_qlike_edge_vs_har": _mean_metric(qlike_edge_values),
+        "overall_picp_90_abs_error": _mean_metric(picp_abs_errors),
+        "target_metrics": target_metrics,
+    }
+
+
 def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, Any]:
     artifact_ctx = prepare_symbol_artifact_context(
         data_dir,
@@ -441,21 +695,22 @@ def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, A
     artifact_paths = get_artifact_paths(symbol_dir, file_prefix, lane)
 
     features_path = artifact_paths["features"]
-    oos_path = artifact_paths["oos_proba"]
+    oos_key = "oos_forecasts" if lane == "VOL" else "oos_proba"
+    oos_path = artifact_paths[oos_key]
     if not os.path.exists(features_path):
         raise FileNotFoundError(f"Missing features file for {lane}: {features_path}")
     if not os.path.exists(oos_path):
-        raise FileNotFoundError(f"Missing OOS probability map for {lane}: {oos_path}")
+        raise FileNotFoundError(f"Missing OOS artifact for {lane}: {oos_path}")
 
     feature_cols = _read_feature_cols(features_path)
     oos_map = joblib.load(oos_path)
-    calibrator_path = artifact_paths.get("calibrator")
-    calibrator = (
-        joblib.load(calibrator_path)
-        if calibrator_path and os.path.exists(calibrator_path)
-        else None
-    )
     if lane == "1H":
+        calibrator_path = artifact_paths.get("calibrator")
+        calibrator = (
+            joblib.load(calibrator_path)
+            if calibrator_path and os.path.exists(calibrator_path)
+            else None
+        )
         df_model_ready = _build_1h_model_ready(data_dir, symbol)
         metrics = _score_saved_oos(
             df_model_ready,
@@ -467,7 +722,13 @@ def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, A
             test_size_ratio=0.15,
             n_splits=10,
         )
-    else:
+    elif lane == "1D":
+        calibrator_path = artifact_paths.get("calibrator")
+        calibrator = (
+            joblib.load(calibrator_path)
+            if calibrator_path and os.path.exists(calibrator_path)
+            else None
+        )
         df_model_ready = _build_1d_model_ready(data_dir, symbol)
         metrics = _score_saved_oos(
             df_model_ready,
@@ -479,11 +740,37 @@ def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, A
             test_size_ratio=TEST_SIZE_RATIO_DAILY,
             n_splits=10,
         )
+    else:
+        calibrators_path = artifact_paths.get("calibrators")
+        calibrators = (
+            joblib.load(calibrators_path)
+            if calibrators_path and os.path.exists(calibrators_path)
+            else {}
+        )
+        conformal_path = artifact_paths.get("conformal")
+        conformal_artifact = (
+            joblib.load(conformal_path)
+            if conformal_path and os.path.exists(conformal_path)
+            else None
+        )
+        df_model_ready = _build_vol_model_ready(data_dir, symbol)
+        metrics = _score_saved_vol_oos(
+            df_model_ready,
+            oos_map,
+            conformal_artifact=conformal_artifact,
+            calibrators=calibrators,
+        )
+        metrics["missing_feature_count"] = int(
+            sum(1 for col in feature_cols if col not in df_model_ready.columns)
+        )
 
     metrics["feature_count"] = len(feature_cols)
     metrics["frame_rows"] = len(df_model_ready)
-    metrics["target_up_mean"] = float(df_model_ready["target"].mean())
-    metrics["purge_gap"] = PURGE_GAP_DAILY if lane == "1D" else 24
+    if lane != "VOL":
+        metrics["target_up_mean"] = float(df_model_ready["target"].mean())
+    metrics["purge_gap"] = (
+        VOL_PURGE_GAP if lane == "VOL" else PURGE_GAP_DAILY if lane == "1D" else 24
+    )
 
     return {
         "lane": lane,
@@ -494,6 +781,45 @@ def _capture_lane_snapshot(data_dir: str, symbol: str, lane: str) -> dict[str, A
 
 
 def _print_lane_metrics(symbol: str, lane: str, metrics: dict[str, Any]) -> None:
+    if lane == "VOL":
+        qlike_text = (
+            f"{metrics['overall_qlike']:.4f}"
+            if np.isfinite(float(metrics.get("overall_qlike", np.nan)))
+            else "NA"
+        )
+        edge_text = (
+            f"{metrics['overall_edge_vs_har']:+.1%}"
+            if np.isfinite(float(metrics.get("overall_edge_vs_har", np.nan)))
+            else "NA"
+        )
+        print(
+            f"[{symbol} VOL] mae={metrics['overall_mae']:.4f} "
+            f"rmse={metrics['overall_rmse']:.4f} "
+            f"qlike={qlike_text} "
+            f"edge={edge_text} "
+            f"coverage={metrics['oos_coverage']:.1%} "
+            f"features={metrics['feature_count']} "
+            f"oos_bars={metrics['oos_prediction_bars']}/{metrics['total_validation_bars']} "
+            f"missing_features={metrics.get('missing_feature_count', 0)}"
+        )
+        for target in VOL_ALL_TARGETS:
+            target_metrics = metrics.get("target_metrics", {}).get(target)
+            if not isinstance(target_metrics, dict):
+                continue
+            summary = (
+                f"  [{VOL_TARGET_LABELS.get(target, target)}] "
+                f"mae={target_metrics.get('mae', float('nan')):.4f} "
+                f"rmse={target_metrics.get('rmse', float('nan')):.4f}"
+            )
+            if "qlike" in target_metrics:
+                summary += f" qlike={target_metrics['qlike']:.4f}"
+            if np.isfinite(float(target_metrics.get("edge_vs_har", np.nan))):
+                summary += f" edge={target_metrics['edge_vs_har']:+.1%}"
+            if np.isfinite(float(target_metrics.get("picp_90", np.nan))):
+                summary += f" picp90={target_metrics['picp_90']:.1%}"
+            print(summary)
+        return
+
     print(
         f"[{symbol} {lane}] acc={metrics['overall_accuracy']:.3f} "
         f"hc_acc={metrics['overall_high_conf_accuracy'] if metrics['overall_high_conf_accuracy'] is not None else 'NA'} "
@@ -515,7 +841,7 @@ def capture_baseline(args: argparse.Namespace) -> int:
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
 
     snapshot = {
-        "schema_version": 1,
+        "schema_version": 2,
         "symbol": resolve_instrument_identity(args.symbol).canonical_symbol,
         "outdir": os.path.abspath(args.outdir),
         "captured_at_utc": _utc_now(),
@@ -603,6 +929,99 @@ def compare_baseline(args: argparse.Namespace) -> int:
         else:
             print(f"[compare] {lane} artifact identity: {run_status}")
 
+        if lane == "VOL":
+            if (
+                current_metrics["oos_coverage"] + args.metric_tolerance
+                < base_metrics["oos_coverage"]
+            ):
+                failures.append(
+                    f"{lane}: OOS coverage regressed "
+                    f"{current_metrics['oos_coverage']:.3f} < {base_metrics['oos_coverage']:.3f}"
+                )
+            if current_metrics.get("missing_feature_count", 0) > base_metrics.get(
+                "missing_feature_count", 0
+            ):
+                failures.append(
+                    f"{lane}: missing_feature_count increased "
+                    f"{current_metrics.get('missing_feature_count', 0)} > "
+                    f"{base_metrics.get('missing_feature_count', 0)}"
+                )
+            for metric_key in (
+                "overall_mae",
+                "overall_rmse",
+                "overall_qlike",
+                "overall_picp_90_abs_error",
+            ):
+                if _metric_worsened(
+                    current_metrics.get(metric_key),
+                    base_metrics.get(metric_key),
+                    args.metric_tolerance,
+                ):
+                    failures.append(
+                        f"{lane}: {metric_key} regressed "
+                        f"{current_metrics.get(metric_key):.4f} > "
+                        f"{base_metrics.get(metric_key):.4f}"
+                    )
+            for metric_key in (
+                "overall_edge_vs_har",
+                "overall_qlike_edge_vs_har",
+            ):
+                if _metric_regressed(
+                    current_metrics.get(metric_key),
+                    base_metrics.get(metric_key),
+                    args.metric_tolerance,
+                ):
+                    failures.append(
+                        f"{lane}: {metric_key} regressed "
+                        f"{current_metrics.get(metric_key):+.4f} < "
+                        f"{base_metrics.get(metric_key):+.4f}"
+                    )
+
+            base_target_metrics = base_metrics.get("target_metrics", {})
+            current_target_metrics = current_metrics.get("target_metrics", {})
+            for target, base_target in base_target_metrics.items():
+                current_target = current_target_metrics.get(target)
+                if not isinstance(current_target, dict):
+                    failures.append(f"{lane}: missing target metrics for {target}")
+                    continue
+                for metric_key in ("mae", "rmse", "qlike", "picp_90_abs_error"):
+                    if metric_key not in base_target:
+                        continue
+                    if _metric_worsened(
+                        current_target.get(metric_key),
+                        base_target.get(metric_key),
+                        args.metric_tolerance,
+                    ):
+                        failures.append(
+                            f"{lane}: {target} {metric_key} regressed "
+                            f"{current_target.get(metric_key):.4f} > "
+                            f"{base_target.get(metric_key):.4f}"
+                        )
+                for metric_key in ("edge_vs_har", "qlike_edge_vs_har"):
+                    if metric_key not in base_target:
+                        continue
+                    if _metric_regressed(
+                        current_target.get(metric_key),
+                        base_target.get(metric_key),
+                        args.metric_tolerance,
+                    ):
+                        failures.append(
+                            f"{lane}: {target} {metric_key} regressed "
+                            f"{current_target.get(metric_key):+.4f} < "
+                            f"{base_target.get(metric_key):+.4f}"
+                        )
+
+            for key, artifact in base_artifacts.items():
+                current_artifact = current_artifacts.get(key, {})
+                if artifact.get("exists") and artifact.get(
+                    "sha256"
+                ) != current_artifact.get("sha256"):
+                    print(
+                        f"[compare] note: {lane} artifact changed for {key} "
+                        f"({artifact.get('sha256', '')[:12]} -> {current_artifact.get('sha256', '')[:12]})"
+                    )
+            continue
+
         if (
             current_metrics["oos_coverage"] + args.metric_tolerance
             < base_metrics["oos_coverage"]
@@ -674,7 +1093,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument(
         "--lane",
-        choices=("1H", "1D", "all"),
+        choices=("1H", "1D", "VOL", "all"),
         default="all",
         help="Lane to capture",
     )
@@ -699,7 +1118,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument(
         "--lane",
-        choices=("1H", "1D", "all"),
+        choices=("1H", "1D", "VOL", "all"),
         default="all",
         help="Lane to compare",
     )

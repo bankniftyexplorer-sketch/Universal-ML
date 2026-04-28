@@ -124,6 +124,7 @@ def main() -> None:
     df_1h = tf_ctx["df_1h"]
     df_1h_raw = tf_ctx["df_1h_raw"]
     df_1h_status = tf_ctx["df_1h_status"]
+    df_vix = tf_ctx["df_vix"]
     df_1w = primary_frames["1W"]
     df_1m = primary_frames["1M"]
     df_3m = primary_frames["3M"]
@@ -142,11 +143,17 @@ def main() -> None:
                 f"[OPTIONAL {df_1h_status or 'UNKNOWN'} -> ignored]"
             )
             _print_tf_span("1H", df_1h_raw)
+    if df_vix is not None and not df_vix.empty:
+        print(f"  VIX companion    : {describe_selected_frame(df_vix)}")
+        _print_tf_span("VIX", df_vix)
+    else:
+        print("  VIX companion    : [OPTIONAL unavailable -> ignored]")
 
     df_feature_frame = build_daily_volatility_feature_frame(
         df_1d,
         reference_1d=reference_frames["1D"],
         df_1h=df_1h,
+        df_vix=df_vix,
         df_1w=df_1w,
         df_1m=df_1m,
         df_3m=df_3m,
@@ -183,6 +190,7 @@ def main() -> None:
         row=last_row,
         forecasts=forecasts,
         intraday_1h_used=df_1h is not None and not df_1h.empty,
+        vix_available=df_vix is not None and not df_vix.empty,
         reference_price=reference_price,
         reference_price_source=reference_source,
         raw_forecasts=ml_forecasts,

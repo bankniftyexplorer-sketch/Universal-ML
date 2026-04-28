@@ -3632,7 +3632,284 @@ function compute_intraday_rv_summary(
 end
 
 """
-    compute_narrative_context(
+    compute_vix_features(
+        vix_closes, rv_yz_log;
+        short_window=5, long_window=21, z_window=63, rank_window=252
+    ) -> Dict{String, Vector{Float64}}
+
+Implied-volatility (VIX) feature family — 17 features:
+
+Level (4):
+  vix_level           — log(VIX close)
+  vix_z               — z-score vs z_window history
+  vix_pctrank         — percentile rank over rank_window
+  vix_regime          — discretized: 0=low(<15), 1=normal(15-25), 2=elevated(25-35), 3=extreme(>35)
+
+Dynamics (5):
+  vix_trend           — short MA / long MA ratio - 1
+  vix_shock           — 1-bar surprise (vix/prev_vix - 1)
+  vix_accel           — 2nd derivative: shock[t] - shock[t-1]
+  vix_5d_change       — 5-day log change
+  vix_21d_change      — 21-day log change
+
+Term structure / spread (4):
+  vix_rv_spread       — log(VIX) - rv_yz_log (variance risk premium proxy)
+  vix_rv_ratio        — VIX / exp(rv_yz_log) (fear premium multiplier)
+  vix_rv_spread_z     — z-score of spread over z_window
+  vix_rv_spread_trend — short MA of spread / long MA of spread - 1
+
+Mean-reversion (4):
+  vix_distance_from_mean — (VIX - rank_window mean) / rank_window std
+  vix_halflife_signal    — exp(-|distance|/2) * sign(distance) (OU proxy)
+  vix_contango_proxy     — short MA / z_window MA - 1
+  vix_floor_distance     — (VIX - rank_window min) / (rank_window max - rank_window min)
+"""
+function compute_vix_features(
+    vix_closes::Vector{Float64},
+    rv_yz_log::Vector{Float64};
+    short_window::Int = 5,
+    long_window::Int = 21,
+    z_window::Int = 63,
+    rank_window::Int = 252,
+)::Dict{String, Vector{Float64}}
+    n = length(vix_closes)
+    eps = 1e-9
+
+    vix_level_out = fill(0.0, n)
+    vix_z_out = fill(0.0, n)
+    vix_pctrank_out = fill(0.5, n)
+    vix_regime_out = fill(1.0, n)
+    vix_trend_out = fill(0.0, n)
+    vix_shock_out = fill(0.0, n)
+    vix_accel_out = fill(0.0, n)
+    vix_5d_change_out = fill(0.0, n)
+    vix_21d_change_out = fill(0.0, n)
+    vix_rv_spread_out = fill(0.0, n)
+    vix_rv_ratio_out = fill(1.0, n)
+    vix_rv_spread_z_out = fill(0.0, n)
+    vix_rv_spread_trend_out = fill(0.0, n)
+    vix_distance_from_mean_out = fill(0.0, n)
+    vix_halflife_signal_out = fill(0.0, n)
+    vix_contango_proxy_out = fill(0.0, n)
+    vix_floor_distance_out = fill(0.5, n)
+
+    # --- Precompute log VIX and spread ---
+    log_vix = fill(0.0, n)
+    spread = fill(0.0, n)
+    for i in 1:n
+        v = vix_closes[i]
+        if v > eps
+            log_vix[i] = log(v)
+        end
+        spread[i] = log_vix[i] - rv_yz_log[i]
+    end
+
+    # --- Level features ---
+    for i in 1:n
+        v = vix_closes[i]
+        if v <= eps
+            continue
+        end
+        vix_level_out[i] = log_vix[i]
+
+        # Regime
+        if v < 15.0
+            vix_regime_out[i] = 0.0
+        elseif v < 25.0
+            vix_regime_out[i] = 1.0
+        elseif v < 35.0
+            vix_regime_out[i] = 2.0
+        else
+            vix_regime_out[i] = 3.0
+        end
+
+        # Z-score and percentile rank
+        if i >= z_window
+            s = 0.0
+            s2 = 0.0
+            for j in (i - z_window + 1):i
+                lv = log_vix[j]
+                s += lv
+                s2 += lv * lv
+            end
+            mu = s / z_window
+            var = s2 / z_window - mu * mu
+            std = sqrt(max(var, eps))
+            vix_z_out[i] = clamp((log_vix[i] - mu) / std, -5.0, 5.0)
+        end
+
+        if i >= rank_window
+            count_below = 0
+            for j in (i - rank_window + 1):i
+                if log_vix[j] <= log_vix[i]
+                    count_below += 1
+                end
+            end
+            vix_pctrank_out[i] = count_below / rank_window
+        end
+    end
+
+    # --- Dynamics ---
+    prev_shock = 0.0
+    for i in 2:n
+        v = vix_closes[i]
+        vp = vix_closes[i - 1]
+        if v > eps && vp > eps
+            shock = v / vp - 1.0
+            vix_shock_out[i] = clamp(shock, -2.0, 2.0)
+            vix_accel_out[i] = clamp(shock - prev_shock, -2.0, 2.0)
+            prev_shock = shock
+        else
+            prev_shock = 0.0
+        end
+    end
+
+    # Trend: short MA / long MA - 1
+    for i in long_window:n
+        short_sum = 0.0
+        for j in (i - short_window + 1):i
+            short_sum += log_vix[j]
+        end
+        long_sum = 0.0
+        for j in (i - long_window + 1):i
+            long_sum += log_vix[j]
+        end
+        short_ma = short_sum / short_window
+        long_ma = long_sum / long_window
+        if abs(long_ma) > eps
+            vix_trend_out[i] = clamp(short_ma / long_ma - 1.0, -1.0, 1.0)
+        end
+    end
+
+    # 5d and 21d log change
+    for i in 6:n
+        if log_vix[i] != 0.0 && log_vix[i - 5] != 0.0
+            vix_5d_change_out[i] = clamp(log_vix[i] - log_vix[i - 5], -2.0, 2.0)
+        end
+    end
+    for i in 22:n
+        if log_vix[i] != 0.0 && log_vix[i - 21] != 0.0
+            vix_21d_change_out[i] = clamp(log_vix[i] - log_vix[i - 21], -3.0, 3.0)
+        end
+    end
+
+    # --- Term structure / spread ---
+    for i in 1:n
+        vix_rv_spread_out[i] = clamp(spread[i], -3.0, 3.0)
+        rv_ann = exp(rv_yz_log[i])
+        if rv_ann > eps && vix_closes[i] > eps
+            vix_rv_ratio_out[i] = clamp(vix_closes[i] / (rv_ann * 100.0), 0.0, 10.0)
+        end
+    end
+
+    # Spread z-score
+    for i in z_window:n
+        s = 0.0
+        s2 = 0.0
+        for j in (i - z_window + 1):i
+            s += spread[j]
+            s2 += spread[j] * spread[j]
+        end
+        mu = s / z_window
+        var = s2 / z_window - mu * mu
+        std = sqrt(max(var, eps))
+        vix_rv_spread_z_out[i] = clamp((spread[i] - mu) / std, -5.0, 5.0)
+    end
+
+    # Spread trend
+    for i in long_window:n
+        short_sum = 0.0
+        for j in (i - short_window + 1):i
+            short_sum += spread[j]
+        end
+        long_sum = 0.0
+        for j in (i - long_window + 1):i
+            long_sum += spread[j]
+        end
+        short_ma = short_sum / short_window
+        long_ma = long_sum / long_window
+        if abs(long_ma) > eps
+            vix_rv_spread_trend_out[i] = clamp(short_ma / long_ma - 1.0, -2.0, 2.0)
+        end
+    end
+
+    # --- Mean-reversion ---
+    for i in rank_window:n
+        s = 0.0
+        s2 = 0.0
+        vmin = Inf
+        vmax = -Inf
+        for j in (i - rank_window + 1):i
+            lv = log_vix[j]
+            s += lv
+            s2 += lv * lv
+            vmin = min(vmin, lv)
+            vmax = max(vmax, lv)
+        end
+        mu = s / rank_window
+        var = s2 / rank_window - mu * mu
+        std = sqrt(max(var, eps))
+        dist = (log_vix[i] - mu) / std
+        vix_distance_from_mean_out[i] = clamp(dist, -5.0, 5.0)
+        vix_halflife_signal_out[i] = clamp(-dist * exp(-abs(dist) / 2.0), -3.0, 3.0)
+
+        range_val = vmax - vmin
+        if range_val > eps
+            vix_floor_distance_out[i] = clamp((log_vix[i] - vmin) / range_val, 0.0, 1.0)
+        end
+    end
+
+    # Contango proxy: short MA / z_window MA - 1
+    for i in z_window:n
+        short_sum = 0.0
+        for j in (i - short_window + 1):i
+            short_sum += log_vix[j]
+        end
+        long_sum = 0.0
+        for j in (i - z_window + 1):i
+            long_sum += log_vix[j]
+        end
+        short_ma = short_sum / short_window
+        long_ma = long_sum / z_window
+        if abs(long_ma) > eps
+            vix_contango_proxy_out[i] = clamp(short_ma / long_ma - 1.0, -1.0, 1.0)
+        end
+    end
+
+    return Dict{String, Vector{Float64}}(
+        "vix_level" => vix_level_out,
+        "vix_z" => vix_z_out,
+        "vix_pctrank" => vix_pctrank_out,
+        "vix_regime" => vix_regime_out,
+        "vix_trend" => vix_trend_out,
+        "vix_shock" => vix_shock_out,
+        "vix_accel" => vix_accel_out,
+        "vix_5d_change" => vix_5d_change_out,
+        "vix_21d_change" => vix_21d_change_out,
+        "vix_rv_spread" => vix_rv_spread_out,
+        "vix_rv_ratio" => vix_rv_ratio_out,
+        "vix_rv_spread_z" => vix_rv_spread_z_out,
+        "vix_rv_spread_trend" => vix_rv_spread_trend_out,
+        "vix_distance_from_mean" => vix_distance_from_mean_out,
+        "vix_halflife_signal" => vix_halflife_signal_out,
+        "vix_contango_proxy" => vix_contango_proxy_out,
+        "vix_floor_distance" => vix_floor_distance_out,
+    )
+end
+
+function compute_vix_features(
+    vix_closes::AbstractVector{Float64},
+    rv_yz_log::AbstractVector{Float64};
+    kwargs...,
+)::Dict{String, Vector{Float64}}
+    return compute_vix_features(
+        collect(Float64, vix_closes),
+        collect(Float64, rv_yz_log);
+        kwargs...,
+    )
+end
+
+"""
         closes, atrs, regime, swing_confirm_bars,
         swing_highs_price, swing_highs_confirm,
         swing_lows_price, swing_lows_confirm

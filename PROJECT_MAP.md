@@ -21,14 +21,16 @@ After any bugfix, modification, or addition that changes repo behavior or contra
   - local accuracy baselines: `<PROJECT_ROOT>/.accuracy_baselines/<SYMBOL>.json`
 - Market data is now guarded by a sync-quality ledger plus a strict runtime gate at the bridge.
 - The vault can also run as a resource-gated auto-sync supervisor that only refreshes when CPU load and Yahoo probe throughput clear configured thresholds.
-- Feature space is now built from five Julia-driven families:
+- Feature space is now built from five always-on Julia-driven families, and the `VOL` lane can optionally add a sixth implied-volatility family from companion VIX data:
   - holographic geometry features
   - SMC institutional-intent features
   - Kalman structural features
   - realized-volatility surface features
   - narrative-context awareness features
+  - VIX implied-volatility features (`VOL` lane optional enrichment)
 - Both active lanes now inject Julia-native realized-volatility surfaces and narrative-context awareness through `julia_bridge.py`.
 - The `VOL` daily volatility lane can optionally enrich itself with `1H` intraday RV summaries, but a failed `1H` quality row no longer blocks the lane; it zeros those features, stamps `intra_available=0`, and continues on the strict daily stack.
+- The `VOL` lane can also optionally enrich itself with a mapped `1D` VIX companion; if the companion is missing or fails quality, it zeros those features, stamps `vix_available=0`, and continues.
 - The `VOL` lane now serves both next-day and 5-day volatility term-structure heads, heterogeneous QLIKE/MAE/Huber variance ensembles, post-hoc ML+HAR combination weights, isotonic point calibrators, decay-weighted conformal intervals, and a forecast-confidence score from one saved artifact set.
 - The raw `realized_volatility` series from the vault remains state only and is excluded from feature selection.
 - Feature math lives in Julia kernels, called from Python bridges.
@@ -39,7 +41,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 - Both active lanes can also train a second-stage policy artifact that learns execution filtering and risk scaling on top of the base directional model.
 - Both active lanes preserve raw OHLC state inside their model-ready training frames so trade-plan and policy replay can simulate candidate trades without rebuilding the raw bars.
 - Backtests and live inference reuse saved artifacts instead of rebuilding everything from scratch.
-- Saved-artifact accuracy can be checked without retraining via `accuracy_guardrail.py`.
+- Saved-artifact accuracy can be checked without retraining via `accuracy_guardrail.py`, now including explicit `VOL` replay scoring from saved OOS forecast maps.
 
 ## Repo layout
 
@@ -50,10 +52,10 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `ops/systemd/user/universal-ml-vault-autosync.service` | User-level systemd unit template for starting the vault auto-sync supervisor at login | You want the auto-sync loop to come up automatically with the system session |
 | `vault_engine.py` | Root-level compatibility shim that re-exports `DataVault` | A root script imports `vault_engine` directly |
 | `instrument_registry.py` | Shared runtime/artifact symbol identity helper that collapses aliases like `BTCUSDT -> BTC` and `SP500 -> SPX500` into one canonical artifact contract | You care about canonical symbol naming across scripts |
-| `inference_bridge.py` | Reads DB, attaches `data_quality`, and enforces the strict runtime gate on `FAIL` quality by default | You care about how scripts fetch market data |
+| `inference_bridge.py` | Reads DB, attaches `data_quality`, enforces the strict runtime gate on `FAIL` quality by default, and can optionally fetch mapped `1D` VIX companion series for the `VOL` lane | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants, nested consensus feature selection, ensemble model wrapper, and probability calibration | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer with the same nested-selection, ensemble, and calibration contract | You care about the daily core |
-| `daily_volatility_engine.py` | `VOL` trainer with multi-target ranking, heterogeneous variance-head ensembles, extended HAR-RV combination, isotonic point calibration, decay-weighted conformal intervals, and 1D+5D heads | You care about daily vol/range forecasting |
+| `daily_volatility_engine.py` | `VOL` trainer with optional `1H` + VIX enrichment, multi-target ranking, heterogeneous variance-head ensembles, extended HAR-RV combination, isotonic point calibration, decay-weighted conformal intervals, and 1D+5D heads | You care about daily vol/range forecasting |
 | `backtest_engine.py` | `1H` backtest/report generator | You care about intraday replay and equity curve |
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
 | `daily_volatility_backtest.py` | `VOL` backtest, calibrator-aware conformal coverage reporter, and OOS replay validator | You care about vol forecast replay |
@@ -61,10 +63,10 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `live_inference.py` | Fast `1H` signal path without retraining | You care about current live signal |
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
 | `sleeve_registry.py` | Builds the cross-symbol sleeve admission registry from honest replay metrics and chooses `base` vs `policy` execution per symbol/lane | You want deployable sleeve selection |
-| `accuracy_guardrail.py` | Rebuilds model-ready frames, replays saved OOS maps, compares against a local baseline | You care about proving an update did or did not change saved-artifact accuracy |
+| `accuracy_guardrail.py` | Rebuilds model-ready frames, replays saved `1H`/`1D` OOS probability maps and `VOL` OOS forecast maps, compares against a local baseline | You care about proving an update did or did not change saved-artifact accuracy |
 | `holographic_engine.py` | Frozen legacy module; only the selection helpers (`feature_selection_pipeline`, `correlation_filter`, `phase1_ranking`) remain live | You care about feature selection or legacy context |
-| `julia_bridge.py` | Only supported Python-to-Julia adapter for holographic, SMC, Kalman, realized-volatility, target, and backtest helper kernels; it also enforces higher-timeframe close-availability alignment | You care about bridge contracts or array prep |
-| `ToonMath.jl` | Fast holographic, SMC, Kalman, and realized-volatility extraction plus target-generation and replay kernels | You care about core math/performance |
+| `julia_bridge.py` | Only supported Python-to-Julia adapter for holographic, SMC, Kalman, realized-volatility, VIX implied-volatility, target, and backtest helper kernels; it also enforces higher-timeframe close-availability alignment | You care about bridge contracts or array prep |
+| `ToonMath.jl` | Fast holographic, SMC, Kalman, realized-volatility, and VIX implied-volatility extraction plus target-generation and replay kernels | You care about core math/performance |
 | `shadow_brain.py` | Optional meta-model trained from prior trade outcomes and used as a veto layer in live inference | You care about veto/approval overlay |
 | `run_daily_model.py` | Legacy script | Ignore unless debugging old behavior |
 | `LAUNCH_INSTRUCTIONS.md` | Operational runbook | You want commands, not architecture |
@@ -177,15 +179,20 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 ### `VOL` daily volatility lane
 
 1. Same data loading as the `1D` lane via `InferenceBridge`.
-2. Same feature families: RV surface, holographic, SMC, Kalman, narrative context, and macro regime overlays.
-3. `julia_bridge.intraday_rv_summary_daily()` additionally injects 9 session-aggregated `1H` volatility features when hourly data exists and passes quality; otherwise those columns are zeroed, `intra_available` is set to `0`, and the lane continues.
-4. `julia_bridge.vol_target_engine_daily()` creates 8 forward regression targets: 4 next-day heads and 4 next-5-day heads for YZ log-vol, log-range, up-excursion, and down-excursion.
-5. Consensus feature selection keeps a shared 40-feature budget, but now ranks candidates across all 4 next-day VOL heads before voting a fold consensus.
-6. `daily_volatility_engine.py` runs fixed-size expanding walk-forward regression validation with per-fold HAR-RV baseline comparison and QLIKE reporting for the variance-style heads.
-7. The lane trains 8 separate LightGBM ensemble heads that all reuse the same consensus feature set; variance-style heads cycle QLIKE, MAE, and Huber member objectives while the lane fits post-hoc Bates-Granger ML+HAR combination weights, isotonic point calibrators, and decay-weighted conformal interval widths from the honest OOS replay.
-8. Artifacts are saved under `<SYMBOL>/` with the `VOL` naming scheme, including 1D models, 5D models, the OOS forecast map, a VOL calibrator bundle, a conformal/HAR post-hoc artifact, and the latest live-forecast JSON payload.
-9. `live_volatility_inference.py` rebuilds the latest VOL feature frame from saved artifacts without retraining, applies the saved HAR-combination weights, isotonic calibrators, and conformal intervals, and refreshes the dashboard-facing JSON payload with 1D and 5D projected levels plus a forecast-confidence score.
-10. `daily_volatility_backtest.py` replays the saved VOL artifacts, restores honest OOS forecasts from disk, re-applies the calibrator-aware conformal/HAR post-hoc layer, and reports interval coverage metrics alongside the older excursion coverage table.
+2. Same feature families as the `1D` lane, plus optional VIX implied-volatility enrichment: RV surface, holographic, SMC, Kalman, narrative context, macro regime overlays, and companion-VIX features.
+3. `InferenceBridge.fetch_vix_series()` can optionally fetch a mapped `1D` VIX companion with `strict_gating=False`.
+   - current companion map: `NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50` -> `INDIA_VIX`; `SPX500` -> `VIX`
+   - if the companion series is missing or carries `FAIL` quality, the bridge returns `None` and the lane continues
+4. `julia_bridge.intraday_rv_summary_daily()` additionally injects 9 session-aggregated `1H` volatility features when hourly data exists and passes quality; otherwise those columns are zeroed, `intra_available` is set to `0`, and the lane continues.
+5. `julia_bridge.vix_feature_engine_daily()` aligns companion VIX closes to the daily bars and injects 17 Julia-built `vix_*` surface columns; `vix_interaction_features()` adds 3 Python-side `VIX x RV` interaction terms, and `vix_available` records whether companion data was present.
+6. `julia_bridge.vol_target_engine_daily()` creates 8 forward regression targets: 4 next-day heads and 4 next-5-day heads for YZ log-vol, log-range, up-excursion, and down-excursion.
+7. Consensus feature selection keeps a shared 40-feature budget, but now ranks candidates across all 4 next-day VOL heads before voting a fold consensus.
+8. `daily_volatility_engine.py` runs fixed-size expanding walk-forward regression validation with per-fold HAR-RV baseline comparison and QLIKE reporting for the variance-style heads.
+9. The lane trains 8 separate LightGBM ensemble heads that all reuse the same consensus feature set; variance-style heads cycle QLIKE, MAE, and Huber member objectives while the lane fits post-hoc Bates-Granger ML+HAR combination weights, isotonic point calibrators, and decay-weighted conformal interval widths from the honest OOS replay.
+10. Artifacts are saved under `<SYMBOL>/` with the `VOL` naming scheme, including 1D models, 5D models, the OOS forecast map, a VOL calibrator bundle, a conformal/HAR post-hoc artifact, and the latest live-forecast JSON payload.
+11. `live_volatility_inference.py` rebuilds the latest VOL feature frame from saved artifacts without retraining, applies the saved HAR-combination weights, isotonic calibrators, and conformal intervals, and refreshes the dashboard-facing JSON payload with 1D and 5D projected levels plus a forecast-confidence score and conformal `projected_peak` / `projected_bottom` price levels.
+12. `daily_volatility_backtest.py` replays the saved VOL artifacts, restores honest OOS forecasts from disk, re-applies the calibrator-aware conformal/HAR post-hoc layer, and reports interval coverage metrics alongside the older excursion coverage table.
+13. `accuracy_guardrail.py` can now rebuild the VOL feature frame, replay the saved VOL OOS forecast map with HAR/conformal overlays, and compare per-target regression metrics against a local baseline without retraining.
 
 ## Data contracts
 

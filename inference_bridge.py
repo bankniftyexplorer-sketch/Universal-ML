@@ -14,6 +14,16 @@ MACRO_PARENT_TIMEFRAMES = {
     "12M": "1D",
 }
 
+VIX_COMPANION_MAP: dict[str, str] = {
+    "NIFTY": "INDIA_VIX",
+    "BANKNIFTY": "INDIA_VIX",
+    "SENSEX": "INDIA_VIX",
+    "FINNIFTY": "INDIA_VIX",
+    "MIDCPNIFTY": "INDIA_VIX",
+    "NIFTYNXT50": "INDIA_VIX",
+    "SPX500": "VIX",
+}
+
 
 class DataIntegrityError(RuntimeError):
     """Fatal runtime gate for model-facing market data integrity failures."""
@@ -383,6 +393,38 @@ class InferenceBridge:
         except (sqlite3.Error, ValueError) as e:
             print(f"[!] DATABASE ERROR: {e}")
             return {}
+
+    def fetch_vix_series(
+        self,
+        market_symbol: str,
+    ) -> pd.DataFrame | None:
+        """Fetch the VIX companion 1D series for a given market symbol.
+
+        Returns a DataFrame with time/open/high/low/close/volume columns,
+        or None if no VIX companion exists or data is unavailable.
+        VIX is optional enrichment — never raises on missing data.
+        """
+        vix_symbol = VIX_COMPANION_MAP.get(market_symbol.strip().upper())
+        if vix_symbol is None:
+            return None
+        try:
+            stack = self.fetch_holographic_stack(
+                vix_symbol,
+                "SPOT",
+                include_realized_vol=False,
+                strict_gating=False,
+            )
+            df_vix = stack.get("1D")
+            if df_vix is None or df_vix.empty:
+                return None
+            if self._quality_status(df_vix.attrs.get("data_quality")) == "FAIL":
+                return None
+            required = {"time", "open", "high", "low", "close"}
+            if not required.issubset(set(df_vix.columns)):
+                return None
+            return df_vix.reset_index(drop=True)
+        except Exception:
+            return None
 
 
 if __name__ == "__main__":

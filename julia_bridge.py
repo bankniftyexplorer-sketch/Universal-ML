@@ -1698,3 +1698,130 @@ def rv_feature_engine_daily(
             )
 
     return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+# ─────────────────────────────────────────────────────────────
+# VIX IMPLIED VOLATILITY FEATURE ENGINE
+# ─────────────────────────────────────────────────────────────
+
+_VIX_FEATURE_COLS = [
+    "vix_level",
+    "vix_z",
+    "vix_pctrank",
+    "vix_regime",
+    "vix_trend",
+    "vix_shock",
+    "vix_accel",
+    "vix_5d_change",
+    "vix_21d_change",
+    "vix_rv_spread",
+    "vix_rv_ratio",
+    "vix_rv_spread_z",
+    "vix_rv_spread_trend",
+    "vix_distance_from_mean",
+    "vix_halflife_signal",
+    "vix_contango_proxy",
+    "vix_floor_distance",
+]
+
+_VIX_INTERACTION_COLS = [
+    "vix_x_rv_asym",
+    "vix_x_jump",
+    "vix_x_vov",
+]
+
+
+def _zero_vix_features(index: pd.Index) -> pd.DataFrame:
+    """Return a zero-filled VIX feature DataFrame (graceful fallback)."""
+    return pd.DataFrame(
+        {col: np.zeros(len(index), dtype=np.float64) for col in _VIX_FEATURE_COLS},
+        index=index,
+    )
+
+
+def vix_feature_engine_daily(
+    df_1d: pd.DataFrame,
+    df_vix: pd.DataFrame | None,
+    rv_yz_log_col: str = "rv_1d_yz_log",
+) -> pd.DataFrame:
+    """Compute VIX implied-volatility features aligned to daily bars.
+
+    Parameters
+    ----------
+    df_1d : DataFrame with 'time' column and rv_yz_log_col (realized vol log).
+    df_vix : VIX 1D DataFrame with 'time' and 'close' columns, or None.
+    rv_yz_log_col : column name in df_1d for the realized vol log series.
+
+    Returns
+    -------
+    DataFrame with 17 vix_* columns, indexed like df_1d.
+    """
+    if df_1d.empty:
+        return _zero_vix_features(df_1d.index)
+
+    if df_vix is None or df_vix.empty or len(df_vix) < 5:
+        return _zero_vix_features(df_1d.index)
+
+    _, TM = _init_julia()
+
+    # Align VIX to daily bars via merge_asof
+    df_daily = df_1d[["time"]].copy().reset_index(drop=True)
+    df_daily["_idx"] = df_1d.index
+
+    vix_sorted = (
+        df_vix[["time", "close"]].copy().sort_values("time").reset_index(drop=True)
+    )
+    vix_sorted.rename(columns={"close": "vix_close"}, inplace=True)
+
+    merged = pd.merge_asof(
+        df_daily.sort_values("time"),
+        vix_sorted,
+        on="time",
+        direction="backward",
+    )
+    merged = merged.sort_values("_idx").set_index("_idx")
+    merged.index = df_1d.index
+
+    vix_closes = merged["vix_close"].fillna(0.0).to_numpy(dtype=np.float64)
+
+    if rv_yz_log_col in df_1d.columns:
+        rv_log = df_1d[rv_yz_log_col].fillna(0.0).to_numpy(dtype=np.float64)
+    else:
+        rv_log = np.zeros(len(df_1d), dtype=np.float64)
+
+    jl_result = TM.compute_vix_features(
+        _to_f64(vix_closes),
+        _to_f64(rv_log),
+    )
+
+    result = pd.DataFrame(
+        {col: np.array(jl_result[col], dtype=np.float64) for col in _VIX_FEATURE_COLS},
+        index=df_1d.index,
+    )
+    return result.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def vix_interaction_features(
+    df_full: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute VIX × RV interaction features (3 columns).
+
+    Requires vix_level, rv_1d_rv_asym, rv_1d_jump_ratio, rv_1d_vov
+    to already exist in df_full.
+    """
+    n = len(df_full)
+    zeros = pd.Series(np.zeros(n), index=df_full.index)
+
+    vix_level = df_full.get("vix_level", zeros)
+    rv_asym = df_full.get("rv_1d_rv_asym", zeros)
+    jump = df_full.get("rv_1d_jump_ratio", zeros)
+    vov = df_full.get("rv_1d_vov", zeros)
+
+    return pd.DataFrame(
+        {
+            "vix_x_rv_asym": (vix_level * rv_asym).clip(-10.0, 10.0),
+            "vix_x_jump": (vix_level * jump).clip(-10.0, 10.0),
+            "vix_x_vov": (vix_level * vov).clip(-10.0, 10.0),
+        },
+        index=df_full.index,
+    ).fillna(0.0)
