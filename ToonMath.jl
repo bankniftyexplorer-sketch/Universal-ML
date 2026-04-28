@@ -2928,7 +2928,7 @@ end
     compute_rv_features(opens, highs, lows, closes; ...) -> Dict{String, Vector{Float64}}
 
 Single-pass Yang-Zhang + Parkinson + jump/asymmetry/skewness volatility surface.
-Returns 11 features per timeframe:
+Returns 14 features per timeframe:
 
 Estimators (2):
   yz_log     — log1p(Yang-Zhang annualized RV)
@@ -2950,6 +2950,11 @@ Structure (2):
 Asymmetry (2):
   rv_asym    — down_vol / up_vol ratio (leverage effect, Black 1976)
   rv_skew    — realized skewness of returns (3rd moment, crash/melt-up)
+
+Semivariance (3):
+  rs_plus     — log1p(sqrt(annualized upside semivariance))
+  rs_minus    — log1p(sqrt(annualized downside semivariance))
+  rs_leverage — signed semivariance imbalance in [-1, 1]
 """
 function compute_rv_features(
     opens::Vector{Float64},
@@ -2976,6 +2981,9 @@ function compute_rv_features(
     jump_ratio_out = fill(0.0, n)
     rv_asym_out = fill(1.0, n)
     rv_skew_out = fill(0.0, n)
+    rs_plus_out = fill(0.0, n)
+    rs_minus_out = fill(0.0, n)
+    rs_leverage_out = fill(0.0, n)
 
     log_co = fill(0.0, n)
     log_oc = fill(0.0, n)
@@ -3109,6 +3117,18 @@ function compute_rv_features(
             rv_asym_out[i] = clamp(down_var / up_var, 0.1, 10.0)
         end
 
+        rs_plus_ann = up_var * annualization
+        rs_minus_ann = down_var * annualization
+        rs_plus_out[i] = log1p(sqrt(max(rs_plus_ann, 0.0)))
+        rs_minus_out[i] = log1p(sqrt(max(rs_minus_ann, 0.0)))
+        if (rs_plus_ann + rs_minus_ann) > eps
+            rs_leverage_out[i] = clamp(
+                (rs_minus_ann - rs_plus_ann) / (rs_plus_ann + rs_minus_ann),
+                -1.0,
+                1.0,
+            )
+        end
+
         m2 = 0.0
         m3 = 0.0
         for j in s
@@ -3139,6 +3159,9 @@ function compute_rv_features(
             jump_ratio_out[i] = jump_ratio_out[first_valid]
             rv_asym_out[i] = rv_asym_out[first_valid]
             rv_skew_out[i] = rv_skew_out[first_valid]
+            rs_plus_out[i] = rs_plus_out[first_valid]
+            rs_minus_out[i] = rs_minus_out[first_valid]
+            rs_leverage_out[i] = rs_leverage_out[first_valid]
         end
     end
 
@@ -3216,7 +3239,31 @@ function compute_rv_features(
         "jump_ratio" => jump_ratio_out,
         "rv_asym" => rv_asym_out,
         "rv_skew" => rv_skew_out,
+        "rs_plus" => rs_plus_out,
+        "rs_minus" => rs_minus_out,
+        "rs_leverage" => rs_leverage_out,
     )
+end
+
+function _single_day_yz_var(
+    c_0::Float64,
+    o_1::Float64,
+    h_1::Float64,
+    l_1::Float64,
+    c_1::Float64,
+)::Float64
+    if c_0 <= 0.0 || o_1 <= 0.0 || h_1 <= 0.0 || l_1 <= 0.0 || c_1 <= 0.0
+        return NaN
+    end
+
+    overnight_var = log(o_1 / c_0)^2
+    log_hc = log(h_1 / c_1)
+    log_ho = log(h_1 / o_1)
+    log_lc = log(l_1 / c_1)
+    log_lo = log(l_1 / o_1)
+    rs_var = log_hc * log_ho + log_lc * log_lo
+    oc_var = log(c_1 / o_1)^2
+    return overnight_var + 0.34 * rs_var + 0.66 * oc_var
 end
 
 """
@@ -3262,19 +3309,11 @@ function compute_vol_targets(
         l_1 = lows[i + 1]
         c_1 = closes[i + 1]
 
-        if c_0 <= 0.0 || o_1 <= 0.0 || h_1 <= 0.0 || l_1 <= 0.0 || c_1 <= 0.0
+        yz_single_day_var = _single_day_yz_var(c_0, o_1, h_1, l_1, c_1)
+        if !isfinite(yz_single_day_var)
             continue
         end
 
-        overnight_var = log(o_1 / c_0)^2
-        log_hc = log(h_1 / c_1)
-        log_ho = log(h_1 / o_1)
-        log_lc = log(l_1 / c_1)
-        log_lo = log(l_1 / o_1)
-        rs_var = log_hc * log_ho + log_lc * log_lo
-        oc_var = log(c_1 / o_1)^2
-
-        yz_single_day_var = overnight_var + 0.34 * rs_var + 0.66 * oc_var
         next_yz_logvol[i] = log1p(sqrt(max(yz_single_day_var * 252.0, 0.0)))
         next_log_range[i] = log(h_1 / l_1)
         next_up_excursion[i] = log(h_1 / o_1)
@@ -3296,6 +3335,100 @@ function compute_vol_targets(
     closes::AbstractVector{Float64},
 )
     return compute_vol_targets(
+        collect(Float64, opens),
+        collect(Float64, highs),
+        collect(Float64, lows),
+        collect(Float64, closes),
+    )
+end
+
+"""
+    compute_vol_targets_5d(opens, highs, lows, closes) -> NamedTuple
+
+Construct four forward-looking 5-day volatility/range targets.
+Each output vector has the same length as input; the last five elements are NaN.
+
+Targets:
+  next5d_yz_logvol      — log1p(sqrt(mean(next 5 daily YZ vars) × 252))
+  next5d_log_range      — log(H_{t+1:t+5} / L_{t+1:t+5})
+  next5d_up_excursion   — log(H_{t+1:t+5} / O_{t+1})
+  next5d_dn_excursion   — log(O_{t+1} / L_{t+1:t+5})
+"""
+function compute_vol_targets_5d(
+    opens::Vector{Float64},
+    highs::Vector{Float64},
+    lows::Vector{Float64},
+    closes::Vector{Float64},
+)
+    n = length(closes)
+
+    next5d_yz_logvol = fill(NaN, n)
+    next5d_log_range = fill(NaN, n)
+    next5d_up_excursion = fill(NaN, n)
+    next5d_dn_excursion = fill(NaN, n)
+
+    if n <= 5
+        return (
+            next5d_yz_logvol = next5d_yz_logvol,
+            next5d_log_range = next5d_log_range,
+            next5d_up_excursion = next5d_up_excursion,
+            next5d_dn_excursion = next5d_dn_excursion,
+        )
+    end
+
+    @inbounds for i in 1:(n - 5)
+        o_5d = opens[i + 1]
+        if o_5d <= 0.0
+            continue
+        end
+
+        h_5d = -Inf
+        l_5d = Inf
+        yz_var_sum = 0.0
+        valid = true
+        for j in (i + 1):(i + 5)
+            h_j = highs[j]
+            l_j = lows[j]
+            if h_j <= 0.0 || l_j <= 0.0
+                valid = false
+                break
+            end
+            h_5d = max(h_5d, h_j)
+            l_5d = min(l_5d, l_j)
+
+            yz_day = _single_day_yz_var(closes[j - 1], opens[j], highs[j], lows[j], closes[j])
+            if !isfinite(yz_day)
+                valid = false
+                break
+            end
+            yz_var_sum += yz_day
+        end
+
+        if !valid || !isfinite(h_5d) || !isfinite(l_5d) || l_5d <= 0.0 || h_5d <= 0.0
+            continue
+        end
+
+        next5d_yz_logvol[i] = log1p(sqrt(max((yz_var_sum / 5.0) * 252.0, 0.0)))
+        next5d_log_range[i] = log(h_5d / l_5d)
+        next5d_up_excursion[i] = log(h_5d / o_5d)
+        next5d_dn_excursion[i] = log(o_5d / l_5d)
+    end
+
+    return (
+        next5d_yz_logvol = next5d_yz_logvol,
+        next5d_log_range = next5d_log_range,
+        next5d_up_excursion = next5d_up_excursion,
+        next5d_dn_excursion = next5d_dn_excursion,
+    )
+end
+
+function compute_vol_targets_5d(
+    opens::AbstractVector{Float64},
+    highs::AbstractVector{Float64},
+    lows::AbstractVector{Float64},
+    closes::AbstractVector{Float64},
+)
+    return compute_vol_targets_5d(
         collect(Float64, opens),
         collect(Float64, highs),
         collect(Float64, lows),

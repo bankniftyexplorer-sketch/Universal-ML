@@ -29,6 +29,7 @@ After any bugfix, modification, or addition that changes repo behavior or contra
   - narrative-context awareness features
 - Both active lanes now inject Julia-native realized-volatility surfaces and narrative-context awareness through `julia_bridge.py`.
 - The `VOL` daily volatility lane can optionally enrich itself with `1H` intraday RV summaries, but a failed `1H` quality row no longer blocks the lane; it zeros those features and continues on the strict daily stack.
+- The `VOL` lane now serves both next-day and 5-day volatility term-structure heads, post-hoc ML+HAR combination weights, conformal intervals, and a forecast-confidence score from one saved artifact set.
 - The raw `realized_volatility` series from the vault remains state only and is excluded from feature selection.
 - Feature math lives in Julia kernels, called from Python bridges.
 - `julia_bridge.py` is the only supported Python interface to `ToonMath.jl`, and it shifts higher-timeframe timestamps to bar-close availability before Julia dispatch or Python-side HTF projection mapping.
@@ -52,11 +53,11 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `inference_bridge.py` | Reads DB, attaches `data_quality`, and enforces the strict runtime gate on `FAIL` quality by default | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants, nested consensus feature selection, ensemble model wrapper, and probability calibration | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer with the same nested-selection, ensemble, and calibration contract | You care about the daily core |
-| `daily_volatility_engine.py` | `VOL` trainer with HAR-RV baseline comparison | You care about daily vol/range forecasting |
+| `daily_volatility_engine.py` | `VOL` trainer with multi-target ranking, QLIKE variance heads, HAR-RV combination, conformal intervals, and 1D+5D heads | You care about daily vol/range forecasting |
 | `backtest_engine.py` | `1H` backtest/report generator | You care about intraday replay and equity curve |
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
-| `daily_volatility_backtest.py` | `VOL` backtest/coverage reporter | You care about vol forecast replay |
-| `live_volatility_inference.py` | `VOL` live forecast publisher that writes projected high/low levels to JSON from saved VOL heads | You care about dashboard-ready daily vol levels without retraining |
+| `daily_volatility_backtest.py` | `VOL` backtest, conformal coverage reporter, and OOS replay validator | You care about vol forecast replay |
+| `live_volatility_inference.py` | `VOL` live forecast publisher that writes combined 1D+5D projected levels, intervals, and confidence to JSON from saved VOL heads | You care about dashboard-ready daily vol levels without retraining |
 | `live_inference.py` | Fast `1H` signal path without retraining | You care about current live signal |
 | `meta_strategy_selector.py` | Strategy zoo and winner selection layer | You care about model-selection logic |
 | `sleeve_registry.py` | Builds the cross-symbol sleeve admission registry from honest replay metrics and chooses `base` vs `policy` execution per symbol/lane | You want deployable sleeve selection |
@@ -103,9 +104,9 @@ After any bugfix, modification, or addition that changes repo behavior or contra
    - primary Kalman state
    - 7-ratio fib observation ladders
    - mapped higher-timeframe Kalman state from `1D/1W/1M`, aligned to completed bars only
-9. `julia_bridge.rv_feature_engine_fast()` adds a 47-column `1H` realized-volatility surface:
-   - 11 primary `1H` RV features
-   - 12 columns each from `1D/1W/1M` (11 HTF RV features + 1 term-structure column), aligned to completed bars only
+9. `julia_bridge.rv_feature_engine_fast()` adds a 59-column `1H` realized-volatility surface:
+   - 14 primary `1H` RV features, now including `rs_plus`, `rs_minus`, and `rs_leverage`
+   - 15 columns each from `1D/1W/1M` (14 HTF RV features + 1 term-structure column), aligned to completed bars only
 10. `julia_bridge.narrative_context_engine_fast()` adds a 23-column `1H` narrative-context family:
    - 7 primary `1H` narrative-context features from Kalman regime persistence, displacement, drawdown, swing count, and fib range state
    - 7 mapped columns each from `1D` and `1W`, aligned to completed bars only
@@ -152,9 +153,9 @@ After any bugfix, modification, or addition that changes repo behavior or contra
    - primary Kalman state
    - 7-ratio fib observation ladders
    - mapped higher-timeframe Kalman state from `1W/1M/6M`, aligned to completed bars only
-9. `julia_bridge.rv_feature_engine_daily()` adds a 71-column daily realized-volatility surface:
-   - 11 primary `1D` RV features
-   - 12 columns each from `1W/1M/3M/6M/12M` (11 HTF RV features + 1 term-structure column), aligned to completed bars only
+9. `julia_bridge.rv_feature_engine_daily()` adds an 89-column daily realized-volatility surface:
+   - 14 primary `1D` RV features, now including `rs_plus`, `rs_minus`, and `rs_leverage`
+   - 15 columns each from `1W/1M/3M/6M/12M` (14 HTF RV features + 1 term-structure column), aligned to completed bars only
 10. `julia_bridge.narrative_context_engine_daily()` adds a 23-column daily narrative-context family:
    - 7 primary `1D` narrative-context features from Kalman regime persistence, displacement, drawdown, swing count, and fib range state
    - 7 mapped columns each from `1W` and `1M`, aligned to completed bars only
@@ -178,13 +179,13 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 1. Same data loading as the `1D` lane via `InferenceBridge`.
 2. Same feature families: RV surface, holographic, SMC, Kalman, narrative context, and macro regime overlays.
 3. `julia_bridge.intraday_rv_summary_daily()` additionally injects 9 session-aggregated `1H` volatility features when hourly data exists and passes quality; otherwise those columns are zeroed and the lane continues.
-4. `julia_bridge.vol_target_engine_daily()` creates 4 forward regression targets: next-day YZ log-vol, log-range, up-excursion, and down-excursion.
-5. Consensus feature selection keeps a shared 40-feature budget, using `next_yz_logvol` as the primary ranking target.
-6. `daily_volatility_engine.py` runs expanding walk-forward regression validation with per-fold HAR-RV baseline comparison.
-7. The lane trains 4 separate LightGBM ensemble heads that all reuse the same consensus feature set.
-8. Artifacts are saved under `<SYMBOL>/` with the `VOL` naming scheme, including a latest live-forecast JSON payload with projected high/low levels.
-9. `live_volatility_inference.py` rebuilds the latest VOL feature frame from saved artifacts without retraining and refreshes the dashboard-facing JSON payload.
-10. `daily_volatility_backtest.py` replays the saved VOL artifacts, restores honest OOS forecasts from disk, and reports excursion-band coverage metrics.
+4. `julia_bridge.vol_target_engine_daily()` creates 8 forward regression targets: 4 next-day heads and 4 next-5-day heads for YZ log-vol, log-range, up-excursion, and down-excursion.
+5. Consensus feature selection keeps a shared 40-feature budget, but now ranks candidates across all 4 next-day VOL heads before voting a fold consensus.
+6. `daily_volatility_engine.py` runs expanding walk-forward regression validation with per-fold HAR-RV baseline comparison and QLIKE reporting for the variance-style heads.
+7. The lane trains 8 separate LightGBM ensemble heads that all reuse the same consensus feature set, then fits post-hoc Bates-Granger ML+HAR combination weights and conformal interval widths from the honest OOS replay.
+8. Artifacts are saved under `<SYMBOL>/` with the `VOL` naming scheme, including 1D models, 5D models, the OOS forecast map, a conformal/HAR post-hoc artifact, and the latest live-forecast JSON payload.
+9. `live_volatility_inference.py` rebuilds the latest VOL feature frame from saved artifacts without retraining, applies the saved HAR-combination weights plus conformal intervals, and refreshes the dashboard-facing JSON payload with 1D and 5D projected levels plus a forecast-confidence score.
+10. `daily_volatility_backtest.py` replays the saved VOL artifacts, restores honest OOS forecasts from disk, re-applies the conformal/HAR post-hoc layer, and reports interval coverage metrics alongside the older excursion coverage table.
 
 ## Data contracts
 
@@ -263,8 +264,13 @@ Artifacts live in `<PROJECT_ROOT>/<SYMBOL>/`.
 - `{symbol}_VOL_model_range.pkl`
 - `{symbol}_VOL_model_up_exc.pkl`
 - `{symbol}_VOL_model_dn_exc.pkl`
+- `{symbol}_VOL_model_5d_logvol.pkl`
+- `{symbol}_VOL_model_5d_range.pkl`
+- `{symbol}_VOL_model_5d_up_exc.pkl`
+- `{symbol}_VOL_model_5d_dn_exc.pkl`
 - `{symbol}_VOL_features.txt`
 - `{symbol}_VOL_oos_forecasts.pkl`
+- `{symbol}_VOL_conformal.pkl`
 - `{symbol}_VOL_live_forecast.json`
 - `{symbol}_VOL_report.png`
 - `{symbol}_VOL_backtest_report.png`

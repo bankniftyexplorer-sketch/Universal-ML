@@ -16,8 +16,11 @@ import joblib
 import pandas as pd
 
 from daily_volatility_engine import (
+    VOL_MODEL_ARTIFACT_KEYS,
+    _predict_har_rv_model,
     build_daily_volatility_feature_frame,
     build_vol_forecast_payload,
+    combine_vol_forecasts,
     fetch_vol_timeframe_context,
     predict_volatility_heads,
     prepare_vol_inference_frame,
@@ -64,24 +67,17 @@ def main() -> None:
     artifact_paths_vol = get_artifact_paths(symbol_dir, file_prefix, "VOL")
 
     model_paths = {
-        "next_yz_logvol": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_logvol"
-        ),
-        "next_log_range": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_range"
-        ),
-        "next_up_exc": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_up_exc"
-        ),
-        "next_dn_exc": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_dn_exc"
-        ),
+        target: resolve_artifact_path(symbol_dir, file_prefix, "VOL", artifact_key)
+        for target, artifact_key in VOL_MODEL_ARTIFACT_KEYS.items()
     }
     feat_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "features")
+    conformal_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "conformal")
 
-    if any(
-        not os.path.exists(path) for path in model_paths.values()
-    ) or not os.path.exists(feat_path):
+    if (
+        any(not os.path.exists(path) for path in model_paths.values())
+        or not os.path.exists(feat_path)
+        or not os.path.exists(conformal_path)
+    ):
         print(
             f"  [!] FATAL: Missing VOL artifacts for {symbol}. "
             "Run daily_volatility_engine.py first."
@@ -91,6 +87,7 @@ def main() -> None:
     with open(feat_path, encoding="utf-8") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
     models = {target: joblib.load(path) for target, path in model_paths.items()}
+    conformal_artifact = joblib.load(conformal_path)
 
     sys.path.append(os.path.join(project_root, "data_vault"))
     try:
@@ -153,7 +150,19 @@ def main() -> None:
     )
     df_infer = prepare_vol_inference_frame(df_feature_frame, feature_cols)
     last_row = df_infer.iloc[-1]
-    forecasts = predict_volatility_heads(models, feature_cols, last_row)
+    ml_forecasts = predict_volatility_heads(models, feature_cols, last_row)
+    har_models = conformal_artifact.get("har_models", {})
+    har_forecasts = {
+        target: float(_predict_har_rv_model(har_models[target], last_row))
+        for target in ml_forecasts
+        if target in har_models
+    }
+    forecasts = combine_vol_forecasts(
+        ml_forecasts,
+        har_forecasts,
+        conformal_artifact,
+        targets=list(ml_forecasts),
+    )
 
     if df_1h is not None and not df_1h.empty:
         reference_price = float(df_1h["close"].iloc[-1])
@@ -169,6 +178,9 @@ def main() -> None:
         intraday_1h_used=df_1h is not None and not df_1h.empty,
         reference_price=reference_price,
         reference_price_source=reference_source,
+        raw_forecasts=ml_forecasts,
+        har_forecasts=har_forecasts,
+        conformal_artifact=conformal_artifact,
     )
     save_vol_forecast_json(payload, artifact_paths_vol["live_forecast"])
     print(f"  VOL live forecast saved to '{artifact_paths_vol['live_forecast']}'")

@@ -21,15 +21,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from daily_volatility_engine import (
+    VOL_ALL_TARGETS,
+    VOL_CONFORMAL_LEVELS,
     VOL_MIN_TRAIN_BARS,
+    VOL_MODEL_ARTIFACT_KEYS,
     VOL_PURGE_GAP,
     VOL_TARGET_LABELS,
-    VOL_TARGETS,
     VOL_TEST_SIZE_RATIO,
-    _har_rv_baseline,
+    _conformal_level_key,
+    _qlike_loss,
     _regression_metrics,
-    _vol_split_points,
     build_daily_volatility_feature_frame,
+    build_har_oos_series,
+    enrich_vol_oos_frame,
     fetch_vol_timeframe_context,
     prepare_vol_model_ready,
 )
@@ -59,15 +63,16 @@ def replay_vol_forecasts(
     oos_map: dict | None,
 ) -> pd.DataFrame:
     """Reconstruct predictions from saved OOS map + apply models to recent bars."""
-    replay = df[["time", *VOL_TARGETS]].copy()
+    active_targets = [target for target in models if target in df.columns]
+    replay = df[["time", *active_targets]].copy()
     model_preds = {
         target: np.asarray(models[target].predict(df[feature_cols]), dtype=float)
-        for target in VOL_TARGETS
+        for target in active_targets
     }
     saved_map = {pd.Timestamp(ts): payload for ts, payload in (oos_map or {}).items()}
     is_oos = np.zeros(len(df), dtype=bool)
 
-    for target in VOL_TARGETS:
+    for target in active_targets:
         replay[f"pred_{target}"] = model_preds[target]
 
     for idx, ts in enumerate(df["time"]):
@@ -75,30 +80,12 @@ def replay_vol_forecasts(
         if not isinstance(payload, dict):
             continue
         is_oos[idx] = True
-        for target in VOL_TARGETS:
+        for target in active_targets:
             if target in payload and payload[target] is not None:
                 replay.at[idx, f"pred_{target}"] = float(payload[target])
 
     replay["is_oos"] = is_oos
     return replay
-
-
-def _build_har_logvol_oos_series(df: pd.DataFrame) -> np.ndarray:
-    har_series = np.full(len(df), np.nan, dtype=float)
-    split_points = _vol_split_points(
-        len(df),
-        min_train_bars=VOL_MIN_TRAIN_BARS,
-        test_size_ratio=VOL_TEST_SIZE_RATIO,
-    )
-    for train_end, test_end in split_points:
-        purged_train_end = max(0, train_end - VOL_PURGE_GAP)
-        har_preds = _har_rv_baseline(
-            df.iloc[:purged_train_end],
-            df.iloc[train_end:test_end],
-            "next_yz_logvol",
-        )
-        har_series[train_end:test_end] = har_preds
-    return har_series
 
 
 def coverage_report(
@@ -141,9 +128,80 @@ def coverage_report(
     return pd.DataFrame(rows)
 
 
+def conformal_coverage_report(
+    replay_df: pd.DataFrame,
+    conformal_artifact: dict[str, object] | None,
+    *,
+    targets: list[str] | None = None,
+) -> pd.DataFrame:
+    target_list = [
+        target
+        for target in (targets or VOL_ALL_TARGETS)
+        if target in replay_df.columns and f"pred_{target}" in replay_df.columns
+    ]
+    enriched = enrich_vol_oos_frame(
+        replay_df,
+        conformal_artifact,
+        targets=target_list,
+    )
+    rows: list[dict[str, float | str]] = []
+
+    for target in target_list:
+        actual = enriched[target].to_numpy(dtype=float)
+        pred_col = (
+            f"final_pred_{target}"
+            if f"final_pred_{target}" in enriched.columns
+            else f"pred_{target}"
+        )
+        pred = enriched[pred_col].to_numpy(dtype=float)
+        for level in VOL_CONFORMAL_LEVELS:
+            level_key = _conformal_level_key(level)
+            lo_col = f"interval_lo_{level_key}_{target}"
+            hi_col = f"interval_hi_{level_key}_{target}"
+            if lo_col not in enriched.columns or hi_col not in enriched.columns:
+                continue
+            lo = enriched[lo_col].to_numpy(dtype=float)
+            hi = enriched[hi_col].to_numpy(dtype=float)
+            mask = (
+                np.isfinite(actual)
+                & np.isfinite(pred)
+                & np.isfinite(lo)
+                & np.isfinite(hi)
+            )
+            if not mask.any():
+                continue
+
+            picp = float(
+                np.mean((actual[mask] >= lo[mask]) & (actual[mask] <= hi[mask]))
+            )
+            mpiw = float(np.mean(hi[mask] - lo[mask]))
+            alpha = 1.0 - float(level)
+            below = actual[mask] < lo[mask]
+            above = actual[mask] > hi[mask]
+            winkler = hi[mask] - lo[mask]
+            if below.any():
+                winkler[below] += (2.0 / alpha) * (lo[below] - actual[below])
+            if above.any():
+                winkler[above] += (2.0 / alpha) * (actual[above] - hi[above])
+
+            rows.append(
+                {
+                    "target": target,
+                    "level": float(level),
+                    "picp": picp,
+                    "mpiw": mpiw,
+                    "winkler": float(np.mean(winkler)),
+                    "sample_size": int(mask.sum()),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
 def save_vol_backtest_report(
     replay_df: pd.DataFrame,
     coverage_df: pd.DataFrame,
+    conformal_df: pd.DataFrame,
     save_path: str,
     *,
     symbol: str,
@@ -157,7 +215,17 @@ def save_vol_backtest_report(
 
     report_df = report_df.sort_values("time").reset_index(drop=True)
     times = pd.to_datetime(report_df["time"])
-    logvol_err = report_df["pred_next_yz_logvol"].to_numpy(dtype=float) - report_df[
+    logvol_pred_col = (
+        "final_pred_next_yz_logvol"
+        if "final_pred_next_yz_logvol" in report_df.columns
+        else "pred_next_yz_logvol"
+    )
+    range_pred_col = (
+        "final_pred_next_log_range"
+        if "final_pred_next_log_range" in report_df.columns
+        else "pred_next_log_range"
+    )
+    logvol_err = report_df[logvol_pred_col].to_numpy(dtype=float) - report_df[
         "next_yz_logvol"
     ].to_numpy(dtype=float)
     sigma = float(np.nanstd(logvol_err))
@@ -172,19 +240,29 @@ def save_vol_backtest_report(
     )
 
     ax = axes[0, 0]
-    pred_logvol = report_df["pred_next_yz_logvol"].to_numpy(dtype=float)
+    pred_logvol = report_df[logvol_pred_col].to_numpy(dtype=float)
     ax.plot(
         times, report_df["next_yz_logvol"], color="black", linewidth=1.2, label="Actual"
     )
-    ax.plot(times, pred_logvol, color="#1f77b4", linewidth=1.1, label="Forecast")
-    ax.fill_between(
-        times,
-        pred_logvol - sigma,
-        pred_logvol + sigma,
-        color="#1f77b4",
-        alpha=0.18,
-        label="±1σ",
-    )
+    ax.plot(times, pred_logvol, color="#1f77b4", linewidth=1.1, label="Served")
+    if "interval_lo_90_next_yz_logvol" in report_df.columns:
+        ax.fill_between(
+            times,
+            report_df["interval_lo_90_next_yz_logvol"].to_numpy(dtype=float),
+            report_df["interval_hi_90_next_yz_logvol"].to_numpy(dtype=float),
+            color="#1f77b4",
+            alpha=0.18,
+            label="90% conformal",
+        )
+    else:
+        ax.fill_between(
+            times,
+            pred_logvol - sigma,
+            pred_logvol + sigma,
+            color="#1f77b4",
+            alpha=0.18,
+            label="±1σ",
+        )
     ax.set_title("Log-Vol Forecast vs Actual")
     ax.grid(alpha=0.2)
     ax.legend(loc="upper right")
@@ -195,48 +273,57 @@ def save_vol_backtest_report(
     )
     ax.plot(
         times,
-        report_df["pred_next_log_range"],
+        report_df[range_pred_col],
         color="#2ca02c",
         linewidth=1.1,
-        label="Forecast",
+        label="Served",
     )
+    if "interval_lo_90_next_log_range" in report_df.columns:
+        ax.fill_between(
+            times,
+            report_df["interval_lo_90_next_log_range"].to_numpy(dtype=float),
+            report_df["interval_hi_90_next_log_range"].to_numpy(dtype=float),
+            color="#2ca02c",
+            alpha=0.18,
+            label="90% conformal",
+        )
     ax.set_title("Range Forecast vs Actual")
     ax.grid(alpha=0.2)
     ax.legend(loc="upper right")
 
     ax = axes[1, 0]
     ax.axis("off")
-    if coverage_df.empty:
+    conformal_90 = conformal_df[conformal_df["level"] == 0.90].copy()
+    if conformal_90.empty:
         ax.text(0.5, 0.5, "No coverage data", ha="center", va="center")
     else:
         table_rows = [
             [
-                f"{row['quantile']:.0%}",
-                f"{row['up_coverage']:.1%}",
-                f"{row['dn_coverage']:.1%}",
-                f"{row['up_pinball']:.4f}",
-                f"{row['dn_pinball']:.4f}",
+                VOL_TARGET_LABELS.get(row["target"], row["target"]),
+                f"{row['picp']:.1%}",
+                f"{row['mpiw']:.4f}",
+                f"{row['winkler']:.4f}",
             ]
-            for _, row in coverage_df.iterrows()
+            for _, row in conformal_90.iterrows()
         ]
         table = ax.table(
             cellText=table_rows,
-            colLabels=["Q", "Up Cov", "Dn Cov", "Up PB", "Dn PB"],
+            colLabels=["Target", "PICP 90", "MPIW 90", "Winkler 90"],
             cellLoc="center",
             loc="center",
         )
         table.auto_set_font_size(False)
         table.set_fontsize(9)
         table.scale(1.0, 1.4)
-        ax.set_title("Excursion Band Coverage (Empirical vs Nominal)")
+        ax.set_title("Conformal Interval Coverage (90%)")
 
     ax = axes[1, 1]
     ml_err = np.abs(
-        report_df["pred_next_yz_logvol"].to_numpy(dtype=float)
+        report_df[logvol_pred_col].to_numpy(dtype=float)
         - report_df["next_yz_logvol"].to_numpy(dtype=float)
     )
     ml_cum_mae = np.cumsum(ml_err) / np.arange(1, len(ml_err) + 1)
-    ax.plot(times, ml_cum_mae, color="#1f77b4", linewidth=1.2, label="ML")
+    ax.plot(times, ml_cum_mae, color="#1f77b4", linewidth=1.2, label="Served")
 
     har_pred = report_df["har_next_yz_logvol"].to_numpy(dtype=float)
     har_mask = np.isfinite(har_pred)
@@ -249,6 +336,18 @@ def save_vol_backtest_report(
         ax.plot(
             times[har_mask], har_cum_mae, color="#d62728", linewidth=1.1, label="HAR-RV"
         )
+    if not coverage_df.empty:
+        nominal_90 = coverage_df[coverage_df["quantile"] == 0.90]
+        if not nominal_90.empty:
+            row = nominal_90.iloc[0]
+            ax.text(
+                0.02,
+                0.04,
+                f"Excursion 90%: Up {row['up_coverage']:.1%} | Dn {row['dn_coverage']:.1%}",
+                transform=ax.transAxes,
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+            )
     ax.set_title("Cumulative MAE Over Time")
     ax.grid(alpha=0.2)
     ax.legend(loc="upper right")
@@ -289,24 +388,19 @@ def main() -> None:
     print("=" * 60)
 
     model_paths = {
-        "next_yz_logvol": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_logvol"
-        ),
-        "next_log_range": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_range"
-        ),
-        "next_up_exc": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_up_exc"
-        ),
-        "next_dn_exc": resolve_artifact_path(
-            symbol_dir, file_prefix, "VOL", "model_dn_exc"
-        ),
+        target: resolve_artifact_path(symbol_dir, file_prefix, "VOL", artifact_key)
+        for target, artifact_key in VOL_MODEL_ARTIFACT_KEYS.items()
     }
     feat_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "features")
     oos_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "oos_forecasts")
+    conformal_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "conformal")
 
     missing_models = [path for path in model_paths.values() if not os.path.exists(path)]
-    if missing_models or not os.path.exists(feat_path):
+    if (
+        missing_models
+        or not os.path.exists(feat_path)
+        or not os.path.exists(conformal_path)
+    ):
         print("  [!] Missing VOL artifacts. Run daily_volatility_engine.py first.")
         raise SystemExit(1)
 
@@ -314,6 +408,7 @@ def main() -> None:
     with open(feat_path, encoding="utf-8") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
     oos_map = joblib.load(oos_path) if os.path.exists(oos_path) else {}
+    conformal_artifact = joblib.load(conformal_path)
 
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
     tf_ctx = fetch_vol_timeframe_context(
@@ -388,7 +483,23 @@ def main() -> None:
 
     print(f"  [=] Total Daily Bars: {len(df_backtest)}")
     replay_df = replay_vol_forecasts(df_backtest, models, feature_cols, oos_map)
-    replay_df["har_next_yz_logvol"] = _build_har_logvol_oos_series(df_backtest)
+    active_targets = [target for target in models if target in df_backtest.columns]
+    har_models = conformal_artifact.get("har_models", {})
+    for target in active_targets:
+        replay_df[f"har_{target}"] = build_har_oos_series(
+            df_backtest,
+            target,
+            n_splits=8,
+            min_train_bars=VOL_MIN_TRAIN_BARS,
+            test_size_ratio=VOL_TEST_SIZE_RATIO,
+            purge_gap=VOL_PURGE_GAP,
+            har_model=har_models.get(target),
+        )
+    replay_df = enrich_vol_oos_frame(
+        replay_df,
+        conformal_artifact,
+        targets=active_targets,
+    )
 
     oos_count = int(replay_df["is_oos"].sum())
     print(f"  [=] Saved OOS forecasts reused on {oos_count} bars.")
@@ -403,18 +514,47 @@ def main() -> None:
             "pred_next_dn_exc": "next_dn_exc",
         }
     )
+    if "final_pred_next_up_exc" in report_scope.columns:
+        predictions["next_up_exc"] = report_scope["final_pred_next_up_exc"].to_numpy(
+            dtype=float
+        )
+    if "final_pred_next_dn_exc" in report_scope.columns:
+        predictions["next_dn_exc"] = report_scope["final_pred_next_dn_exc"].to_numpy(
+            dtype=float
+        )
     actuals = report_scope[["next_up_exc", "next_dn_exc"]]
     coverage_df = coverage_report(predictions, actuals)
+    conformal_df = conformal_coverage_report(
+        report_scope,
+        conformal_artifact,
+        targets=active_targets,
+    )
 
     print("\n" + "=" * 60)
     print("  VOL DAILY REPLAY METRICS")
     print("=" * 60)
-    for target in VOL_TARGETS:
+    for target in active_targets:
+        pred_col = (
+            f"final_pred_{target}"
+            if f"final_pred_{target}" in report_scope.columns
+            else f"pred_{target}"
+        )
         mae, rmse = _regression_metrics(
             report_scope[target],
-            report_scope[f"pred_{target}"].to_numpy(dtype=float),
+            report_scope[pred_col].to_numpy(dtype=float),
         )
-        print(f"  {VOL_TARGET_LABELS[target]:<18}: MAE {mae:.4f} | RMSE {rmse:.4f}")
+        summary = f"  {VOL_TARGET_LABELS[target]:<18}: MAE {mae:.4f} | RMSE {rmse:.4f}"
+        if target in {
+            "next_yz_logvol",
+            "next_log_range",
+            "next5d_yz_logvol",
+            "next5d_log_range",
+        }:
+            summary += (
+                f" | QLIKE "
+                f"{_qlike_loss(report_scope[target], report_scope[pred_col].to_numpy(dtype=float)):.4f}"
+            )
+        print(summary)
 
     logvol_mask = np.isfinite(report_scope["har_next_yz_logvol"].to_numpy(dtype=float))
     if logvol_mask.any():
@@ -423,12 +563,22 @@ def main() -> None:
             report_scope.loc[logvol_mask, "har_next_yz_logvol"].to_numpy(dtype=float),
         )
         print(f"  HAR-RV Log-Vol Baseline: MAE {har_mae:.4f} | RMSE {har_rmse:.4f}")
+    conformal_90 = conformal_df[conformal_df["level"] == 0.90].copy()
+    if not conformal_90.empty:
+        print("  Conformal 90% Coverage:")
+        for _, row in conformal_90.iterrows():
+            print(
+                f"    {VOL_TARGET_LABELS.get(row['target'], row['target']):<18}: "
+                f"PICP {row['picp']:.1%} | MPIW {row['mpiw']:.4f} | "
+                f"Winkler {row['winkler']:.4f}"
+            )
     print(f"  Report Scope Bars      : {len(report_scope)}")
     print("=" * 60)
 
     save_vol_backtest_report(
         replay_df,
         coverage_df,
+        conformal_df,
         artifact_paths_vol["backtest_report"],
         symbol=symbol,
     )

@@ -1435,28 +1435,38 @@ _INTRADAY_RV_SUMMARY_COLS = [
 
 
 def vol_target_engine_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """Add 4 forward volatility target columns to a daily DataFrame.
+    """Add 8 forward volatility target columns to a daily DataFrame.
 
-    Calls ToonMath.compute_vol_targets.
-    Returns the same DataFrame with 4 new columns added in-place.
+    Calls ToonMath.compute_vol_targets and ToonMath.compute_vol_targets_5d.
+    Returns the same DataFrame with 8 new columns added in-place.
     """
     _, TM = _init_julia()
 
     df = df.copy()
-    result = TM.compute_vol_targets(
+    result_1d = TM.compute_vol_targets(
+        _to_f64(df["open"].to_numpy()),
+        _to_f64(df["high"].to_numpy()),
+        _to_f64(df["low"].to_numpy()),
+        _to_f64(df["close"].to_numpy()),
+    )
+    result_5d = TM.compute_vol_targets_5d(
         _to_f64(df["open"].to_numpy()),
         _to_f64(df["high"].to_numpy()),
         _to_f64(df["low"].to_numpy()),
         _to_f64(df["close"].to_numpy()),
     )
 
-    def _col(name: str) -> np.ndarray:
-        return np.array(getattr(result, name), dtype=np.float64)
+    def _col(result_obj, name: str) -> np.ndarray:
+        return np.array(getattr(result_obj, name), dtype=np.float64)
 
-    df["next_yz_logvol"] = _col("next_yz_logvol")
-    df["next_log_range"] = _col("next_log_range")
-    df["next_up_exc"] = _col("next_up_excursion")
-    df["next_dn_exc"] = _col("next_dn_excursion")
+    df["next_yz_logvol"] = _col(result_1d, "next_yz_logvol")
+    df["next_log_range"] = _col(result_1d, "next_log_range")
+    df["next_up_exc"] = _col(result_1d, "next_up_excursion")
+    df["next_dn_exc"] = _col(result_1d, "next_dn_excursion")
+    df["next5d_yz_logvol"] = _col(result_5d, "next5d_yz_logvol")
+    df["next5d_log_range"] = _col(result_5d, "next5d_log_range")
+    df["next5d_up_exc"] = _col(result_5d, "next5d_up_excursion")
+    df["next5d_dn_exc"] = _col(result_5d, "next5d_dn_excursion")
     return df
 
 
@@ -1530,6 +1540,9 @@ _RV_FEAT_KEYS = [
     "jump_ratio",
     "rv_asym",
     "rv_skew",
+    "rs_plus",
+    "rs_minus",
+    "rs_leverage",
 ]
 
 
@@ -1597,9 +1610,9 @@ def rv_feature_engine_fast(
 ) -> pd.DataFrame:
     """Julia RV engine for 1H lane. Returns DataFrame with rv_* columns.
 
-    Primary: 11 features.
-    Per HTF:  11 features + 1 term structure = 12.
-    Total with all 3 HTFs: 11 + 3*12 = 47 columns.
+    Primary: 14 features.
+    Per HTF:  14 features + 1 term structure = 15.
+    Total with all 3 HTFs: 14 + 3*15 = 59 columns.
     """
     _, TM = _init_julia()
 
@@ -1646,9 +1659,9 @@ def rv_feature_engine_daily(
 ) -> pd.DataFrame:
     """Julia RV engine for 1D lane. Returns DataFrame with rv_* columns.
 
-    Primary: 11 features.
-    Per HTF:  11 features + 1 term structure = 12.
-    Total with all 5 HTFs: 11 + 5*12 = 71 columns.
+    Primary: 14 features.
+    Per HTF:  14 features + 1 term structure = 15.
+    Total with all 5 HTFs: 14 + 5*15 = 89 columns.
     """
     _, TM = _init_julia()
 
