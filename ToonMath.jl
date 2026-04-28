@@ -3314,7 +3314,7 @@ function compute_vol_targets(
             continue
         end
 
-        next_yz_logvol[i] = log1p(sqrt(max(yz_single_day_var * 252.0, 0.0)))
+        next_yz_logvol[i] = log1p(sqrt(max(yz_single_day_var * 252.0, 1e-6)))
         next_log_range[i] = log(h_1 / l_1)
         next_up_excursion[i] = log(h_1 / o_1)
         next_dn_excursion[i] = log(o_1 / l_1)
@@ -3408,7 +3408,7 @@ function compute_vol_targets_5d(
             continue
         end
 
-        next5d_yz_logvol[i] = log1p(sqrt(max((yz_var_sum / 5.0) * 252.0, 0.0)))
+        next5d_yz_logvol[i] = log1p(sqrt(max((yz_var_sum / 5.0) * 252.0, 1e-6)))
         next5d_log_range[i] = log(h_5d / l_5d)
         next5d_up_excursion[i] = log(h_5d / o_5d)
         next5d_dn_excursion[i] = log(o_5d / l_5d)

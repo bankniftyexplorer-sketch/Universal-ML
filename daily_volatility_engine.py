@@ -18,6 +18,7 @@ import lightgbm as lgb
 import matplotlib
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import Ridge
 
 matplotlib.use("Agg")
@@ -62,13 +63,23 @@ VOL_TARGETS_5D = [
 ]
 VOL_ALL_TARGETS = VOL_TARGETS + VOL_TARGETS_5D
 VOL_MIN_TRAIN_BARS = 500
-VOL_TEST_SIZE_RATIO = 0.12
+VOL_TEST_SIZE_MIN = 100
 VOL_PURGE_GAP = 1
 VOL_FEAT_BUDGET = 40
 VOL_N_SPLITS = 8
 VOL_OPTIONAL_FAIL_TIMEFRAMES = ("1H",)
 VOL_CONFORMAL_LEVELS = (0.80, 0.90, 0.95)
-VOL_HAR_FEATURE_COLS = ["har_rv_d", "har_rv_w", "har_rv_m"]
+VOL_CONFORMAL_DECAY = 0.98
+VOL_MIN_CALIBRATION_SAMPLES = 200
+VOL_HUBER_DELTA = 1.0
+VOL_HAR_FEATURE_COLS = [
+    "har_rv_d",
+    "har_rv_w",
+    "har_rv_m",
+    "har_rv_d_lag1",
+    "har_rv_d_lag2",
+    "har_rv_jump",
+]
 VOL_QLIKE_TARGETS = {
     "next_yz_logvol",
     "next_log_range",
@@ -140,13 +151,13 @@ def _vol_split_points(
     n: int,
     n_splits: int = VOL_N_SPLITS,
     min_train_bars: int = VOL_MIN_TRAIN_BARS,
-    test_size_ratio: float = VOL_TEST_SIZE_RATIO,
+    test_size: int | None = None,
 ) -> list[tuple[int, int]]:
+    resolved_test_size = max(VOL_TEST_SIZE_MIN, int(test_size or (n // 10)))
     split_points: list[tuple[int, int]] = []
     current_train_end = min_train_bars
     while current_train_end < n:
-        test_window_size = max(int(n * test_size_ratio), 100)
-        test_end = min(current_train_end + test_window_size, n)
+        test_end = min(current_train_end + resolved_test_size, n)
         if test_end <= current_train_end:
             break
         if (test_end - current_train_end) < 50:
@@ -199,11 +210,49 @@ def _qlike_eval_metric(
     return "qlike", _qlike_loss(y_true, y_pred), False
 
 
+def _huber_loss(
+    y_true: pd.Series | np.ndarray,
+    y_pred: pd.Series | np.ndarray,
+    delta: float = VOL_HUBER_DELTA,
+) -> float:
+    true = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(true) & np.isfinite(pred)
+    if not mask.any():
+        return float("nan")
+    err = pred[mask] - true[mask]
+    abs_err = np.abs(err)
+    quad = np.minimum(abs_err, delta)
+    lin = abs_err - quad
+    return float(np.mean((0.5 * quad * quad) + (delta * lin)))
+
+
+def _huber_objective(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    delta: float = VOL_HUBER_DELTA,
+) -> tuple[np.ndarray, np.ndarray]:
+    err = np.asarray(y_pred, dtype=float) - np.asarray(y_true, dtype=float)
+    abs_err = np.abs(err)
+    grad = np.where(abs_err <= delta, err, delta * np.sign(err))
+    hess = np.where(abs_err <= delta, 1.0, 0.01)
+    return grad, hess
+
+
+def _huber_eval_metric(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> tuple[str, float, bool]:
+    return "huber", _huber_loss(y_true, y_pred), False
+
+
 def _register_pickle_objectives() -> None:
     main_module = sys.modules.get("__main__")
     if main_module is not None:
         main_module._qlike_objective = _qlike_objective
         main_module._qlike_eval_metric = _qlike_eval_metric
+        main_module._huber_objective = _huber_objective
+        main_module._huber_eval_metric = _huber_eval_metric
 
 
 sys.modules.setdefault("daily_volatility_engine", sys.modules[__name__])
@@ -211,16 +260,34 @@ _register_pickle_objectives()
 
 
 def _build_lgbm_ensemble_vol(target_col: str) -> list[lgb.LGBMRegressor]:
+    models, _ = _build_lgbm_ensemble_vol_with_eval_metrics(target_col)
+    return models
+
+
+def _build_lgbm_ensemble_vol_with_eval_metrics(
+    target_col: str,
+) -> tuple[list[lgb.LGBMRegressor], list[object]]:
     specs = _load_hyperparams_config()["classifier_ensemble"]
     if not isinstance(specs, list) or not specs:
         raise ValueError("`classifier_ensemble` must be a non-empty list.")
 
-    objective = _qlike_objective if _is_qlike_target(target_col) else "mae"
-    metric = "None" if _is_qlike_target(target_col) else "mae"
+    objective_cycle = (
+        [
+            (_qlike_objective, "None", _qlike_eval_metric),
+            ("mae", "mae", "mae"),
+            (_huber_objective, "None", _huber_eval_metric),
+        ]
+        if _is_qlike_target(target_col)
+        else [("mae", "mae", "mae")]
+    )
     models: list[lgb.LGBMRegressor] = []
+    eval_metrics: list[object] = []
     for idx, spec in enumerate(specs, start=1):
         if not isinstance(spec, dict):
             raise ValueError(f"`classifier_ensemble[{idx - 1}]` must be an object.")
+        objective, metric, eval_metric = objective_cycle[
+            (idx - 1) % len(objective_cycle)
+        ]
         params = dict(spec)
         params.update(
             {
@@ -231,7 +298,8 @@ def _build_lgbm_ensemble_vol(target_col: str) -> list[lgb.LGBMRegressor]:
             }
         )
         models.append(lgb.LGBMRegressor(**params))
-    return models
+        eval_metrics.append(eval_metric)
+    return models, eval_metrics
 
 
 def _fit_lgbm_with_inner_validation_vol(
@@ -263,8 +331,8 @@ def _fit_lgbm_with_inner_validation_vol(
     y_val_inner = y_train_full.iloc[-inner_val_size:]
 
     fitted_models: list[lgb.LGBMRegressor] = []
-    eval_metric = _qlike_eval_metric if _is_qlike_target(target_col) else "mae"
-    for model in _build_lgbm_ensemble_vol(target_col):
+    models, eval_metrics = _build_lgbm_ensemble_vol_with_eval_metrics(target_col)
+    for model, eval_metric in zip(models, eval_metrics):
         model.fit(
             X_train_inner,
             y_train_inner,
@@ -404,7 +472,7 @@ def build_har_oos_series(
     *,
     n_splits: int = VOL_N_SPLITS,
     min_train_bars: int = VOL_MIN_TRAIN_BARS,
-    test_size_ratio: float = VOL_TEST_SIZE_RATIO,
+    test_size: int | None = None,
     purge_gap: int = VOL_PURGE_GAP,
     har_model: dict[str, object] | None = None,
 ) -> np.ndarray:
@@ -413,7 +481,7 @@ def build_har_oos_series(
         len(df),
         n_splits=n_splits,
         min_train_bars=min_train_bars,
-        test_size_ratio=test_size_ratio,
+        test_size=test_size,
     )
     for train_end, test_end in split_points:
         purged_train_end = max(0, train_end - purge_gap)
@@ -484,6 +552,7 @@ def build_vol_conformal_artifact(
     oos_frame: pd.DataFrame,
     har_models: dict[str, dict[str, object]],
     targets: list[str] | None = None,
+    calibrators: dict[str, IsotonicRegression] | None = None,
 ) -> dict[str, object]:
     target_list = [
         target
@@ -492,8 +561,9 @@ def build_vol_conformal_artifact(
         and f"pred_{target}" in oos_frame.columns
     ]
     artifact: dict[str, object] = {
-        "version": "VOL_v5.4",
+        "version": "VOL_v5.5",
         "levels": [_conformal_level_key(level) for level in VOL_CONFORMAL_LEVELS],
+        "conformal_decay": VOL_CONFORMAL_DECAY,
         "oos_mean_logvol": float("nan"),
         "oos_std_logvol": float("nan"),
         "har_models": har_models,
@@ -515,10 +585,26 @@ def build_vol_conformal_artifact(
         har_pred = oos_frame[f"har_{target}"].to_numpy(dtype=float)
         weights = _compute_bates_granger_weights(actual, ml_pred, har_pred)
         combined = _combine_forecast_arrays(ml_pred, har_pred, weights)
+        calibrator = (calibrators or {}).get(target)
+        if calibrator is not None:
+            combined = _apply_vol_calibrator_array(combined, calibrator)
         mask = np.isfinite(actual) & np.isfinite(combined)
         abs_residuals = np.abs(actual[mask] - combined[mask])
+        if abs_residuals.size:
+            weights_decay = VOL_CONFORMAL_DECAY ** np.arange(
+                abs_residuals.size - 1,
+                -1,
+                -1,
+                dtype=float,
+            )
+        else:
+            weights_decay = np.array([], dtype=float)
         widths = {
-            _conformal_level_key(level): float(np.nanquantile(abs_residuals, level))
+            _conformal_level_key(level): _weighted_quantile(
+                abs_residuals,
+                weights_decay,
+                level,
+            )
             if abs_residuals.size
             else float("nan")
             for level in VOL_CONFORMAL_LEVELS
@@ -527,8 +613,83 @@ def build_vol_conformal_artifact(
             "weights": weights,
             "widths": widths,
             "sample_size": int(mask.sum()),
+            "calibrated": calibrator is not None,
         }
     return artifact
+
+
+def _weighted_quantile(
+    values: np.ndarray,
+    weights: np.ndarray,
+    quantile: float,
+) -> float:
+    vals = np.asarray(values, dtype=float)
+    wts = np.asarray(weights, dtype=float)
+    mask = np.isfinite(vals) & np.isfinite(wts) & (wts > 0.0)
+    if not mask.any():
+        return float("nan")
+    vals = vals[mask]
+    wts = wts[mask]
+    order = np.argsort(vals)
+    sorted_vals = vals[order]
+    sorted_weights = wts[order]
+    cumsum = np.cumsum(sorted_weights)
+    cutoff = float(np.clip(quantile, 0.0, 1.0)) * cumsum[-1]
+    idx = int(np.searchsorted(cumsum, cutoff, side="left"))
+    return float(sorted_vals[min(idx, len(sorted_vals) - 1)])
+
+
+def _apply_vol_calibrator_array(
+    values: np.ndarray | pd.Series,
+    calibrator: IsotonicRegression | None,
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).copy()
+    if calibrator is None:
+        return arr
+    mask = np.isfinite(arr)
+    if mask.any():
+        arr[mask] = np.asarray(calibrator.predict(arr[mask]), dtype=float)
+    return arr
+
+
+def _apply_vol_calibrator_value(
+    value: float,
+    calibrator: IsotonicRegression | None,
+) -> float:
+    if calibrator is None or not np.isfinite(value):
+        return float(value)
+    return float(np.asarray(calibrator.predict(np.array([value], dtype=float)))[0])
+
+
+def _calibrate_vol_forecasts(
+    oos_frame: pd.DataFrame,
+    targets: list[str] | None = None,
+) -> dict[str, IsotonicRegression]:
+    calibrators: dict[str, IsotonicRegression] = {}
+    target_list = [
+        target
+        for target in (targets or VOL_ALL_TARGETS)
+        if f"actual_{target}" in oos_frame.columns
+    ]
+    for target in target_list:
+        pred_col = (
+            f"final_pred_{target}"
+            if f"final_pred_{target}" in oos_frame.columns
+            else f"pred_{target}"
+        )
+        if pred_col not in oos_frame.columns:
+            continue
+        actual = oos_frame[f"actual_{target}"].to_numpy(dtype=float)
+        pred = oos_frame[pred_col].to_numpy(dtype=float)
+        mask = np.isfinite(actual) & np.isfinite(pred)
+        if mask.sum() < VOL_MIN_CALIBRATION_SAMPLES:
+            continue
+        if np.unique(pred[mask]).size < 2:
+            continue
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(pred[mask], actual[mask])
+        calibrators[target] = iso
+    return calibrators
 
 
 def combine_vol_forecasts(
@@ -536,6 +697,7 @@ def combine_vol_forecasts(
     har_forecasts: dict[str, float] | None,
     conformal_artifact: dict[str, object] | None,
     *,
+    calibrators: dict[str, IsotonicRegression] | None = None,
     targets: list[str] | None = None,
 ) -> dict[str, float]:
     target_list = targets or list(ml_forecasts)
@@ -551,12 +713,16 @@ def combine_vol_forecasts(
         ml_value = float(ml_forecasts[target])
         har_value = float(har_forecasts.get(target, np.nan))
         weights = target_meta.get(target, {}).get("weights", {"ml": 1.0, "har": 0.0})
-        combined[target] = float(
+        combined_value = float(
             _combine_forecast_arrays(
                 np.array([ml_value], dtype=float),
                 np.array([har_value], dtype=float),
                 weights,
             )[0]
+        )
+        combined[target] = _apply_vol_calibrator_value(
+            combined_value,
+            (calibrators or {}).get(target),
         )
     return combined
 
@@ -565,6 +731,7 @@ def enrich_vol_oos_frame(
     oos_frame: pd.DataFrame,
     conformal_artifact: dict[str, object] | None,
     *,
+    calibrators: dict[str, IsotonicRegression] | None = None,
     targets: list[str] | None = None,
 ) -> pd.DataFrame:
     enriched = oos_frame.copy()
@@ -588,6 +755,10 @@ def enrich_vol_oos_frame(
             enriched[f"pred_{target}"].to_numpy(dtype=float),
             np.asarray(har_vals, dtype=float),
             weights,
+        )
+        final_pred = _apply_vol_calibrator_array(
+            final_pred,
+            (calibrators or {}).get(target),
         )
         enriched[f"final_pred_{target}"] = final_pred
 
@@ -927,6 +1098,7 @@ def build_daily_volatility_feature_frame(
     intra_df = intraday_rv_summary_daily(df_1d_labelled, df_1h)
     for col in intra_df.columns:
         df_full[col] = intra_df[col].values
+    df_full["intra_available"] = 1.0 if df_1h is not None and not df_1h.empty else 0.0
     log(f"  [TOON VOL] Intraday RV features injected: {len(intra_df.columns)} columns")
 
     log("  [TOON VOL] Layer 2: Injecting macro regime overlays (6M/12M)...")
@@ -954,6 +1126,17 @@ def add_har_rv_components(df: pd.DataFrame) -> pd.DataFrame:
         .mean()
         .to_numpy(dtype=float)
     )
+    df["har_rv_d_lag1"] = pd.Series(df["har_rv_d"]).shift(1).fillna(0.0)
+    df["har_rv_d_lag2"] = pd.Series(df["har_rv_d"]).shift(2).fillna(0.0)
+    jump_ratio = (
+        df["rv_1d_jump_ratio"].to_numpy(dtype=float)
+        if "rv_1d_jump_ratio" in df.columns
+        else np.zeros(len(df), dtype=float)
+    )
+    jump_ratio = np.clip(
+        np.nan_to_num(jump_ratio, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0
+    )
+    df["har_rv_jump"] = df["har_rv_d"].to_numpy(dtype=float) * jump_ratio
     return df
 
 
@@ -1008,7 +1191,7 @@ def walk_forward_vol(
     feature_cols: list[str],
     n_splits: int = VOL_N_SPLITS,
     min_train_bars: int = VOL_MIN_TRAIN_BARS,
-    test_size_ratio: float = VOL_TEST_SIZE_RATIO,
+    test_size: int | None = None,
     purge_gap: int = VOL_PURGE_GAP,
 ) -> dict:
     active_targets = [target for target in VOL_ALL_TARGETS if target in df.columns]
@@ -1025,15 +1208,16 @@ def walk_forward_vol(
         n,
         n_splits=n_splits,
         min_train_bars=min_train_bars,
-        test_size_ratio=test_size_ratio,
+        test_size=test_size,
     )
     if not split_points:
         print("  Error: Could not determine valid split points for VOL walk-forward.")
         return {}
 
+    resolved_test_size = max(VOL_TEST_SIZE_MIN, int(test_size or (n // 10)))
     print(
         f"\n  VOL walk-forward: {len(split_points)} splits, "
-        f"min_train_bars={min_train_bars}, test_ratio={test_size_ratio:.2f}, "
+        f"min_train_bars={min_train_bars}, test_size={resolved_test_size}, "
         f"purge_gap={purge_gap}"
     )
     print(f"  Total daily bars: {n}")
@@ -1224,7 +1408,7 @@ def fold_consensus_feature_selection_vol(
     candidate_feature_cols: list[str],
     n_splits: int = VOL_N_SPLITS,
     min_train_bars: int = VOL_MIN_TRAIN_BARS,
-    test_size_ratio: float = VOL_TEST_SIZE_RATIO,
+    test_size: int | None = None,
     purge_gap: int = VOL_PURGE_GAP,
     consensus_threshold: float = 0.50,
     ranking_targets: list[str] | None = None,
@@ -1246,7 +1430,7 @@ def fold_consensus_feature_selection_vol(
         n,
         n_splits=n_splits,
         min_train_bars=min_train_bars,
-        test_size_ratio=test_size_ratio,
+        test_size=test_size,
     )
     if not split_points:
         print("  [Nested VOL] No valid split points.")
@@ -1352,7 +1536,7 @@ def fold_consensus_feature_selection_vol(
         consensus_features,
         n_splits=n_splits,
         min_train_bars=min_train_bars,
-        test_size_ratio=test_size_ratio,
+        test_size=test_size,
         purge_gap=purge_gap,
     )
     if final_wf:
@@ -1367,6 +1551,7 @@ def save_vol_report(
     *,
     symbol: str,
     conformal_artifact: dict[str, object] | None = None,
+    calibrators: dict[str, IsotonicRegression] | None = None,
 ) -> None:
     oos_frame = wf_results.get("oos_frame")
     if oos_frame is None or len(oos_frame) == 0:
@@ -1376,6 +1561,7 @@ def save_vol_report(
     oos_frame = enrich_vol_oos_frame(
         oos_frame,
         conformal_artifact,
+        calibrators=calibrators,
         targets=wf_results.get("targets"),
     )
     plot_targets = [
@@ -1625,7 +1811,6 @@ def main() -> None:
         candidate_feature_cols,
         n_splits=VOL_N_SPLITS,
         min_train_bars=VOL_MIN_TRAIN_BARS,
-        test_size_ratio=VOL_TEST_SIZE_RATIO,
         purge_gap=VOL_PURGE_GAP,
         ranking_targets=VOL_TARGETS,
     )
@@ -1633,10 +1818,24 @@ def main() -> None:
         print("  [TOON VOL] Nested feature selection failed. Aborting.")
         raise SystemExit(1)
 
+    provisional_conformal_artifact = build_vol_conformal_artifact(
+        wf_results["oos_frame"],
+        wf_results["final_har_models"],
+        targets=wf_results["targets"],
+    )
+    vol_calibrators = _calibrate_vol_forecasts(
+        enrich_vol_oos_frame(
+            wf_results["oos_frame"],
+            provisional_conformal_artifact,
+            targets=wf_results["targets"],
+        ),
+        targets=wf_results["targets"],
+    )
     conformal_artifact = build_vol_conformal_artifact(
         wf_results["oos_frame"],
         wf_results["final_har_models"],
         targets=wf_results["targets"],
+        calibrators=vol_calibrators,
     )
 
     print(f"\n  [TOON VOL] Consensus feature count: {len(feature_cols)}")
@@ -1669,12 +1868,14 @@ def main() -> None:
             wf_results["final_models"][target], artifact_paths_vol[artifact_key]
         )
     joblib.dump(wf_results["oos_forecast_map"], artifact_paths_vol["oos_forecasts"])
+    joblib.dump(vol_calibrators, artifact_paths_vol["calibrators"])
     joblib.dump(conformal_artifact, artifact_paths_vol["conformal"])
     save_vol_report(
         wf_results,
         artifact_paths_vol["ml_report"],
         symbol=symbol,
         conformal_artifact=conformal_artifact,
+        calibrators=vol_calibrators,
     )
 
     print(f"\n  VOL feature list saved to '{artifact_paths_vol['features']}'")
@@ -1688,6 +1889,10 @@ def main() -> None:
     print(
         f"  VOL OOS forecast map saved to '{artifact_paths_vol['oos_forecasts']}' "
         f"({len(wf_results['oos_forecast_map'])} bars)"
+    )
+    print(
+        f"  VOL calibrators saved to '{artifact_paths_vol['calibrators']}' "
+        f"({len(vol_calibrators)} targets)"
     )
     print(f"  VOL conformal artifact saved to '{artifact_paths_vol['conformal']}'")
     print(f"  VOL report saved to '{artifact_paths_vol['ml_report']}'")
@@ -1710,6 +1915,7 @@ def main() -> None:
         latest_ml_forecasts,
         latest_har_forecasts,
         conformal_artifact,
+        calibrators=vol_calibrators,
         targets=wf_results["targets"],
     )
     if df_1h is not None and not df_1h.empty:

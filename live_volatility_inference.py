@@ -71,6 +71,9 @@ def main() -> None:
         for target, artifact_key in VOL_MODEL_ARTIFACT_KEYS.items()
     }
     feat_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "features")
+    calibrator_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "VOL", "calibrators"
+    )
     conformal_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "conformal")
 
     if (
@@ -87,6 +90,9 @@ def main() -> None:
     with open(feat_path, encoding="utf-8") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
     models = {target: joblib.load(path) for target, path in model_paths.items()}
+    calibrators = (
+        joblib.load(calibrator_path) if os.path.exists(calibrator_path) else {}
+    )
     conformal_artifact = joblib.load(conformal_path)
 
     sys.path.append(os.path.join(project_root, "data_vault"))
@@ -161,6 +167,7 @@ def main() -> None:
         ml_forecasts,
         har_forecasts,
         conformal_artifact,
+        calibrators=calibrators,
         targets=list(ml_forecasts),
     )
 

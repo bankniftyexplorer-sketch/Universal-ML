@@ -27,7 +27,6 @@ from daily_volatility_engine import (
     VOL_MODEL_ARTIFACT_KEYS,
     VOL_PURGE_GAP,
     VOL_TARGET_LABELS,
-    VOL_TEST_SIZE_RATIO,
     _conformal_level_key,
     _qlike_loss,
     _regression_metrics,
@@ -132,6 +131,7 @@ def conformal_coverage_report(
     replay_df: pd.DataFrame,
     conformal_artifact: dict[str, object] | None,
     *,
+    calibrators: dict[str, object] | None = None,
     targets: list[str] | None = None,
 ) -> pd.DataFrame:
     target_list = [
@@ -142,6 +142,7 @@ def conformal_coverage_report(
     enriched = enrich_vol_oos_frame(
         replay_df,
         conformal_artifact,
+        calibrators=calibrators,
         targets=target_list,
     )
     rows: list[dict[str, float | str]] = []
@@ -393,6 +394,9 @@ def main() -> None:
     }
     feat_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "features")
     oos_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "oos_forecasts")
+    calibrator_path = resolve_artifact_path(
+        symbol_dir, file_prefix, "VOL", "calibrators"
+    )
     conformal_path = resolve_artifact_path(symbol_dir, file_prefix, "VOL", "conformal")
 
     missing_models = [path for path in model_paths.values() if not os.path.exists(path)]
@@ -408,6 +412,9 @@ def main() -> None:
     with open(feat_path, encoding="utf-8") as handle:
         feature_cols = [line.strip() for line in handle if line.strip()]
     oos_map = joblib.load(oos_path) if os.path.exists(oos_path) else {}
+    calibrators = (
+        joblib.load(calibrator_path) if os.path.exists(calibrator_path) else {}
+    )
     conformal_artifact = joblib.load(conformal_path)
 
     bridge = InferenceBridge(db_path=os.path.join(data_dir, "data_vault", "ohlcv.db"))
@@ -491,13 +498,13 @@ def main() -> None:
             target,
             n_splits=8,
             min_train_bars=VOL_MIN_TRAIN_BARS,
-            test_size_ratio=VOL_TEST_SIZE_RATIO,
             purge_gap=VOL_PURGE_GAP,
             har_model=har_models.get(target),
         )
     replay_df = enrich_vol_oos_frame(
         replay_df,
         conformal_artifact,
+        calibrators=calibrators,
         targets=active_targets,
     )
 
@@ -527,6 +534,7 @@ def main() -> None:
     conformal_df = conformal_coverage_report(
         report_scope,
         conformal_artifact,
+        calibrators=calibrators,
         targets=active_targets,
     )
 
