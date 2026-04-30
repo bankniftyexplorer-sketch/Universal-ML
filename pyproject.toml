@@ -8,7 +8,7 @@ dependencies = [
     "joblib==1.5.3",
     "juliacall==0.9.31",
     "lightgbm==4.6.0",
-    "matplotlib==3.10.8",
+    "matplotlib==3.10.9",
     "numba>=0.60.0",
     "numpy==2.4.3",
     "pandas==3.0.1",
