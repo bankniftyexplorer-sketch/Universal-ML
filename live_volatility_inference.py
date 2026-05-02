@@ -201,6 +201,14 @@ def main() -> None:
     print(f"  VOL live forecast saved to '{artifact_paths_vol['live_forecast']}'")
     print_vol_forecast(payload, title=f"{symbol} VOL LIVE FORECAST")
 
+    # Auto-generate the visual PNG dashboard
+    try:
+        from plot_vol_forecast import plot_live_forecast
+
+        plot_live_forecast(symbol, project_root)
+    except Exception as e:
+        print(f"  [!] Failed to generate VOL dashboard image: {e}")
+
 
 if __name__ == "__main__":
     main()
