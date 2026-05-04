@@ -1729,6 +1729,10 @@ _VIX_INTERACTION_COLS = [
     "vix_x_jump",
     "vix_x_vov",
 ]
+_VIX_REGIME_THRESHOLDS_DEFAULT = (15.0, 25.0, 35.0)
+_VIX_REGIME_THRESHOLDS_BY_SYMBOL = {
+    "INDIA_VIX": (12.0, 18.0, 25.0),
+}
 
 
 def _zero_vix_features(index: pd.Index) -> pd.DataFrame:
@@ -1736,6 +1740,28 @@ def _zero_vix_features(index: pd.Index) -> pd.DataFrame:
     return pd.DataFrame(
         {col: np.zeros(len(index), dtype=np.float64) for col in _VIX_FEATURE_COLS},
         index=index,
+    )
+
+
+def _resolve_vix_regime_thresholds(
+    df_vix: pd.DataFrame | None,
+) -> tuple[float, float, float]:
+    if df_vix is None:
+        return _VIX_REGIME_THRESHOLDS_DEFAULT
+    attrs = df_vix.attrs if isinstance(getattr(df_vix, "attrs", None), dict) else {}
+    vix_symbol = (
+        str(
+            attrs.get("vix_companion_symbol")
+            or attrs.get("resolved_source_symbol")
+            or attrs.get("pair_symbol")
+            or ""
+        )
+        .strip()
+        .upper()
+    )
+    return _VIX_REGIME_THRESHOLDS_BY_SYMBOL.get(
+        vix_symbol,
+        _VIX_REGIME_THRESHOLDS_DEFAULT,
     )
 
 
@@ -1789,9 +1815,13 @@ def vix_feature_engine_daily(
     else:
         rv_log = np.zeros(len(df_1d), dtype=np.float64)
 
+    regime_low, regime_mid, regime_high = _resolve_vix_regime_thresholds(df_vix)
     jl_result = TM.compute_vix_features(
         _to_f64(vix_closes),
         _to_f64(rv_log),
+        regime_low=float(regime_low),
+        regime_mid=float(regime_mid),
+        regime_high=float(regime_high),
     )
 
     result = pd.DataFrame(

@@ -66,7 +66,7 @@ VOL_TARGETS_5D = [
 VOL_ALL_TARGETS = VOL_TARGETS + VOL_TARGETS_5D
 VOL_MIN_TRAIN_BARS = 500
 VOL_TEST_SIZE_MIN = 100
-VOL_PURGE_GAP = 1
+VOL_PURGE_GAP = 5
 VOL_FEAT_BUDGET = 40
 VOL_N_SPLITS = 8
 VOL_OPTIONAL_FAIL_TIMEFRAMES = ("1H",)
@@ -74,6 +74,8 @@ VOL_CONFORMAL_LEVELS = (0.80, 0.90, 0.95)
 VOL_CONFORMAL_DECAY = 0.98
 VOL_MIN_CALIBRATION_SAMPLES = 200
 VOL_HUBER_DELTA = 1.0
+VOL_EXCURSION_QUANTILE_ALPHA = 0.75
+VOL_INTRADAY_SYNTHETIC_VOL_MAX_RATIO = 0.90
 VOL_HAR_FEATURE_COLS = [
     "har_rv_d",
     "har_rv_w",
@@ -173,6 +175,15 @@ def _vol_split_points(
 
 def _is_qlike_target(target_col: str) -> bool:
     return target_col in VOL_QLIKE_TARGETS
+
+
+def _is_excursion_target(target_col: str) -> bool:
+    return target_col in {
+        "next_up_exc",
+        "next_dn_exc",
+        "next5d_up_exc",
+        "next5d_dn_exc",
+    }
 
 
 def _conformal_level_key(level: float) -> str:
@@ -285,21 +296,34 @@ def _build_lgbm_ensemble_vol_with_eval_metrics(
     if not isinstance(specs, list) or not specs:
         raise ValueError("`classifier_ensemble` must be a non-empty list.")
 
-    objective_cycle = (
+    objective_cycle: list[tuple[object, str, object, dict[str, float]]] = (
         [
-            (_qlike_objective, "None", _qlike_eval_metric),
-            ("mae", "mae", "mae"),
-            (_huber_objective, "None", _huber_eval_metric),
+            (_qlike_objective, "None", _qlike_eval_metric, {}),
+            ("mae", "mae", "mae", {}),
+            (_huber_objective, "None", _huber_eval_metric, {}),
         ]
         if _is_qlike_target(target_col)
-        else [("mae", "mae", "mae")]
+        else (
+            [
+                ("mae", "mae", "mae", {}),
+                (_huber_objective, "None", _huber_eval_metric, {}),
+                (
+                    "quantile",
+                    "quantile",
+                    "quantile",
+                    {"alpha": VOL_EXCURSION_QUANTILE_ALPHA},
+                ),
+            ]
+            if _is_excursion_target(target_col)
+            else [("mae", "mae", "mae", {})]
+        )
     )
     models: list[lgb.LGBMRegressor] = []
     eval_metrics: list[object] = []
     for idx, spec in enumerate(specs, start=1):
         if not isinstance(spec, dict):
             raise ValueError(f"`classifier_ensemble[{idx - 1}]` must be an object.")
-        objective, metric, eval_metric = objective_cycle[
+        objective, metric, eval_metric, extra_params = objective_cycle[
             (idx - 1) % len(objective_cycle)
         ]
         params = dict(spec)
@@ -311,6 +335,7 @@ def _build_lgbm_ensemble_vol_with_eval_metrics(
                 "verbose": -1,
             }
         )
+        params.update(extra_params)
         models.append(lgb.LGBMRegressor(**params))
         eval_metrics.append(eval_metric)
     return models, eval_metrics
@@ -374,6 +399,12 @@ def _regression_metrics(
     mae = float(np.mean(np.abs(err)))
     rmse = float(np.sqrt(np.mean(err * err)))
     return mae, rmse
+
+
+def _edge_vs_har_mae(mae: float, har_mae: float) -> float:
+    if not np.isfinite(mae) or not np.isfinite(har_mae) or har_mae <= 0.0:
+        return float("nan")
+    return float(1.0 - (mae / har_mae))
 
 
 def _nanmean_metric(rows: list[dict], key: str) -> float:
@@ -575,9 +606,10 @@ def build_vol_conformal_artifact(
         and f"pred_{target}" in oos_frame.columns
     ]
     artifact: dict[str, object] = {
-        "version": "VOL_v5.5",
+        "version": "VOL_v5.6",
         "levels": [_conformal_level_key(level) for level in VOL_CONFORMAL_LEVELS],
         "conformal_decay": VOL_CONFORMAL_DECAY,
+        "interval_style": "asymmetric",
         "oos_mean_logvol": float("nan"),
         "oos_std_logvol": float("nan"),
         "har_models": har_models,
@@ -603,7 +635,8 @@ def build_vol_conformal_artifact(
         if calibrator is not None:
             combined = _apply_vol_calibrator_array(combined, calibrator)
         mask = np.isfinite(actual) & np.isfinite(combined)
-        abs_residuals = np.abs(actual[mask] - combined[mask])
+        residuals = actual[mask] - combined[mask]
+        abs_residuals = np.abs(residuals)
         if abs_residuals.size:
             weights_decay = VOL_CONFORMAL_DECAY ** np.arange(
                 abs_residuals.size - 1,
@@ -613,19 +646,48 @@ def build_vol_conformal_artifact(
             )
         else:
             weights_decay = np.array([], dtype=float)
-        widths = {
-            _conformal_level_key(level): _weighted_quantile(
-                abs_residuals,
-                weights_decay,
-                level,
+        lower_mask = residuals < 0.0
+        upper_mask = residuals > 0.0
+        lower_residuals = (-residuals[lower_mask]).astype(float, copy=False)
+        upper_residuals = residuals[upper_mask].astype(float, copy=False)
+        lower_weights = (
+            weights_decay[lower_mask] if weights_decay.size else weights_decay
+        )
+        upper_weights = (
+            weights_decay[upper_mask] if weights_decay.size else weights_decay
+        )
+        widths: dict[str, float] = {}
+        bounds: dict[str, dict[str, float]] = {}
+        for level in VOL_CONFORMAL_LEVELS:
+            level_key = _conformal_level_key(level)
+            symmetric_width = (
+                _weighted_quantile(abs_residuals, weights_decay, level)
+                if abs_residuals.size
+                else float("nan")
             )
-            if abs_residuals.size
-            else float("nan")
-            for level in VOL_CONFORMAL_LEVELS
-        }
+            low_width = (
+                _weighted_quantile(lower_residuals, lower_weights, level)
+                if lower_residuals.size
+                else symmetric_width
+            )
+            high_width = (
+                _weighted_quantile(upper_residuals, upper_weights, level)
+                if upper_residuals.size
+                else symmetric_width
+            )
+            if not np.isfinite(low_width):
+                low_width = symmetric_width
+            if not np.isfinite(high_width):
+                high_width = symmetric_width
+            widths[level_key] = float(symmetric_width)
+            bounds[level_key] = {
+                "low": float(low_width),
+                "high": float(high_width),
+            }
         artifact["targets"][target] = {
             "weights": weights,
             "widths": widths,
+            "bounds": bounds,
             "sample_size": int(mask.sum()),
             "calibrated": calibrator is not None,
         }
@@ -651,6 +713,25 @@ def _weighted_quantile(
     cutoff = float(np.clip(quantile, 0.0, 1.0)) * cumsum[-1]
     idx = int(np.searchsorted(cumsum, cutoff, side="left"))
     return float(sorted_vals[min(idx, len(sorted_vals) - 1)])
+
+
+def _resolve_conformal_widths(
+    target_meta: dict[str, object],
+    level_key: str,
+) -> tuple[float, float]:
+    bounds = target_meta.get("bounds", {})
+    fallback_width = float(target_meta.get("widths", {}).get(level_key, np.nan))
+    if isinstance(bounds, dict):
+        bound_entry = bounds.get(level_key, {})
+        if isinstance(bound_entry, dict):
+            low_width = float(bound_entry.get("low", np.nan))
+            high_width = float(bound_entry.get("high", np.nan))
+            if not np.isfinite(low_width):
+                low_width = fallback_width
+            if not np.isfinite(high_width):
+                high_width = fallback_width
+            return low_width, high_width
+    return fallback_width, fallback_width
 
 
 def _apply_vol_calibrator_array(
@@ -776,12 +857,15 @@ def enrich_vol_oos_frame(
         )
         enriched[f"final_pred_{target}"] = final_pred
 
-        widths = target_meta.get(target, {}).get("widths", {})
+        target_interval_meta = target_meta.get(target, {})
         for level in VOL_CONFORMAL_LEVELS:
             level_key = _conformal_level_key(level)
-            width = float(widths.get(level_key, np.nan))
-            enriched[f"interval_lo_{level_key}_{target}"] = final_pred - width
-            enriched[f"interval_hi_{level_key}_{target}"] = final_pred + width
+            low_width, high_width = _resolve_conformal_widths(
+                target_interval_meta,
+                level_key,
+            )
+            enriched[f"interval_lo_{level_key}_{target}"] = final_pred - low_width
+            enriched[f"interval_hi_{level_key}_{target}"] = final_pred + high_width
     return enriched
 
 
@@ -833,16 +917,21 @@ def _build_target_intervals(
     )
     intervals: dict[str, dict[str, dict[str, float]]] = {}
     for target, forecast in forecasts.items():
-        widths = target_meta.get(target, {}).get("widths", {})
+        target_interval_meta = target_meta.get(target, {})
         target_intervals: dict[str, dict[str, float]] = {}
         for level in VOL_CONFORMAL_LEVELS:
             level_key = _conformal_level_key(level)
-            width = float(widths.get(level_key, np.nan))
-            if np.isfinite(width):
+            low_width, high_width = _resolve_conformal_widths(
+                target_interval_meta,
+                level_key,
+            )
+            if np.isfinite(low_width) and np.isfinite(high_width):
                 target_intervals[level_key] = {
-                    "low": float(forecast - width),
-                    "high": float(forecast + width),
-                    "width": float(width),
+                    "low": float(forecast - low_width),
+                    "high": float(forecast + high_width),
+                    "low_width": float(low_width),
+                    "high_width": float(high_width),
+                    "width": float(max(low_width, high_width)),
                 }
         if target_intervals:
             intervals[target] = target_intervals
@@ -1023,7 +1112,7 @@ def print_vol_forecast(
         )
     if not payload.get("intraday_1h_used", False):
         print(
-            "  [1H optional reference unavailable or failed quality; intra_* features zeroed]"
+            "  [1H optional reference unavailable, failed quality, or intentionally ignored; intra_* features zeroed]"
         )
     print("======================================================================")
 
@@ -1070,6 +1159,37 @@ def fetch_vol_timeframe_context(
         "df_1h_status": df_1h_status,
         "df_vix": df_vix,
     }
+
+
+def _synthetic_volume_ratio(df: pd.DataFrame | None) -> float:
+    if df is None or df.empty:
+        return float("nan")
+    synth = df.get("is_synthetic_vol")
+    if synth is None:
+        return 0.0
+    synth_arr = pd.Series(synth).fillna(False).astype(float).to_numpy(dtype=float)
+    mask = np.isfinite(synth_arr)
+    if not mask.any():
+        return 0.0
+    return float(np.mean(synth_arr[mask]))
+
+
+def _resolve_intraday_reference_frame(
+    df_1h: pd.DataFrame | None,
+    *,
+    logger=print,
+) -> tuple[pd.DataFrame | None, float]:
+    log = logger if logger is not None else (lambda *_args, **_kwargs: None)
+    synth_ratio = _synthetic_volume_ratio(df_1h)
+    if df_1h is None or df_1h.empty:
+        return None, synth_ratio
+    if np.isfinite(synth_ratio) and synth_ratio > VOL_INTRADAY_SYNTHETIC_VOL_MAX_RATIO:
+        log(
+            "  [TOON VOL] 1H reference is predominantly synthetic-volume "
+            f"({synth_ratio:.1%}); intra_* features will be zeroed."
+        )
+        return None, synth_ratio
+    return df_1h, synth_ratio
 
 
 def build_daily_volatility_feature_frame(
@@ -1119,15 +1239,18 @@ def build_daily_volatility_feature_frame(
         df_full[col] = nc_df[col].values
 
     log("  [TOON VOL] Layer 1e: Intraday RV summary from 1H bars...")
-    if df_1h is None or df_1h.empty:
+    usable_df_1h, _ = _resolve_intraday_reference_frame(df_1h, logger=logger)
+    if usable_df_1h is None:
         log(
             "  [TOON VOL] 1H reference unavailable or intentionally ignored; "
             "intra_* features will be zeroed."
         )
-    intra_df = intraday_rv_summary_daily(df_1d_labelled, df_1h)
+    intra_df = intraday_rv_summary_daily(df_1d_labelled, usable_df_1h)
     for col in intra_df.columns:
         df_full[col] = intra_df[col].values
-    df_full["intra_available"] = 1.0 if df_1h is not None and not df_1h.empty else 0.0
+    df_full["intra_available"] = (
+        1.0 if usable_df_1h is not None and not usable_df_1h.empty else 0.0
+    )
     log(f"  [TOON VOL] Intraday RV features injected: {len(intra_df.columns)} columns")
 
     log("  [TOON VOL] Layer 1f: Implied Volatility (VIX) features...")
@@ -1450,6 +1573,43 @@ def _multi_target_phase1_ranking(
     return fused[:VOL_FEAT_BUDGET]
 
 
+def _score_feature_set_across_targets(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    fold_features: list[str],
+    ranking_targets: list[str],
+    *,
+    purge_gap: int,
+) -> tuple[float, dict[str, float]]:
+    edge_by_target: dict[str, float] = {}
+    for target in ranking_targets:
+        if target not in train_df.columns or target not in test_df.columns:
+            continue
+        try:
+            model, _, _ = _fit_lgbm_with_inner_validation_vol(
+                train_df[fold_features],
+                train_df[target],
+                target_col=target,
+                purge_gap=purge_gap,
+            )
+        except Exception:
+            edge_by_target[target] = float("nan")
+            continue
+        preds = np.asarray(model.predict(test_df[fold_features]), dtype=float)
+        har_preds = _har_rv_baseline(train_df, test_df, target)
+        mae, _ = _regression_metrics(test_df[target], preds)
+        har_mae, _ = _regression_metrics(test_df[target], har_preds)
+        edge_by_target[target] = _edge_vs_har_mae(mae, har_mae)
+
+    finite_edges = np.array(
+        [edge for edge in edge_by_target.values() if np.isfinite(edge)],
+        dtype=float,
+    )
+    if finite_edges.size == 0:
+        return float("nan"), edge_by_target
+    return float(np.mean(finite_edges)), edge_by_target
+
+
 def fold_consensus_feature_selection_vol(
     df: pd.DataFrame,
     candidate_feature_cols: list[str],
@@ -1489,6 +1649,7 @@ def fold_consensus_feature_selection_vol(
     )
 
     feature_votes: dict[str, int] = {}
+    feature_validation_sum: dict[str, float] = {}
     fold_results: list[dict[str, float | int]] = []
 
     for i, (train_end, test_end) in enumerate(split_points):
@@ -1513,59 +1674,63 @@ def fold_consensus_feature_selection_vol(
         if not fold_features:
             continue
 
-        for feat in fold_features:
-            feature_votes[feat] = feature_votes.get(feat, 0) + 1
-
-        X_train = train_df[fold_features]
-        y_train = train_df["next_yz_logvol"]
         try:
-            model, _, _ = _fit_lgbm_with_inner_validation_vol(
-                X_train,
-                y_train,
-                target_col="next_yz_logvol",
+            validation_score, validation_edges = _score_feature_set_across_targets(
+                train_df,
+                test_df,
+                fold_features,
+                active_ranking_targets,
                 purge_gap=purge_gap,
             )
         except Exception as exc:
-            print(f"  [Nested VOL] Fold {i + 1} training failed: {exc}")
+            print(f"  [Nested VOL] Fold {i + 1} validation failed: {exc}")
             continue
 
-        preds = np.asarray(model.predict(test_df[fold_features]), dtype=float)
-        har_preds = _har_rv_baseline(train_df, test_df, "next_yz_logvol")
-        mae, rmse = _regression_metrics(test_df["next_yz_logvol"], preds)
-        har_mae, har_rmse = _regression_metrics(test_df["next_yz_logvol"], har_preds)
-        edge_vs_har = (
-            float(1.0 - (mae / har_mae))
-            if np.isfinite(mae) and np.isfinite(har_mae) and har_mae > 0.0
-            else float("nan")
-        )
-        qlike = _qlike_loss(test_df["next_yz_logvol"], preds)
-        har_qlike = _qlike_loss(test_df["next_yz_logvol"], har_preds)
+        if not np.isfinite(validation_score):
+            print(f"  [Nested VOL] Fold {i + 1} produced no finite multi-target score.")
+            continue
+
+        for feat in fold_features:
+            feature_votes[feat] = feature_votes.get(feat, 0) + 1
+            feature_validation_sum[feat] = (
+                feature_validation_sum.get(feat, 0.0) + validation_score
+            )
 
         print(
-            f"  [Nested VOL] Fold {i + 1:>2} | Train:{len(X_train):>5} "
-            f"Test:{len(test_df):>5} | MAE:{mae:.4f} RMSE:{rmse:.4f} "
-            f"HAR:{har_mae:.4f} Edge:{edge_vs_har:+.1%} "
-            f"QL:{qlike:.4f}/{har_qlike:.4f} | Feats:{len(fold_features)}"
+            f"  [Nested VOL] Fold {i + 1:>2} | Train:{len(train_df):>5} "
+            f"Test:{len(test_df):>5} | Score:{validation_score:+.1%} | "
+            + " | ".join(
+                f"{VOL_TARGET_SHORT[target]} "
+                f"{validation_edges.get(target, np.nan):+.1%}"
+                for target in active_ranking_targets
+            )
+            + f" | Feats:{len(fold_features)}"
         )
-        fold_results.append(
-            {
-                "split": i + 1,
-                "train_bars": len(X_train),
-                "test_bars": len(test_df),
-                "mae": mae,
-                "rmse": rmse,
-                "har_mae": har_mae,
-                "har_rmse": har_rmse,
-                "edge_vs_har": edge_vs_har,
-                "qlike": qlike,
-                "har_qlike": har_qlike,
-            }
-        )
+        fold_result: dict[str, float | int] = {
+            "split": i + 1,
+            "train_bars": len(train_df),
+            "test_bars": len(test_df),
+            "validation_score": validation_score,
+        }
+        for target, edge in validation_edges.items():
+            fold_result[f"{target}_edge_vs_har"] = edge
+        fold_results.append(fold_result)
 
     min_votes = max(1, int(len(split_points) * consensus_threshold))
+    feature_validation_avg = {
+        feat: feature_validation_sum[feat] / max(feature_votes[feat], 1)
+        for feat in feature_votes
+    }
     consensus_features = [
         feat
-        for feat, votes in sorted(feature_votes.items(), key=lambda item: -item[1])
+        for feat, votes in sorted(
+            feature_votes.items(),
+            key=lambda item: (
+                -item[1],
+                -feature_validation_avg.get(item[0], float("-inf")),
+                item[0],
+            ),
+        )
         if votes >= min_votes
     ][:VOL_FEAT_BUDGET]
 
@@ -1589,6 +1754,7 @@ def fold_consensus_feature_selection_vol(
     if final_wf:
         final_wf["nested_fold_results"] = fold_results
         final_wf["feature_votes"] = feature_votes
+        final_wf["feature_validation_avg"] = feature_validation_avg
     return consensus_features, final_wf
 
 
@@ -1982,8 +2148,8 @@ def main() -> None:
         symbol=symbol,
         row=last_row,
         forecasts=latest_forecasts,
-        intraday_1h_used=df_1h is not None and not df_1h.empty,
-        vix_available=df_vix is not None and not df_vix.empty,
+        intraday_1h_used=bool(last_row.get("intra_available", 0.0) >= 0.5),
+        vix_available=bool(last_row.get("vix_available", 0.0) >= 0.5),
         reference_price=reference_price,
         reference_price_source=reference_source,
         raw_forecasts=latest_ml_forecasts,

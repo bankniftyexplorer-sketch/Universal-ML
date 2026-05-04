@@ -3643,7 +3643,7 @@ Level (4):
   vix_level           — log(VIX close)
   vix_z               — z-score vs z_window history
   vix_pctrank         — percentile rank over rank_window
-  vix_regime          — discretized: 0=low(<15), 1=normal(15-25), 2=elevated(25-35), 3=extreme(>35)
+  vix_regime          — discretized with runtime-provided thresholds for the active companion
 
 Dynamics (5):
   vix_trend           — short MA / long MA ratio - 1
@@ -3671,6 +3671,9 @@ function compute_vix_features(
     long_window::Int = 21,
     z_window::Int = 63,
     rank_window::Int = 252,
+    regime_low::Float64 = 15.0,
+    regime_mid::Float64 = 25.0,
+    regime_high::Float64 = 35.0,
 )::Dict{String, Vector{Float64}}
     n = length(vix_closes)
     eps = 1e-9
@@ -3713,11 +3716,11 @@ function compute_vix_features(
         vix_level_out[i] = log_vix[i]
 
         # Regime
-        if v < 15.0
+        if v < regime_low
             vix_regime_out[i] = 0.0
-        elseif v < 25.0
+        elseif v < regime_mid
             vix_regime_out[i] = 1.0
-        elseif v < 35.0
+        elseif v < regime_high
             vix_regime_out[i] = 2.0
         else
             vix_regime_out[i] = 3.0

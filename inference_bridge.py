@@ -422,7 +422,9 @@ class InferenceBridge:
             required = {"time", "open", "high", "low", "close"}
             if not required.issubset(set(df_vix.columns)):
                 return None
-            return df_vix.reset_index(drop=True)
+            df_vix = df_vix.reset_index(drop=True)
+            df_vix.attrs["vix_companion_symbol"] = vix_symbol
+            return df_vix
         except Exception:
             return None
 
