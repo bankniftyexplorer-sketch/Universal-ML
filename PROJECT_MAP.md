@@ -30,7 +30,8 @@ After any bugfix, modification, or addition that changes repo behavior or contra
   - VIX implied-volatility features (`VOL` lane optional enrichment)
 - Both active lanes now inject Julia-native realized-volatility surfaces and narrative-context awareness through `julia_bridge.py`.
 - The `VOL` daily volatility lane can optionally enrich itself with `1H` intraday RV summaries, but a failed `1H` quality row no longer blocks the lane; it zeros those features, stamps `intra_available=0`, and continues on the strict daily stack.
-- The `VOL` lane can also optionally enrich itself with a mapped `1D` VIX companion; if the companion is missing or fails quality, it zeros those features, stamps `vix_available=0`, and continues.
+- The `VOL` lane can also optionally enrich itself with a mapped `1D` VIX companion or suite; if the primary companion is missing or fails quality, it zeros those features, stamps `vix_available=0`, and continues.
+- `SPX500` can now optionally consume a three-leg VIX suite (`VIX`, `VIX9D`, `VIX3M`) so the VOL lane can model short-term fear, 30-day fear, and structural fear together, plus suite-curve inversion state.
 - The `VOL` lane now serves both next-day and 5-day volatility term-structure heads, heterogeneous QLIKE/MAE/Huber variance ensembles plus MAE/Huber/quantile excursion ensembles, companion-aware VIX regimes, synthetic-volume-aware intraday gating, post-hoc ML+HAR combination weights, isotonic point calibrators, decay-weighted asymmetric conformal intervals, and a forecast-confidence score from one saved artifact set.
 - The raw `realized_volatility` series from the vault remains state only and is excluded from feature selection.
 - Feature math lives in Julia kernels, called from Python bridges.
@@ -52,10 +53,10 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 | `ops/systemd/user/universal-ml-vault-autosync.service` | User-level systemd unit template for starting the vault auto-sync supervisor at login | You want the auto-sync loop to come up automatically with the system session |
 | `vault_engine.py` | Root-level compatibility shim that re-exports `DataVault` | A root script imports `vault_engine` directly |
 | `instrument_registry.py` | Shared runtime/artifact symbol identity helper that collapses aliases like `BTCUSDT -> BTC` and `SP500 -> SPX500` into one canonical artifact contract | You care about canonical symbol naming across scripts |
-| `inference_bridge.py` | Reads DB, attaches `data_quality`, enforces the strict runtime gate on `FAIL` quality by default, and can optionally fetch mapped `1D` VIX companion series for the `VOL` lane | You care about how scripts fetch market data |
+| `inference_bridge.py` | Reads DB, attaches `data_quality`, enforces the strict runtime gate on `FAIL` quality by default, and can optionally fetch mapped `1D` VIX companion suites for the `VOL` lane | You care about how scripts fetch market data |
 | `universal_ml_engine.py` | Main `1H` trainer plus shared runtime helpers/constants, nested consensus feature selection, ensemble model wrapper, and probability calibration | You care about the intraday core |
 | `daily_ml_engine.py` | Main `1D` trainer with the same nested-selection, ensemble, and calibration contract | You care about the daily core |
-| `daily_volatility_engine.py` | `VOL` trainer with optional `1H` + VIX enrichment, synthetic-volume-aware intraday gating, companion-aware VIX regimes, multi-target ranking, heterogeneous variance/excursion ensembles, extended HAR-RV combination, isotonic point calibration, decay-weighted asymmetric conformal intervals, and 1D+5D heads | You care about daily vol/range forecasting |
+| `daily_volatility_engine.py` | `VOL` trainer with optional `1H` + VIX enrichment, SPX multi-VIX suite features, synthetic-volume-aware intraday gating, companion-aware VIX regimes, multi-target ranking, heterogeneous variance/excursion ensembles, extended HAR-RV combination, isotonic point calibration, decay-weighted asymmetric conformal intervals, and 1D+5D heads | You care about daily vol/range forecasting |
 | `backtest_engine.py` | `1H` backtest/report generator | You care about intraday replay and equity curve |
 | `daily_backtest_engine.py` | `1D` backtest/report generator | You care about daily replay and equity curve |
 | `daily_volatility_backtest.py` | `VOL` backtest, calibrator-aware conformal coverage reporter, and OOS replay validator | You care about vol forecast replay |
@@ -180,12 +181,12 @@ After any bugfix, modification, or addition that changes repo behavior or contra
 
 1. Same data loading as the `1D` lane via `InferenceBridge`.
 2. Same feature families as the `1D` lane, plus optional VIX implied-volatility enrichment: RV surface, holographic, SMC, Kalman, narrative context, macro regime overlays, and companion-VIX features.
-3. `InferenceBridge.fetch_vix_series()` can optionally fetch a mapped `1D` VIX companion with `strict_gating=False`.
-   - current companion map: `NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50` -> `INDIA_VIX`; `SPX500` -> `VIX`
-   - if the companion series is missing or carries `FAIL` quality, the bridge returns `None` and the lane continues
-   - the fetched frame now preserves the mapped companion identity so downstream VIX regime bucketing can adapt by geography
+3. `InferenceBridge.fetch_vix_suite()` can optionally fetch a mapped `1D` VIX companion suite with `strict_gating=False`, and `fetch_vix_series()` now returns the primary leg from that suite.
+   - current suite map: `NIFTY`, `BANKNIFTY`, `SENSEX`, `FINNIFTY`, `MIDCPNIFTY`, `NIFTYNXT50` -> `INDIA_VIX`; `SPX500` -> `VIX`, `VIX9D`, `VIX3M`
+   - if a companion series is missing or carries `FAIL` quality, the bridge returns `None` for that leg and the lane continues
+   - fetched frames preserve the mapped companion identity so downstream VIX regime bucketing can adapt by geography
 4. `julia_bridge.intraday_rv_summary_daily()` additionally injects 9 session-aggregated `1H` volatility features when hourly data exists, passes quality, and is not dominated by synthetic volume; otherwise those columns are zeroed, `intra_available` is set to `0`, and the lane continues.
-5. `julia_bridge.vix_feature_engine_daily()` aligns companion VIX closes to the daily bars and injects 17 Julia-built `vix_*` surface columns; `vix_interaction_features()` adds 3 Python-side `VIX x RV` interaction terms, `vix_available` records whether companion data was present, and the Julia `vix_regime` cutoffs are now selected from the mapped companion identity (`INDIA_VIX` vs `VIX`).
+5. `julia_bridge.vix_feature_engine_daily()` aligns companion VIX closes to the daily bars and injects 17 Julia-built `vix_*` surface columns; `vix_interaction_features()` adds 3 Python-side `VIX x RV` interaction terms, `vix_available` records whether the primary companion was present, the Julia `vix_regime` cutoffs are now selected from the mapped companion identity (`INDIA_VIX` vs `VIX`), and `daily_volatility_engine.py` can add prefixed `vix9d_*` / `vix3m_*` families plus suite-curve spread and inversion features for `SPX500`.
 6. `julia_bridge.vol_target_engine_daily()` creates 8 forward regression targets: 4 next-day heads and 4 next-5-day heads for YZ log-vol, log-range, up-excursion, and down-excursion.
 7. Consensus feature selection keeps a shared 40-feature budget, ranks candidates across all 4 next-day VOL heads before voting a fold consensus, and now validates fold feature sets on multi-target edge vs HAR instead of log-vol alone.
 8. `daily_volatility_engine.py` runs fixed-size expanding walk-forward regression validation with per-fold HAR-RV baseline comparison and QLIKE reporting for the variance-style heads.

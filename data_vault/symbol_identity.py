@@ -128,6 +128,8 @@ STRICT_INDEX_REGISTRY = (
     InstrumentRegistryEntry("INDIA_VIX", "SPOT", "YAHOO", "^INDIAVIX", "SPOT", "INR"),
     InstrumentRegistryEntry("SPX500", "SPOT", "YAHOO", "^GSPC", "SPOT", "USD"),
     InstrumentRegistryEntry("VIX", "SPOT", "YAHOO", "^VIX", "SPOT", "USD"),
+    InstrumentRegistryEntry("VIX9D", "SPOT", "YAHOO", "^VIX9D", "SPOT", "USD"),
+    InstrumentRegistryEntry("VIX3M", "SPOT", "YAHOO", "^VIX3M", "SPOT", "USD"),
     InstrumentRegistryEntry(
         "SENSEX", "FUT", "BSE_DLY", "BSX1!", "CONTINUOUS_FUTURE", "INR"
     ),
@@ -206,6 +208,8 @@ CANONICAL_SYMBOL_ALIASES = {
     "SPX500": "SPX500",
     "GSPC": "SPX500",
     "VIX": "VIX",
+    "VIX9D": "VIX9D",
+    "VIX3M": "VIX3M",
 }
 
 

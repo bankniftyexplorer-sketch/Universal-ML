@@ -433,6 +433,7 @@ def main() -> None:
     df_1h_raw = tf_ctx["df_1h_raw"]
     df_1h_status = tf_ctx["df_1h_status"]
     df_vix = tf_ctx["df_vix"]
+    vix_suite = tf_ctx.get("vix_suite", {})
     df_1w = primary_frames["1W"]
     df_1m = primary_frames["1M"]
     df_3m = primary_frames["3M"]
@@ -478,6 +479,7 @@ def main() -> None:
         reference_1d=reference_frames["1D"],
         df_1h=df_1h,
         df_vix=df_vix,
+        df_vix_suite=vix_suite,
         df_1w=df_1w,
         df_1m=df_1m,
         df_3m=df_3m,

@@ -76,6 +76,10 @@ VOL_MIN_CALIBRATION_SAMPLES = 200
 VOL_HUBER_DELTA = 1.0
 VOL_EXCURSION_QUANTILE_ALPHA = 0.75
 VOL_INTRADAY_SYNTHETIC_VOL_MAX_RATIO = 0.90
+VOL_VIX_SUITE_PREFIXES = {
+    "VIX9D": "vix9d",
+    "VIX3M": "vix3m",
+}
 VOL_HAR_FEATURE_COLS = [
     "har_rv_d",
     "har_rv_w",
@@ -1149,7 +1153,8 @@ def fetch_vol_timeframe_context(
         if df_1h_status == "FAIL" or df_1h_raw is None or df_1h_raw.empty
         else df_1h_raw
     )
-    df_vix = bridge.fetch_vix_series(market_data_symbol)
+    vix_suite = bridge.fetch_vix_suite(market_data_symbol)
+    df_vix = next(iter(vix_suite.values()), None) if vix_suite else None
     return {
         "tf_maps": tf_maps,
         "primary_frames": primary_frames,
@@ -1158,6 +1163,7 @@ def fetch_vol_timeframe_context(
         "df_1h_raw": df_1h_raw,
         "df_1h_status": df_1h_status,
         "df_vix": df_vix,
+        "vix_suite": vix_suite,
     }
 
 
@@ -1192,12 +1198,119 @@ def _resolve_intraday_reference_frame(
     return df_1h, synth_ratio
 
 
+def _rename_vix_feature_prefix(
+    feature_df: pd.DataFrame,
+    prefix: str,
+) -> pd.DataFrame:
+    rename_map = {}
+    for col in feature_df.columns:
+        suffix = col[4:] if col.startswith("vix_") else col
+        rename_map[col] = f"{prefix}_{suffix}"
+    return feature_df.rename(columns=rename_map)
+
+
+def _build_additional_vix_suite_features(
+    df_1d_labelled: pd.DataFrame,
+    df_vix_suite: dict[str, pd.DataFrame | None] | None,
+) -> pd.DataFrame:
+    if not isinstance(df_vix_suite, dict) or not df_vix_suite:
+        return pd.DataFrame(index=df_1d_labelled.index)
+
+    suite_parts: list[pd.DataFrame] = []
+    availability_cols: dict[str, np.ndarray] = {}
+    for symbol, prefix in VOL_VIX_SUITE_PREFIXES.items():
+        companion_df = df_vix_suite.get(symbol)
+        if companion_df is None or companion_df.empty:
+            feature_df = vix_feature_engine_daily(df_1d_labelled, None)
+            available = 0.0
+        else:
+            feature_df = vix_feature_engine_daily(df_1d_labelled, companion_df)
+            available = 1.0
+        suite_parts.append(_rename_vix_feature_prefix(feature_df, prefix))
+        availability_cols[f"{prefix}_available"] = np.full(
+            len(df_1d_labelled),
+            available,
+            dtype=float,
+        )
+
+    suite_df = (
+        pd.concat(suite_parts, axis=1)
+        if suite_parts
+        else pd.DataFrame(index=df_1d_labelled.index)
+    )
+    if availability_cols:
+        suite_df = pd.concat(
+            [suite_df, pd.DataFrame(availability_cols, index=df_1d_labelled.index)],
+            axis=1,
+        )
+    return suite_df
+
+
+def _build_vix_suite_curve_features(df_full: pd.DataFrame) -> pd.DataFrame:
+    n = len(df_full)
+    zeros = pd.Series(np.zeros(n), index=df_full.index)
+
+    base_log = df_full.get("vix_level", zeros).to_numpy(dtype=float)
+    base_available = df_full.get("vix_available", zeros).to_numpy(dtype=float) >= 0.5
+    short_log = df_full.get("vix9d_level", zeros).to_numpy(dtype=float)
+    structural_log = df_full.get("vix3m_level", zeros).to_numpy(dtype=float)
+    short_available = base_available & (
+        df_full.get("vix9d_available", zeros).to_numpy(dtype=float) >= 0.5
+    )
+    structural_available = base_available & (
+        df_full.get("vix3m_available", zeros).to_numpy(dtype=float) >= 0.5
+    )
+    suite_available = short_available & structural_available
+
+    short_spread = short_log - base_log
+    back_spread = base_log - structural_log
+    full_span = short_log - structural_log
+
+    def _masked(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        out = np.zeros(n, dtype=float)
+        if mask.any():
+            out[mask] = values[mask]
+        return out
+
+    return (
+        pd.DataFrame(
+            {
+                "vix9d_vix_spread": _masked(short_spread, short_available),
+                "vix_vix3m_spread": _masked(back_spread, structural_available),
+                "vix9d_vix3m_spread": _masked(full_span, suite_available),
+                "vix9d_vix_ratio": _masked(
+                    np.exp(np.clip(short_spread, -5.0, 5.0)),
+                    short_available,
+                ),
+                "vix_vix3m_ratio": _masked(
+                    np.exp(np.clip(back_spread, -5.0, 5.0)),
+                    structural_available,
+                ),
+                "vix_curve_short_inversion": (
+                    short_available & (short_spread > 0.0)
+                ).astype(float),
+                "vix_curve_back_inversion": (
+                    structural_available & (back_spread > 0.0)
+                ).astype(float),
+                "vix_curve_full_inversion": (
+                    suite_available & (short_spread > 0.0) & (back_spread > 0.0)
+                ).astype(float),
+                "vix_suite_available": suite_available.astype(float),
+            },
+            index=df_full.index,
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+
 def build_daily_volatility_feature_frame(
     df_1d: pd.DataFrame,
     *,
     reference_1d: pd.DataFrame | None = None,
     df_1h: pd.DataFrame | None = None,
     df_vix: pd.DataFrame | None = None,
+    df_vix_suite: dict[str, pd.DataFrame | None] | None = None,
     df_1w: pd.DataFrame | None = None,
     df_1m: pd.DataFrame | None = None,
     df_3m: pd.DataFrame | None = None,
@@ -1265,10 +1378,20 @@ def build_daily_volatility_feature_frame(
     vix_interact = vix_interaction_features(df_full)
     for col in vix_interact.columns:
         df_full[col] = vix_interact[col].values
+    suite_vix_df = _build_additional_vix_suite_features(df_1d_labelled, df_vix_suite)
+    for col in suite_vix_df.columns:
+        df_full[col] = suite_vix_df[col].values
     df_full["vix_available"] = 1.0 if df_vix is not None and not df_vix.empty else 0.0
+    suite_curve_df = (
+        _build_vix_suite_curve_features(df_full)
+        if not suite_vix_df.empty
+        else pd.DataFrame(index=df_full.index)
+    )
+    for col in suite_curve_df.columns:
+        df_full[col] = suite_curve_df[col].values
     log(
         "  [TOON VOL] VIX features injected: "
-        f"{len(vix_df.columns) + len(vix_interact.columns)} columns"
+        f"{len(vix_df.columns) + len(vix_interact.columns) + len(suite_vix_df.columns) + len(suite_curve_df.columns)} columns"
     )
 
     log("  [TOON VOL] Layer 2: Injecting macro regime overlays (6M/12M)...")
@@ -1959,6 +2082,7 @@ def main() -> None:
     df_1h_raw = tf_ctx["df_1h_raw"]
     df_1h_status = tf_ctx["df_1h_status"]
     df_vix = tf_ctx["df_vix"]
+    vix_suite = tf_ctx.get("vix_suite", {})
     df_1w = primary_frames["1W"]
     df_1m = primary_frames["1M"]
     df_3m = primary_frames["3M"]
@@ -1982,6 +2106,14 @@ def main() -> None:
         _print_tf_span("VIX", df_vix)
     else:
         print("  VIX companion    : [OPTIONAL unavailable -> ignored]")
+    for suite_symbol, suite_df in vix_suite.items():
+        if suite_symbol not in VOL_VIX_SUITE_PREFIXES:
+            continue
+        if suite_df is not None and not suite_df.empty:
+            print(f"  {suite_symbol:<16}: {describe_selected_frame(suite_df)}")
+            _print_tf_span(suite_symbol, suite_df)
+        else:
+            print(f"  {suite_symbol:<16}: [OPTIONAL unavailable -> ignored]")
     if df_1w is not None and not df_1w.empty:
         print(f"  1W primary lane : {describe_selected_frame(df_1w)}")
     _print_tf_span("1W", df_1w)
@@ -2003,6 +2135,7 @@ def main() -> None:
         reference_1d=reference_frames["1D"],
         df_1h=df_1h,
         df_vix=df_vix,
+        df_vix_suite=vix_suite,
         df_1w=df_1w,
         df_1m=df_1m,
         df_3m=df_3m,

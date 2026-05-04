@@ -468,6 +468,7 @@ def _build_vol_model_ready(data_dir: str, symbol: str) -> pd.DataFrame:
         reference_1d=reference_frames["1D"],
         df_1h=tf_ctx["df_1h"],
         df_vix=tf_ctx["df_vix"],
+        df_vix_suite=tf_ctx.get("vix_suite", {}),
         df_1w=primary_frames["1W"],
         df_1m=primary_frames["1M"],
         df_3m=primary_frames["3M"],
